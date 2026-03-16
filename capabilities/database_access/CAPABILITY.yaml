@@ -1,0 +1,11 @@
+id: database_access
+name: Database Access
+description: 数据库连接与查询（sqlalchemy, asyncpg）。
+packages:
+  - sqlalchemy>=2.0.0
+  - asyncpg>=0.29.0
+imports:
+  - sqlalchemy
+  - asyncpg
+tools: []
+skill_hint: ""

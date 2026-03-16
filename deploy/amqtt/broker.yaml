@@ -1,0 +1,18 @@
+listeners:
+  default:
+    type: tcp
+    bind: 0.0.0.0:1883
+    max_connections: 200
+  websockets:
+    type: ws
+    bind: 0.0.0.0:9001
+    max_connections: 200
+
+timeout_disconnect_delay: 2
+
+plugins:
+  amqtt.plugins.logging_amqtt.EventLoggerPlugin: {}
+  amqtt.plugins.authentication.AnonymousAuthPlugin:
+    allow_anonymous: true
+  amqtt.plugins.sys.broker.BrokerSysPlugin:
+    sys_interval: 20

@@ -1,0 +1,23 @@
+id: api-integration-bootstrap
+name: API Integration Bootstrap
+description: 为新的外部 API 集成快速搭建认证、连通性测试和调用脚本。
+tags:
+  - api
+  - integration
+  - http
+  - webhook
+keywords:
+  - api
+  - 接口
+  - 集成
+  - webhook
+  - 鉴权
+  - 调用
+packages:
+  - httpx>=0.27.0
+  - pydantic>=2.8.0
+verify_imports:
+  - httpx
+  - pydantic
+verify_commands: []
+install_commands: []

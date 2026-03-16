@@ -1,0 +1,68 @@
+node_id: my-hub-server
+node_type: hub
+display_name: Hub Server
+platform: linux
+arch: x86_64
+
+providers:
+  - name: kimi
+    model: kimi-k2.5
+    via: api
+  - name: qwen
+    model: qwen3.5-397b-a17b
+    via: api
+  - name: ollama-local
+    model: qwen2.5:72b
+    via: local
+    context_length: 32768
+    properties:
+      gpu: NVIDIA RTX 5090
+
+capabilities:
+  - capability_id: knowledge_store
+    description: Large-scale knowledge base storage, retrieval, and ingest.
+    tools:
+      - read_vault
+      - write_vault
+      - search_vault
+      - knowledge_ingest
+  - capability_id: local_llm_inference
+    description: Local LLM inference for privacy-sensitive workloads.
+    tools:
+      - local_llm_generate
+    exclusive: true
+    properties:
+      privacy: local_only
+  - capability_id: audio_transcription
+    description: GPU-accelerated transcription.
+    tools:
+      - audio_transcribe_path
+  - capability_id: long_running_analysis
+    description: Durable background analysis and processing tasks.
+    tools:
+      - background_run
+  - capability_id: document_management
+    description: Structured document creation and editing.
+    tools:
+      - create_note
+      - document_append_block
+      - document_replace_section
+  - capability_id: evolution_runtime
+    description: Controlled capability evolution and validation.
+    tools:
+      - skill_install
+      - capability_register
+      - system_run
+
+resources:
+  cpu_cores: 32
+  memory_gb: 128
+  gpu: NVIDIA RTX 5090
+  gpu_memory_gb: 32
+  disk_free_gb: 4000
+  battery_powered: false
+
+availability:
+  schedule: 24/7
+  intermittent: false
+  max_task_duration_seconds: 0

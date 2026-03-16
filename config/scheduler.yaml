@@ -1,0 +1,33 @@
+# ============================================================
+# Nexus / 星策 — 调度器配置
+# ============================================================
+#
+# 当前阶段仅作为独立配置工件保留，供后续 scheduler runner 使用。
+# 设计约束：
+# 1. 调度配置独立于 app.yaml
+# 2. 晨间/日终任务默认关闭，避免在未接通治理前自动运行
+# 3. daily_reindex 作为知识库维护任务保留
+
+timezone: Asia/Shanghai
+
+jobs:
+  morning_brief:
+    enabled: false
+    schedule:
+      type: daily
+      time: "08:00"
+    task: "生成晨间工作简报，汇总待处理事项、关键日程与高优先级风险。"
+
+  evening_wrapup:
+    enabled: false
+    schedule:
+      type: daily
+      time: "17:00"
+    task: "生成日终总结，汇总已完成事项、未完成事项、阻塞点与次日建议。"
+
+  daily_reindex:
+    enabled: true
+    schedule:
+      type: daily
+      time: "02:30"
+    task: "执行知识库增量重建，刷新 Vault 结构索引与检索索引。"

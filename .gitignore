@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+vault/
+tmp/
+logs/
+*.sqlite3
+*.db
+
+# Config with secrets (use .example versions)
+config/app.yaml
+config/node_cards/*.yaml
+!config/node_cards/*.example.yaml
+
+# macOS app build artifacts
+apps/macos/.build/
+apps/macos/.swiftpm/
+*.dSYM/
+
+# Web
+web/node_modules/
+web/dist/
+web/.npm-cache/
+web/*.tsbuildinfo
+
+# Sync archives
+.nexus_sync_*.tar.gz
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

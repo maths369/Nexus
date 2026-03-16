@@ -1,0 +1,16 @@
+.git
+.gitignore
+.pytest_cache
+.ruff_cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+node_modules/
+web/node_modules/
+web/dist/
+data/
+vault/
+models/

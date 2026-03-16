@@ -1,0 +1,54 @@
+node_id: iphone-user
+node_type: mobile
+display_name: iPhone
+platform: ios
+arch: arm64
+
+providers:
+  - name: kimi
+    model: kimi-k2.5
+    via: api
+
+capabilities:
+  - capability_id: camera_photo
+    description: Capture photos or choose from library when the user is in the foreground flow.
+    tools:
+      - take_photo
+      - photo_from_library
+    requires_user_interaction: true
+  - capability_id: camera_video
+    description: Capture video when the user explicitly opens the mobile flow.
+    tools:
+      - record_video_ios
+    requires_user_interaction: true
+  - capability_id: microphone
+    description: Capture audio snippets when the user explicitly opens the mobile flow.
+    tools:
+      - record_audio_ios
+    requires_user_interaction: true
+  - capability_id: location
+    description: User-authorized location lookup.
+    tools:
+      - get_location
+      - get_address
+  - capability_id: push_notification
+    description: Push-triggered notifications and approvals.
+    tools:
+      - push_notify
+  - capability_id: result_display
+    description: Result display after push wake-up or foreground entry.
+    tools:
+      - display_card
+      - display_report
+
+resources:
+  cpu_cores: 6
+  memory_gb: 8
+  disk_free_gb: 64
+  battery_powered: true
+
+availability:
+  schedule: 24/7
+  intermittent: true
+  max_task_duration_seconds: 300
+  preferred_role: input_output

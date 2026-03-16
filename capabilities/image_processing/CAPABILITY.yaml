@@ -1,0 +1,11 @@
+id: image_processing
+name: Image Processing
+description: 图像处理与 OCR（Pillow, pytesseract）。
+packages:
+  - Pillow>=10.2.0
+  - pytesseract>=0.3.10
+imports:
+  - PIL
+  - pytesseract
+tools: []
+skill_hint: ""

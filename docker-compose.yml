@@ -1,0 +1,80 @@
+services:
+  nexus-mqtt:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./data/mosquitto:/mosquitto/data
+      - ./data/mosquitto/log:/mosquitto/log
+    networks:
+      - nexus-net
+
+  nexus-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXUS_EXTRAS: browser
+    env_file:
+      - .env
+    environment:
+      NEXUS_CONFIG_PATH: /app/config/app.yaml
+      NEXUS_AUDIO_BACKEND: sensevoice_remote
+      NEXUS_AUDIO_BASE_URL: http://nexus-audio-worker:8010
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+      - ./vault:/app/vault
+      - ./data:/app/data
+      - ./models:/app/models
+    depends_on:
+      - nexus-audio-worker
+      - nexus-mqtt
+    networks:
+      - nexus-net
+
+  nexus-audio-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXUS_EXTRAS: audio
+    env_file:
+      - .env
+    environment:
+      NEXUS_CONFIG_PATH: /app/config/app.yaml
+      NEXUS_AUDIO_BACKEND: sensevoice
+      NEXUS_AUDIO_DEVICE: cuda
+    command: ["python", "-m", "nexus", "audio-worker", "--host", "0.0.0.0", "--port", "8010"]
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./config:/app/config
+      - ./vault:/app/vault
+      - ./data:/app/data
+      - ./models:/app/models
+    gpus: all
+    networks:
+      - nexus-net
+
+  nexus-web:
+    image: node:22-alpine
+    working_dir: /workspace/web
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5175"
+    environment:
+      VITE_NEXUS_WS_URL: ws://localhost:8000/ws
+      VITE_NEXUS_HTTP_URL: http://localhost:8000
+    ports:
+      - "5175:5175"
+    volumes:
+      - ./web:/workspace/web
+    depends_on:
+      - nexus-api
+    networks:
+      - nexus-net
+
+networks:
+  nexus-net:

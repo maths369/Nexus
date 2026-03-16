@@ -1,0 +1,181 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+storage:
+  sqlite_dir: ./data/sqlite
+  skills_dir: ./skills
+  skill_registry_dir: ./skill_registry
+  capabilities_dir: ./capabilities
+  staging_dir: ./data/staging
+  backups_dir: ./data/backups
+agent:
+  max_auto_steps: 6
+  budget:
+    max_tool_calls: 200
+    max_duration_seconds: 600
+    checkpoint_interval: 10
+  context_token_limit: 120000
+provider:
+  primary:
+    name: kimi
+    model: kimi-k2.5
+    provider_type: moonshot
+    base_url: https://api.moonshot.cn/v1
+    api_key: ${MOONSHOT_API_KEY}       # or set env: MOONSHOT_API_KEY
+  fallbacks:
+  - name: qwen
+    model: qwen3.5-397b-a17b
+    provider_type: qwen
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: ${DASHSCOPE_API_KEY}      # or set env: DASHSCOPE_API_KEY
+  healthcheck_interval_seconds: 60
+  healthcheck_timeout_seconds: 15
+  max_retries: 2
+  request_timeout_seconds: 60
+  retry_backoff_seconds: 1.5
+  unhealthy_cooldown_seconds: 120
+knowledge:
+  retrieval:
+    chunk_size: 800
+    chunk_overlap: 120
+  memory:
+    max_entries: 1000
+  embeddings:
+    enabled: false
+    model_name: ./models/bge-large-zh-v1.5
+audio:
+  backend: sensevoice
+  language: zh
+  sensevoice_model_dir: ./models/sensevoice/SenseVoiceSmall
+  sensevoice_device: cpu
+  base_url: http://127.0.0.1:8010
+  temp_directory: ./vault/_system/audio_temp
+  final_directory: ./vault/_system/audio
+  transcript_directory: ./vault/_system/transcripts
+vault:
+  base_path: ./vault
+  ensure_directories: true
+  backup_path: ./data/backups
+tool_policy:
+  enabled: true
+  testing_disable_risk_controls: false
+  default_action: allow
+  allowlist:
+  - read_vault
+  - write_vault
+  - create_note
+  - search_vault
+  - list_vault_pages
+  - find_vault_pages
+  - memory_search
+  - memory_write
+  - knowledge_ingest
+  - document_append_block
+  - document_replace_section
+  - document_insert_checklist
+  - document_insert_table
+  - document_insert_page_link
+  - document_create_database
+  - delete_page
+  - audio_transcribe_path
+  - audio_materialize_transcript
+  - browser_navigate
+  - browser_extract_text
+  - browser_screenshot
+  - browser_fill_form
+  - search_web
+  - list_local_files
+  - code_read_file
+  - compact
+  - load_skill
+  - skill_list_installable
+  - skill_install
+  - skill_create
+  - skill_update
+  - skill_list_installed
+  - evolution_audit
+  - capability_list_available
+  - capability_status
+  - capability_enable
+  - capability_create
+  - capability_register
+  - capability_stage
+  - capability_verify
+  - capability_promote
+  - capability_rollback
+  - excel_list_sheets
+  - excel_to_csv
+  - todo_write
+  - dispatch_subagent
+  - task_create
+  - task_update
+  - task_list
+  - task_get
+  - background_run
+  - check_background
+  - system_run
+  - move_page
+  - memory_read_identity
+  - memory_update_user
+  - memory_update_soul
+  - memory_daily_log
+  - memory_read_journal
+  - memory_list_journals
+  - memory_reindex
+  risk_actions:
+    low: allow
+    medium: allow
+    high: approve
+    critical: deny
+evolution:
+  sandbox:
+    enabled: true
+    vault_root: ./vault
+    defaults:
+      timeout_seconds: 30
+      network: false
+      vault_access: ro
+  skills:
+    max_skills_loaded: 200
+    max_skill_file_bytes: 256000
+feishu:
+  enabled: false
+  subscription_mode: long_connection
+  app_id: ${FEISHU_APP_ID}
+  app_secret: ${FEISHU_APP_SECRET}
+  base_url: https://open.feishu.cn/open-apis
+  verification_token: ""
+  encrypt_key: ""
+  verify_signature: true
+  require_mention_in_group: false
+  receive_id_type: chat_id
+  http_timeout_seconds: 15
+  max_processed_messages: 3000
+  long_connection_auto_restart: true
+  long_connection_restart_initial_seconds: 2.0
+  long_connection_restart_max_seconds: 60.0
+  long_connection_max_restarts: 0
+  long_connection_ack_timeout_seconds: 2.5
+  long_connection_log_level: INFO
+scheduler:
+  enabled: false
+  config_path: ./config/scheduler.yaml
+browser:
+  enabled: true
+  worker_command: []
+mesh:
+  enabled: true
+  node_id: my-hub-server
+  node_type: hub
+  node_card_path: ./config/node_cards/hub-server.example.yaml
+  mqtt:
+    broker_host: 127.0.0.1
+    broker_port: 1883
+    transport: tcp
+    websocket_path: /mqtt
+    keepalive_seconds: 60
+    qos: 1
+    tls_enabled: false
+logging:
+  level: INFO
+  format: json

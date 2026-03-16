@@ -1,0 +1,15 @@
+[Unit]
+Description=Nexus MQTT Broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Workspace/Nexus
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/miniconda3/bin/conda run --no-capture-output -n ai_assist python -m nexus.mesh.amqtt_broker --config %h/Workspace/Nexus/deploy/amqtt/broker.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

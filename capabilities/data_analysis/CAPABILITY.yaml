@@ -1,0 +1,13 @@
+id: data_analysis
+name: Data Analysis & Visualization
+description: 数据分析与可视化（matplotlib, seaborn, scipy）。
+packages:
+  - matplotlib>=3.8.0
+  - seaborn>=0.13.0
+  - scipy>=1.12.0
+imports:
+  - matplotlib
+  - seaborn
+  - scipy
+tools: []
+skill_hint: ""

@@ -1,0 +1,32 @@
+id: office-conversion
+name: Office Conversion
+description: 处理 PPT/PPTX、DOCX、XLS/XLSX 等 Office 文件的转换、提取和归档。
+tags:
+  - office
+  - conversion
+  - ppt
+  - pdf
+  - docx
+  - xlsx
+keywords:
+  - ppt
+  - pptx
+  - pdf
+  - 转换
+  - 转成
+  - 转为
+  - office
+  - 文档
+  - 演示文稿
+packages:
+  - python-pptx>=1.0.0
+  - python-docx>=1.1.0
+  - openpyxl>=3.1.0
+  - reportlab>=4.0.0
+verify_imports:
+  - pptx
+  - docx
+  - openpyxl
+  - reportlab
+verify_commands: []
+install_commands: []

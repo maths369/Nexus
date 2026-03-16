@@ -1,0 +1,460 @@
+/* =============================================================
+   Nexus TipTap Editor Styles
+   Adapted from macos-ai-assistant, using Nexus warm color palette
+   ============================================================= */
+
+/* --- Editor Shell & Host --- */
+
+.nexus-editor-shell {
+  position: relative;
+}
+
+.editor-host {
+  position: relative;
+}
+
+.editor-save-indicator {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  font-size: 12px;
+  color: #61726d;
+  pointer-events: none;
+}
+
+/* --- Document Editor wrapper --- */
+
+.document-editor {
+  display: flex;
+  flex-direction: column;
+}
+
+.editor-topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.editor-topbar-info strong {
+  display: block;
+}
+
+.editor-topbar-path {
+  font-size: 13px;
+  color: #60706b;
+  margin-top: 2px;
+  display: block;
+}
+
+.editor-topbar-status {
+  font-size: 13px;
+  color: #2d8e75;
+  white-space: nowrap;
+}
+
+.editor-status {
+  color: #61726d;
+  line-height: 1.7;
+}
+
+/* --- Core TipTap / ProseMirror --- */
+
+.tiptap {
+  color: #0c1b1a;
+  line-height: 1.7;
+  font-size: 16px;
+  min-height: 380px;
+  padding: 12px 4px;
+  outline: none;
+}
+
+.tiptap:focus {
+  outline: none;
+}
+
+/* Headings */
+
+.tiptap h1,
+.tiptap h2,
+.tiptap h3 {
+  margin-top: 24px;
+  margin-bottom: 4px;
+  font-weight: 600;
+  color: #0c1b1a;
+  line-height: 1.3;
+}
+
+.tiptap h1 {
+  font-size: 24px;
+}
+
+.tiptap h2 {
+  font-size: 20px;
+}
+
+.tiptap h3 {
+  font-size: 18px;
+}
+
+/* Paragraph */
+
+.tiptap p {
+  margin: 8px 0;
+}
+
+/* Links */
+
+.tiptap a {
+  color: #2d8e75;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.tiptap a:hover {
+  color: #1a6b56;
+}
+
+/* Blockquote */
+
+.tiptap blockquote {
+  border-left: 3px solid #876843;
+  margin: 12px 0;
+  padding-left: 14px;
+  color: #2c4540;
+  font-style: italic;
+}
+
+/* Code block */
+
+.tiptap pre {
+  background: rgba(12, 27, 26, 0.04);
+  border: 1px solid rgba(12, 27, 26, 0.1);
+  border-radius: 10px;
+  padding: 12px;
+  font-family: "SFMono-Regular", "IBM Plex Mono", Consolas, monospace;
+  font-size: 14px;
+  overflow-x: auto;
+}
+
+.tiptap code {
+  background: rgba(12, 27, 26, 0.06);
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-family: "SFMono-Regular", "IBM Plex Mono", Consolas, monospace;
+  font-size: 14px;
+}
+
+.tiptap pre code {
+  background: transparent;
+  padding: 0;
+}
+
+/* Horizontal rule */
+
+.tiptap hr {
+  border: none;
+  border-top: 1px solid rgba(12, 27, 26, 0.12);
+  margin: 20px 0;
+}
+
+/* Image */
+
+.tiptap .inline-image {
+  max-width: 100%;
+  border-radius: 12px;
+  border: 1px solid rgba(12, 27, 26, 0.1);
+  display: block;
+  margin: 12px 0;
+}
+
+/* --- Task List --- */
+
+.tiptap .task-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.tiptap .task-list li {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 2px 0;
+}
+
+.tiptap .task-list li > label {
+  margin-top: 4px;
+}
+
+.tiptap .task-list li p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.tiptap .task-list li input[type="checkbox"] {
+  accent-color: #2d8e75;
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+/* --- Table --- */
+
+.tiptap table,
+.tiptap .table {
+  border-collapse: collapse;
+  width: 100%;
+  border: 1px solid rgba(12, 27, 26, 0.12);
+  margin: 12px 0;
+}
+
+.tiptap th,
+.tiptap td {
+  border: 1px solid rgba(12, 27, 26, 0.12);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.tiptap th {
+  background: rgba(12, 27, 26, 0.04);
+  font-weight: 600;
+}
+
+/* --- Toggle / Details --- */
+
+.toggle-group {
+  margin: 0.5rem 0;
+  padding: 0.25rem 0;
+  list-style: none;
+}
+
+.toggle-summary {
+  display: flex !important;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 500;
+  outline: none;
+  list-style: none;
+  color: #0c1b1a;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+
+.toggle-summary:hover {
+  background: rgba(12, 27, 26, 0.04);
+}
+
+.toggle-summary::-webkit-details-marker {
+  display: none;
+}
+
+.toggle-summary::before {
+  content: "\25b6";
+  font-size: 10px;
+  margin-right: 8px;
+  transition: transform 0.2s ease-in-out;
+  color: #61726d;
+  width: 12px;
+  display: inline-block;
+  text-align: center;
+}
+
+details[open] > .toggle-summary::before {
+  transform: rotate(90deg);
+}
+
+.toggle-content {
+  margin-left: 24px;
+  margin-top: 4px;
+  padding-left: 4px;
+  border-left: 2px solid rgba(12, 27, 26, 0.12);
+}
+
+/* --- Placeholder --- */
+
+.tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: #9aaba6;
+  pointer-events: none;
+  height: 0;
+}
+
+/* --- Bubble Toolbar --- */
+
+.bubble-toolbar {
+  display: inline-flex;
+  gap: 4px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(12, 27, 26, 0.12);
+  background: rgba(255, 252, 247, 0.96);
+  box-shadow: 0 8px 24px rgba(43, 51, 49, 0.12);
+}
+
+.mini-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(12, 27, 26, 0.1);
+  background: transparent;
+  color: #2c4540;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  transition: background 0.12s;
+}
+
+.mini-btn:hover {
+  background: rgba(12, 27, 26, 0.04);
+}
+
+.mini-btn.active {
+  background: rgba(45, 142, 117, 0.15);
+  border-color: rgba(45, 142, 117, 0.4);
+  color: #2d8e75;
+}
+
+/* --- Slash Menu --- */
+
+.slash-menu {
+  background: rgba(255, 252, 247, 0.98);
+  border: 1px solid rgba(12, 27, 26, 0.12);
+  border-radius: 14px;
+  box-shadow: 0 16px 48px rgba(43, 51, 49, 0.12), 0 0 0 1px rgba(0, 0, 0, 0.03);
+  min-width: 300px;
+  max-width: 340px;
+  overflow: hidden;
+}
+
+.slash-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(12, 27, 26, 0.08);
+}
+
+.slash-header-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: rgba(45, 142, 117, 0.15);
+  color: #2d8e75;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.slash-header-text {
+  color: #61726d;
+  font-size: 12px;
+}
+
+.slash-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 360px;
+  overflow: auto;
+  padding: 6px 0;
+}
+
+.slash-group-header {
+  padding: 8px 14px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #876843;
+  background: transparent;
+}
+
+.slash-group-header:not(:first-child) {
+  margin-top: 6px;
+  border-top: 1px solid rgba(12, 27, 26, 0.06);
+  padding-top: 10px;
+}
+
+.slash-item {
+  display: flex;
+  gap: 12px;
+  padding: 8px 14px;
+  border: none;
+  background: transparent;
+  color: #0c1b1a;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s;
+  width: 100%;
+  font: inherit;
+}
+
+.slash-item:hover,
+.slash-item.active {
+  background: rgba(45, 142, 117, 0.06);
+}
+
+.slash-item .icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: rgba(12, 27, 26, 0.04);
+  border: 1px solid rgba(12, 27, 26, 0.08);
+  color: #0c1b1a;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.slash-item .meta {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.slash-item .meta .title {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.slash-item .meta .desc {
+  color: #61726d;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.slash-empty {
+  padding: 20px 14px;
+  text-align: center;
+  color: #61726d;
+  font-size: 13px;
+}
+
+/* --- Tippy.js override for slash menu --- */
+
+.tippy-box[data-theme~="light"] {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.tippy-box[data-theme~="light"] .tippy-content {
+  padding: 0;
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Nexus Web Frontend
+After=network.target nexus-api.service
+Requires=nexus-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/USER/nexus/web
+ExecStartPre=/usr/bin/npm ci
+ExecStartPre=/usr/bin/npm run build
+ExecStart=/usr/bin/npm run preview -- --host 127.0.0.1 --port 5175
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

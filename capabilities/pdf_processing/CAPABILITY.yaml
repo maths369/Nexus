@@ -1,0 +1,11 @@
+id: pdf_processing
+name: PDF Processing
+description: PDF 读取、提取与生成（pymupdf, reportlab）。
+packages:
+  - pymupdf>=1.23.0
+  - reportlab>=4.1.0
+imports:
+  - fitz
+  - reportlab
+tools: []
+skill_hint: ""

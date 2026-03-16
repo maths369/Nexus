@@ -1,0 +1,70 @@
+node_id: macbook-pro-user
+node_type: edge
+display_name: MacBook Pro
+platform: macos
+arch: arm64
+
+providers:
+  - name: kimi
+    model: kimi-k2.5
+    via: api
+    properties:
+      provider_type: moonshot
+      base_url: https://api.moonshot.cn/v1
+      api_key: ${MOONSHOT_API_KEY}
+  - name: qwen
+    model: qwen3.5-397b-a17b
+    via: api
+    properties:
+      provider_type: qwen
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: ${DASHSCOPE_API_KEY}
+
+capabilities:
+  - capability_id: browser_automation
+    description: Playwright browser automation for authenticated browsing and extraction.
+    tools:
+      - browser_navigate
+      - browser_extract_text
+      - browser_screenshot
+      - browser_fill_form
+    requires_user_interaction: true
+  - capability_id: local_filesystem
+    description: Access to macOS local filesystem.
+    tools:
+      - list_local_files
+      - code_read_file
+  - capability_id: screen_capture
+    description: Screen capture and recording.
+    tools:
+      - capture_screen
+      - record_screen
+  - capability_id: clipboard
+    description: Clipboard read and write.
+    tools:
+      - read_clipboard
+      - write_clipboard
+  - capability_id: apple_shortcuts
+    description: Apple Shortcuts available on the local Mac session.
+    tools:
+      - list_shortcuts
+      - run_shortcut
+    requires_user_interaction: true
+  - capability_id: apple_automation
+    description: Local AppleScript or JXA automation for the current macOS session.
+    tools:
+      - run_applescript
+    requires_user_interaction: true
+
+resources:
+  cpu_cores: 10
+  memory_gb: 16
+  gpu: Apple M3 Pro
+  gpu_memory_gb: 0
+  disk_free_gb: 120
+  battery_powered: true
+
+availability:
+  schedule: weekdays 08:00-23:00
+  intermittent: true
+  max_task_duration_seconds: 1800

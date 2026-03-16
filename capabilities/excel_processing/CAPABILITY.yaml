@@ -1,0 +1,15 @@
+id: excel_processing
+name: Excel Processing
+description: 支持读取 Excel 工作簿并转换为 CSV。
+packages:
+  - pandas>=2.2.0
+  - openpyxl>=3.1.0
+  - xlrd>=2.0.1
+imports:
+  - pandas
+  - openpyxl
+  - xlrd
+tools:
+  - excel_list_sheets
+  - excel_to_csv
+skill_hint: excel-processing
