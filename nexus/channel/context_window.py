@@ -4,7 +4,7 @@ Context Window Manager — 上下文窗口管理
 职责:
 1. 管理 session 的上下文 freshness（消息时效性）
 2. 决定 Agent 应该看到哪些历史
-3. 上下文截断策略
+3. 上下文压缩策略（参照 OpenClaw 的分级截断）
 4. 支持 reset（用户显式重置上下文）
 """
 
@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 1 token ≈ 4 chars (粗估，与 OpenClaw 一致)
+_CHARS_PER_TOKEN = 4
+
 
 class ContextWindowManager:
     """
@@ -28,6 +31,11 @@ class ContextWindowManager:
     - freshness_minutes: 消息间隔超过此值后，视为 session 已 stale
     - max_events: 上下文窗口最多包含多少条事件
     - max_tokens_estimate: 上下文 token 上限的粗估值
+
+    压缩策略（参照 OpenClaw context-pruning）:
+    - soft_trim: 上下文字符数超过窗口 30% 时，截断长消息保留首尾
+    - hard_clear: 超过 50% 时，将旧的 tool/assistant 消息替换为占位符
+    - 保护最近 keep_last_assistants 条 assistant 消息不被裁剪
     """
 
     def __init__(
@@ -36,11 +44,28 @@ class ContextWindowManager:
         freshness_minutes: int = 10,
         max_events: int = 50,
         max_tokens_estimate: int = 8000,
+        *,
+        # 压缩参数
+        context_window_tokens: int = 128_000,
+        soft_trim_ratio: float = 0.3,
+        hard_clear_ratio: float = 0.5,
+        keep_last_assistants: int = 3,
+        soft_trim_max_chars: int = 4000,
+        soft_trim_head_chars: int = 1500,
+        soft_trim_tail_chars: int = 1500,
     ):
         self._store = session_store
         self._freshness_minutes = freshness_minutes
         self._max_events = max_events
         self._max_tokens_estimate = max_tokens_estimate
+        # 压缩参数
+        self._context_window_chars = context_window_tokens * _CHARS_PER_TOKEN
+        self._soft_trim_ratio = soft_trim_ratio
+        self._hard_clear_ratio = hard_clear_ratio
+        self._keep_last_assistants = keep_last_assistants
+        self._soft_trim_max_chars = soft_trim_max_chars
+        self._soft_trim_head_chars = soft_trim_head_chars
+        self._soft_trim_tail_chars = soft_trim_tail_chars
 
     def is_within_freshness(
         self, session_id: str, current_time: datetime
@@ -63,8 +88,8 @@ class ContextWindowManager:
 
         截断策略:
         1. 最多 max_events 条
-        2. 粗估 token 不超过 max_tokens_estimate
-        3. 总是保留第一条（任务描述）和最新的消息
+        2. 总是保留第一条（任务描述）和最新的消息
+        3. 分级压缩长消息（soft-trim → hard-clear）
         """
         events = self._store.get_events(session_id)
         if not events:
@@ -81,16 +106,18 @@ class ContextWindowManager:
 
         artifact_message = self._recent_artifacts_message(session_id)
 
-        # 如果事件数未超过限制，直接返回
-        if len(events) <= self._max_events:
-            return self._events_to_messages(events, artifact_message=artifact_message)
+        # 事件数截断：保留首条 + 最近 N 条
+        if len(events) > self._max_events:
+            first = events[0]
+            recent = events[-(self._max_events - 1):]
+            events = [first] + recent
 
-        # 截断：保留首条 + 最近 N 条
-        first = events[0]
-        recent = events[-(self._max_events - 1):]
-        truncated = [first] + recent
+        messages = self._events_to_messages(events, artifact_message=artifact_message)
 
-        return self._events_to_messages(truncated, artifact_message=artifact_message)
+        # 分级压缩
+        messages = self._compact_messages(messages)
+
+        return messages
 
     def reset(self, session_id: str) -> None:
         """
@@ -105,6 +132,89 @@ class ContextWindowManager:
             content="[context_reset] 用户重置了上下文窗口",
         )
         logger.info(f"Context reset for session {session_id}")
+
+    # ------------------------------------------------------------------
+    # 分级压缩（参照 OpenClaw context-pruning）
+    # ------------------------------------------------------------------
+
+    def _compact_messages(
+        self, messages: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        """对 messages 执行分级压缩，减少上下文占用。
+
+        Stage 1 (soft-trim): 超过 soft_trim_ratio 时，截断长的 tool/assistant 消息
+        Stage 2 (hard-clear): 超过 hard_clear_ratio 时，替换旧消息为占位符
+        """
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+        if total_chars == 0:
+            return messages
+
+        ratio = total_chars / self._context_window_chars
+        if ratio < self._soft_trim_ratio:
+            return messages
+
+        # 标记受保护的索引：第一条 user 消息 + 最近 N 条 assistant 消息
+        protected = self._protected_indices(messages)
+
+        # Stage 1: soft-trim
+        messages = list(messages)  # shallow copy
+        for i, msg in enumerate(messages):
+            if i in protected:
+                continue
+            if msg["role"] not in ("assistant", "tool"):
+                continue
+            content = msg.get("content", "")
+            if len(content) <= self._soft_trim_max_chars:
+                continue
+            head = content[:self._soft_trim_head_chars]
+            tail = content[-self._soft_trim_tail_chars:]
+            trimmed = f"{head}\n\n... [已截断 {len(content) - self._soft_trim_head_chars - self._soft_trim_tail_chars} 字符] ...\n\n{tail}"
+            messages[i] = {**msg, "content": trimmed}
+
+        # 重新计算
+        total_chars = sum(len(m.get("content", "")) for m in messages)
+        ratio = total_chars / self._context_window_chars
+        if ratio < self._hard_clear_ratio:
+            return messages
+
+        # Stage 2: hard-clear（从最旧到最新，跳过受保护的）
+        for i, msg in enumerate(messages):
+            if i in protected:
+                continue
+            if msg["role"] not in ("assistant", "tool"):
+                continue
+            content = msg.get("content", "")
+            if len(content) <= 200:
+                continue
+            messages[i] = {**msg, "content": "[历史回复内容已清理]"}
+            total_chars = sum(len(m.get("content", "")) for m in messages)
+            ratio = total_chars / self._context_window_chars
+            if ratio < self._hard_clear_ratio:
+                break
+
+        return messages
+
+    def _protected_indices(self, messages: list[dict[str, str]]) -> set[int]:
+        """返回受保护的消息索引（不参与压缩）。
+
+        保护规则:
+        - 第一条 user 消息（任务起点）
+        - 最近 keep_last_assistants 条 assistant/tool 消息
+        """
+        protected: set[int] = set()
+        # 保护第一条 user 消息
+        for i, msg in enumerate(messages):
+            if msg["role"] == "user":
+                protected.add(i)
+                break
+        # 保护最近 N 条 assistant 消息
+        assistant_indices = [
+            i for i, msg in enumerate(messages)
+            if msg["role"] in ("assistant", "tool")
+        ]
+        for idx in assistant_indices[-self._keep_last_assistants:]:
+            protected.add(idx)
+        return protected
 
     # ------------------------------------------------------------------
     # 内部辅助
@@ -133,7 +243,7 @@ class ContextWindowManager:
             return ""
         lines = [
             "[session_recent_artifacts]",
-            "本会话最近导入了以下附件。若用户提到“刚上传的文件/这个 PDF/这张图片/这个音频”，优先指代这些附件，不要再次向用户索要文件路径。",
+            '本会话最近导入了以下附件。若用户提到"刚上传的文件/这个 PDF/这张图片/这个音频"，优先指代这些附件，不要再次向用户索要文件路径。',
         ]
         for item in artifacts:
             parts = [

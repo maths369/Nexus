@@ -556,6 +556,8 @@ def _mesh_config(settings: NexusSettings, args: argparse.Namespace) -> dict[str,
     raw = settings.mesh_config()
     broker_host = args.broker_host or raw["broker_host"]
     broker_port = int(args.broker_port or raw["broker_port"])
+    hub_api_host = getattr(args, "hub_api_host", "") or ""
+    hub_api_port = int(getattr(args, "hub_api_port", 0) or 0)
     transport = str(args.mesh_transport or raw["transport"])
     mesh_username = args.mesh_username if args.mesh_username is not None else raw["username"]
     mesh_password = args.mesh_password if args.mesh_password is not None else raw["password"]
@@ -578,6 +580,8 @@ def _mesh_config(settings: NexusSettings, args: argparse.Namespace) -> dict[str,
         "tls_key_path": raw["tls_key_path"],
         "tls_insecure": bool(raw["tls_insecure"]),
         "node_card_path": node_card_path,
+        **({"hub_api_host": hub_api_host} if hub_api_host else {}),
+        **({"hub_api_port": hub_api_port} if hub_api_port else {}),
     }
 
 
@@ -1451,6 +1455,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["", "tcp", "websockets"],
         help="MQTT transport override.",
     )
+    parser.add_argument("--hub-api-host", default="", help="Hub API hostname override.")
+    parser.add_argument("--hub-api-port", type=int, default=0, help="Hub API port override.")
     parser.add_argument("--mesh-username", default=None, help="MQTT username override.")
     parser.add_argument("--mesh-password", default=None, help="MQTT password override.")
     parser.add_argument("--tls-enabled", action="store_true", default=None, help="Enable MQTT TLS.")

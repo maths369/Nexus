@@ -444,17 +444,21 @@ class Orchestrator:
         decision: RoutingDecision,
         reply: ReplyFn,
     ) -> None:
-        """处理新任务意图"""
-        # 创建新 session
-        session = self._sessions.create_session(
+        """处理新任务意图 — 复用持久 session（同 sender + channel 同 session）"""
+        channel_key = message.metadata.get("channel_key") or message.channel.value
+        session, created = self._sessions.get_or_create_persistent_session(
             sender_id=message.sender_id,
-            channel=message.channel.value,
-            summary=message.content[:100],
+            channel=channel_key,
         )
-        self._sessions.close_other_active_sessions(
-            sender_id=message.sender_id,
-            keep_session_id=session.session_id,
-            new_status=SessionStatus.ABANDONED,
+        if created:
+            self._sessions.close_other_active_sessions(
+                sender_id=message.sender_id,
+                keep_session_id=session.session_id,
+                new_status=SessionStatus.ABANDONED,
+            )
+        # 更新 summary 为最新任务
+        self._sessions.update_session_summary(
+            session.session_id, message.content[:100],
         )
         # 记录用户消息
         self._record_inbound_message(session.session_id, message)
@@ -477,6 +481,11 @@ class Orchestrator:
         if not session_id:
             # 降级为新任务
             return await self._handle_new_task(message, decision, reply)
+
+        # Re-activate session if it was completed/paused (persistent session model)
+        session = self._sessions.get_session(session_id)
+        if session and session.status != SessionStatus.ACTIVE:
+            self._sessions.update_session_status(session_id, SessionStatus.ACTIVE)
 
         # 记录用户消息
         self._record_inbound_message(session_id, message)
@@ -744,19 +753,16 @@ class Orchestrator:
 
                 # 发送结果
                 if run.status == RunStatus.SUCCEEDED:
-                    self._sessions.update_session_status(
-                        session_id,
-                        SessionStatus.COMPLETED,
-                    )
+                    # Keep session active so follow-up messages can be
+                    # associated within the freshness window.  The session
+                    # router's freshness check will naturally expire it.
                     await reply(self._formatter.format_result(
                         session_id=session_id,
                         result=run.result,
                     ))
                 else:
-                    self._sessions.update_session_status(
-                        session_id,
-                        SessionStatus.PAUSED,
-                    )
+                    # Keep session active even on failure (persistent session model).
+                    # The session stays alive so the user can retry or follow up.
                     await reply(self._formatter.format_error(
                         session_id=session_id,
                         error=run.error or "执行失败，请重试。",

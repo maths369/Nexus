@@ -143,16 +143,19 @@ def _build_feishu_inbound(
     content: str,
     attachments: list[dict[str, object]] | None = None,
 ) -> InboundMessage:
+    chat_id = str(event.get("chat_id") or "")
+    channel_key = f"feishu:{chat_id}" if chat_id else "feishu"
     return InboundMessage(
         message_id=str(event.get("message_id") or ""),
         channel=ChannelType.FEISHU,
         sender_id=str(event.get("sender_user_id") or ""),
         content=content,
         metadata={
-            "chat_id": str(event.get("chat_id") or ""),
+            "chat_id": chat_id,
             "chat_type": str(event.get("chat_type") or ""),
             "message_type": str(event.get("message_type") or "text"),
             "source": "feishu",
+            "channel_key": channel_key,
         },
         attachments=[dict(item) for item in (attachments or [])],
     )

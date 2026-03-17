@@ -389,10 +389,23 @@ class FeishuAdapter:
             image_key = str(attachment.get("image_key") or "").strip()
             if not image_key:
                 raise ValueError("image_key is required")
+            # Try the direct image API first, fall back to message resource API
+            # Forwarded message images (img_v3_02vs_*) often require the resource API
             response = await self._client.get(
                 f"{self._base_url}/im/v1/images/{image_key}",
+                params={"image_type": "message"},
                 headers=headers,
             )
+            if response.status_code == 400 and message_id:
+                logger.info(
+                    "Image API returned 400 for %s, falling back to message resource API",
+                    image_key,
+                )
+                response = await self._client.get(
+                    f"{self._base_url}/im/v1/messages/{message_id}/resources/{image_key}",
+                    params={"type": "image"},
+                    headers=headers,
+                )
         else:
             file_key = str(attachment.get("file_key") or "").strip()
             if not file_key:

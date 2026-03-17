@@ -86,6 +86,9 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS idx_sessions_status
                     ON sessions(status, updated_at DESC);
 
+                CREATE INDEX IF NOT EXISTS idx_sessions_sender_channel
+                    ON sessions(sender_id, channel, status, updated_at DESC);
+
                 CREATE TABLE IF NOT EXISTS session_events (
                     event_id     TEXT PRIMARY KEY,
                     session_id   TEXT NOT NULL,
@@ -133,6 +136,38 @@ class SessionStore:
             )
         logger.info(f"Created session {session.session_id} for {sender_id}")
         return session
+
+    def get_or_create_persistent_session(
+        self, sender_id: str, channel: str,
+    ) -> tuple[Session, bool]:
+        """Get the persistent session for (sender_id, channel), or create one.
+
+        Returns ``(session, created)`` where *created* is ``True`` when a brand
+        new session was made.
+
+        Lookup priority:
+        1. Active session for this sender + channel
+        2. Most recent non-abandoned session for this sender + channel
+        3. Create new
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT * FROM sessions
+                   WHERE sender_id = ? AND channel = ?
+                         AND status IN ('active', 'paused', 'completed')
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (sender_id, channel),
+            ).fetchone()
+        if row:
+            session = self._row_to_session(row)
+            if session.status != SessionStatus.ACTIVE:
+                self.update_session_status(session.session_id, SessionStatus.ACTIVE)
+                session.status = SessionStatus.ACTIVE
+            self.touch_session(session.session_id)
+            return session, False
+        session = self.create_session(sender_id=sender_id, channel=channel)
+        return session, True
 
     def get_active_session(self, sender_id: str) -> Session | None:
         """获取用户当前活跃的 session"""

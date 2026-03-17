@@ -221,27 +221,32 @@ class SessionRouter:
         )
 
     async def _match_active_session(self, message: InboundMessage) -> RoutingDecision | None:
+        # Try active session first, then fall back to most recent session
+        # (which may be completed but still within the freshness window).
         active = self._store.get_active_session(sender_id=message.sender_id)
-        if not active:
+        candidate = active
+        if candidate is None:
+            candidate = self._store.get_most_recent_session(sender_id=message.sender_id)
+        if candidate is None:
             return None
-        if not self._context.is_within_freshness(active.session_id, message.timestamp):
+        if not self._context.is_within_freshness(candidate.session_id, message.timestamp):
             return None
 
         text = message.content.strip()
-        if self._looks_like_follow_up(text, active):
+        if self._looks_like_follow_up(text, candidate):
             return RoutingDecision(
                 intent=MessageIntent.FOLLOW_UP,
-                session_id=active.session_id,
+                session_id=candidate.session_id,
                 confidence=0.88,
-                reason="fresh active session follow-up",
+                reason="fresh session follow-up",
             )
 
         if self._is_brief_ambiguous_reply(text):
             return RoutingDecision(
                 intent=MessageIntent.FOLLOW_UP,
-                session_id=active.session_id,
+                session_id=candidate.session_id,
                 confidence=0.65,
-                reason="brief reply within active freshness window",
+                reason="brief reply within freshness window",
             )
         return None
 
