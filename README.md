@@ -1,208 +1,204 @@
 # Nexus / 星策
 
-**Personal AI Agent Runtime — 跨设备的个人 AI 助手操作系统**
+**Personal AI Agent Runtime — a multi-node distributed AI assistant that extends across all your devices.**
 
-Nexus 是一个面向个人用户的 AI Agent 运行时，通过多节点协同（Hub + Edge + Mobile）将 AI 助手的能力从云端延伸到你的每一台设备。
+Nexus is a personal AI Agent Runtime that coordinates across multiple nodes (Hub + Edge + Mobile) via an MQTT-based mesh network. It's not a generic chatbot — it's a persistent, tool-wielding, self-evolving personal execution engine.
 
-它不是一个通用聊天机器人，而是一个有记忆、有工具、可进化的个人执行中枢。
+> 📖 [中文文档 / Chinese Documentation](./README_CN.md)
 
 ---
 
-## 核心特性
+## Key Features
 
-### 多节点 Mesh 网络
+### Multi-Node Mesh Network
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Nexus Mesh                           │
-│                                                         │
-│   ┌──────────┐   MQTT    ┌──────────┐   MQTT    ┌────┐ │
-│   │ Hub      │◄────────►│ MacBook  │           │ iOS│ │
-│   │ (Ubuntu) │           │  (Edge)  │           │    │ │
-│   └────┬─────┘           └──────────┘           └────┘ │
-│        │                  AppleScript                   │
-│   ┌────┴─────┐            Browser                      │
-│   │ Feishu   │            Screenshot                   │
-│   │ Web UI   │            Clipboard                    │
-│   └──────────┘            Shortcuts                    │
+│                    Nexus Mesh                            │
+│                                                          │
+│   ┌──────────┐   MQTT    ┌──────────┐   MQTT    ┌─────┐ │
+│   │ Hub      │◄────────►│ MacBook  │           │ iOS │ │
+│   │ (Ubuntu) │           │  (Edge)  │           │     │ │
+│   └────┬─────┘           └──────────┘           └─────┘ │
+│        │                  AppleScript                    │
+│   ┌────┴─────┐            Browser                       │
+│   │ Feishu   │            Screenshot                    │
+│   │ Web UI   │            Clipboard                     │
+│   └──────────┘            Shortcuts                     │
 └─────────────────────────────────────────────────────────┘
 ```
 
-- **Hub (Ubuntu Server)** — 中枢节点：LLM 推理、知识库、文档管理、任务路由
-- **Edge (MacBook)** — 边缘节点：浏览器自动化、AppleScript、截屏、剪贴板、本地文件
-- **Mobile (iPhone)** — 移动节点：拍照、定位、推送通知（规划中）
+- **Hub (Ubuntu Server)** — Central brain: LLM inference, knowledge base, document management, task routing
+- **Edge (MacBook)** — Local executor: browser automation, AppleScript, screen capture, clipboard, local files
+- **Mobile (iPhone)** — Mobile node: camera, location, push notifications *(planned)*
 
-Hub 通过 MQTT 协调所有节点，TaskRouter 自动将任务分配给具备相应能力的节点执行。
+The Hub coordinates all nodes via MQTT. The TaskRouter automatically dispatches tasks to whichever node has the required capabilities.
 
 ### Agent Runtime
 
-- **Tool-calling Loop** — LLM 驱动的多步工具调用循环，支持自动重试和上下文压缩
-- **Tool Governance** — 黑白名单、风险等级、频率限制、审批流程
-- **Subagent** — 子 Agent 委派，支持后台长时任务
-- **Task DAG** — 任务依赖图，结构化任务管理
+- **Tool-calling Loop** — LLM-driven multi-step tool execution with auto-retry and context compression
+- **Tool Governance** — Allowlist/blocklist, risk levels, rate limits, approval workflows
+- **Subagent Delegation** — Spawn sub-agents for background long-running tasks
+- **Task DAG** — Dependency-aware structured task management
 
-### 知识系统（三层架构）
+### Three-Layer Knowledge System
 
-- **Vault** — Markdown 文件为规范知识源，Notion-style block 编辑
-- **结构索引** — SQLite 维护页面树、反向链接、Collection
-- **检索与记忆** — FTS5 全文检索 + 情景记忆（episodic memory），时间衰减权重
+- **Vault** — Markdown files as the canonical source of truth, with Notion-style block editing
+- **Structural Index** — SQLite-backed page tree, backlinks, and collections
+- **Retrieval & Memory** — FTS5 full-text search + episodic memory with time-decay weighting
 
-### 受控自我进化
+### Controlled Self-Evolution
 
-- **Skill System** — 可发现、安装、加载的技能包，热插拔扩展 Agent 能力
-- **Capability Lifecycle** — `sandbox → verify → promote → rollback` 全生命周期
-- **Evolution Audit** — 所有变更记录到审计日志
+- **Skill System** — Discoverable, installable, hot-swappable skill packages that extend the agent's capabilities at runtime
+- **Capability Lifecycle** — `sandbox → verify → promote → rollback` with full audit trail
+- **Evolution Audit** — Every change logged for traceability and rollback
 
-### 多通道接入
+### Multi-Channel Access
 
-- **飞书 / Lark** — 长连接模式，支持富文本、文件、语音消息
-- **Web UI** — React + TipTap 富文本编辑器，WebSocket 实时通信
-- **macOS Menu Bar** — SwiftUI 原生菜单栏应用，本地/Hub 双模式
+- **Feishu / Lark** — Long-connection mode with rich text, file, and voice message support
+- **Web UI** — React + TipTap rich text editor with WebSocket real-time communication
+- **macOS Menu Bar** — Native SwiftUI app with local/Hub dual-mode execution
 
 ---
 
-## 项目结构
+## Architecture
 
 ```
 nexus/
-├── nexus/                    # Python 后端
-│   ├── agent/                # Agent Runtime — 工具调用循环、策略、子代理
-│   ├── api/                  # FastAPI 应用入口
-│   ├── channel/              # 通道适配器（飞书、Web）
-│   ├── edge/                 # Edge 节点 — macOS Sidecar、本地工具
-│   ├── evolution/            # 自我进化 — Skill/Capability 生命周期
-│   ├── knowledge/            # 知识系统 — Vault、检索、记忆
-│   ├── mesh/                 # Mesh 网络 — MQTT、TaskRouter、远程工具代理
-│   ├── provider/             # LLM Provider Gateway（多模型、健康检查、故障转移）
-│   ├── services/             # 基础服务（浏览器、工作区）
-│   └── shared/               # 共享配置与工具
+├── nexus/                    # Python backend
+│   ├── agent/                # Agent Runtime — tool loop, policies, subagents
+│   ├── api/                  # FastAPI application entry
+│   ├── channel/              # Channel adapters (Feishu, Web)
+│   ├── edge/                 # Edge node — macOS Sidecar, local tools
+│   ├── evolution/            # Self-evolution — Skill/Capability lifecycle
+│   ├── knowledge/            # Knowledge system — Vault, retrieval, memory
+│   ├── mesh/                 # Mesh network — MQTT, TaskRouter, remote tool proxy
+│   ├── provider/             # LLM Provider Gateway (multi-model, health check, failover)
+│   ├── services/             # Base services (browser, workspace)
+│   └── shared/               # Shared config & utilities
 ├── apps/
-│   └── macos/                # SwiftUI macOS 菜单栏应用
+│   └── macos/                # SwiftUI macOS menu bar app
 ├── web/                      # React Web UI
-├── config/                   # 配置文件（.example 模板）
-├── deploy/                   # 部署配置（systemd、nginx、MQTT broker）
-├── skills/                   # 已安装的 Skill 包
-├── skill_registry/           # 可安装 Skill 注册表
-├── capabilities/             # Capability 定义
-├── tests/                    # 测试套件
-└── docs/                     # 架构文档
+├── config/                   # Configuration files (.example templates)
+├── deploy/                   # Deployment config (systemd, nginx, MQTT broker)
+├── skills/                   # Installed skill packages
+├── skill_registry/           # Installable skill registry
+├── capabilities/             # Capability definitions
+├── tests/                    # Test suite
+└── docs/                     # Architecture docs
 ```
 
 ---
 
-## 快速开始
+## Getting Started
 
-### 前置条件
+### Prerequisites
 
 - Python 3.10+
-- Node.js 18+ (Web UI)
-- MQTT Broker (Mosquitto 推荐)
-- 至少一个 LLM API Key（Moonshot/Kimi、通义千问、或任何 OpenAI 兼容 API）
+- Node.js 18+ (for Web UI)
+- MQTT Broker (Mosquitto recommended)
+- At least one LLM API key (Moonshot/Kimi, Qwen, OpenAI, or any OpenAI-compatible API)
 
-### 1. 安装
+### 1. Install
 
 ```bash
 git clone https://github.com/maths369/Nexus.git
-cd nexus
+cd Nexus
 
-# 创建 Python 环境
+# Create Python environment
 conda create -n nexus python=3.11
 conda activate nexus
 pip install -e ".[dev,browser]"
 
-# 安装 Web 依赖
+# Install Web UI dependencies
 cd web && npm ci && cd ..
 ```
 
-### 2. 配置
+### 2. Configure
 
 ```bash
-# 复制配置模板
+# Copy config templates
 cp .env.example .env
 cp config/app.yaml.example config/app.yaml
 cp config/node_cards/hub-server.example.yaml config/node_cards/my-hub.yaml
 
-# 编辑 .env 填入你的 API Key
+# Edit .env with your API keys
 vim .env
 
-# 编辑 config/app.yaml 调整参数
+# Edit config/app.yaml to adjust settings
 vim config/app.yaml
 ```
 
-### 3. 启动 Hub
+### 3. Start the Hub
 
 ```bash
-# 启动 MQTT Broker（如果还没运行）
+# Start MQTT Broker (if not already running)
 mosquitto -c deploy/mosquitto/mosquitto.conf -d
 
-# 启动 Nexus API
+# Start Nexus API
 python -m nexus serve --host 0.0.0.0 --port 8000
 
-# 启动 Web UI（另一个终端）
+# Start Web UI (in another terminal)
 cd web && npm run dev
 ```
 
-### 4. 启动 Edge (MacBook)
+### 4. Start an Edge Node (MacBook)
 
 ```bash
-# 复制 Edge 节点卡片
+# Copy and configure edge node card
 cp config/node_cards/macbook-edge.example.yaml config/node_cards/my-macbook.yaml
-# 编辑填入 API Key
 vim config/node_cards/my-macbook.yaml
 
-# 启动 Sidecar
+# Start Sidecar
 python -m nexus edge --node-card config/node_cards/my-macbook.yaml
 ```
 
-或使用 macOS Menu Bar App（`apps/macos/`）：
+Or use the macOS Menu Bar App (`apps/macos/`):
 
 ```bash
 cd apps/macos
-swift build
-open .build/debug/NexusMac.app
+xcodebuild -scheme NexusMac -configuration Release build
 ```
 
 ---
 
-## LLM Provider 支持
+## LLM Provider Support
 
-Nexus 使用 OpenAI 兼容的 API 协议，支持：
+Nexus uses the OpenAI-compatible API protocol and supports multiple providers with automatic failover:
 
-| Provider | 模型示例 | 配置 |
-|----------|---------|------|
+| Provider | Example Models | Config |
+|----------|---------------|--------|
 | Moonshot / Kimi | kimi-k2.5 | `provider_type: moonshot` |
-| 通义千问 / DashScope | qwen3.5-397b-a17b | `provider_type: qwen` |
+| Qwen / DashScope | qwen3.5-397b-a17b | `provider_type: qwen` |
 | OpenAI | gpt-4o | `provider_type: openai` |
-| Ollama (本地) | qwen2.5:72b | `via: local` |
-| 任何 OpenAI 兼容 API | — | 配置 `base_url` + `api_key` |
-
-支持多 Provider 故障转移、健康检查、自动切换。
+| Ollama (local) | qwen2.5:72b | `via: local` |
+| Any OpenAI-compatible API | — | Set `base_url` + `api_key` |
 
 ---
 
-## Mesh 网络
+## Mesh Network
 
-Nexus Mesh 通过 MQTT 协调多个节点协同工作：
+Nexus Mesh coordinates multi-node collaboration via MQTT:
 
-1. **节点注册** — 每个节点通过 Node Card（YAML）声明自己的能力和资源
-2. **TaskRouter** — Hub 自动检测任务所需能力，路由到合适的在线节点
-3. **Agent Loop Dispatch** — 对于多步任务（如浏览器操作），Hub 将整个子任务委托给 Edge 节点的本地 LLM 自主执行
-4. **Journal Sync** — Edge 节点定期将执行日志同步回 Hub
+1. **Node Registration** — Each node declares its capabilities and resources via a Node Card (YAML)
+2. **TaskRouter** — Hub detects required capabilities and routes tasks to the best online node
+3. **Agent Loop Dispatch** — For multi-step tasks (e.g., browser automation), Hub delegates the entire sub-task to the Edge node's local LLM for autonomous execution
+4. **Journal Sync** — Edge nodes periodically sync execution journals back to Hub
 
-### 示例：通过飞书让 MacBook 打开 Chrome
+### Example: Open Chrome on MacBook via Feishu
 
 ```
-用户(飞书) → "打开MacBook上的Chrome"
-  → Hub 接收消息
-  → TaskRouter 检测 apple_automation 能力 → 路由到 MacBook
-  → Hub LLM 调用 mesh_dispatch 工具
-  → MacBook 收到任务 → 本地 LLM 调用 run_applescript
-  → Chrome 打开 → 结果回传 Hub → 飞书回复用户
+User (Feishu) → "Open Chrome on my MacBook"
+  → Hub receives message
+  → TaskRouter detects apple_automation capability → routes to MacBook
+  → Hub LLM calls mesh_dispatch tool
+  → MacBook receives task → local LLM calls run_applescript
+  → Chrome opens → result synced back to Hub → Feishu replies to user
 ```
 
 ---
 
-## 测试
+## Testing
 
 ```bash
 python -m pytest tests/ -v
@@ -210,18 +206,28 @@ python -m pytest tests/ -v
 
 ---
 
-## 技术栈
+## Tech Stack
 
-| 层 | 技术 |
-|---|------|
+| Layer | Technology |
+|-------|-----------|
 | Backend | Python 3.11, FastAPI, asyncio |
 | LLM | OpenAI-compatible API (Kimi, Qwen, GPT-4o, Ollama) |
 | Messaging | MQTT (aiomqtt), WebSocket |
 | Storage | SQLite (FTS5), Markdown (Vault) |
 | Web UI | React, TypeScript, TipTap, Vite |
 | macOS App | SwiftUI, Combine |
-| IM | Feishu/Lark SDK (长连接) |
+| IM | Feishu / Lark SDK (long-connection) |
 | Deployment | systemd, nginx, Docker |
+
+---
+
+## Roadmap
+
+- [ ] iPhone mobile node (camera, location, push notifications)
+- [ ] Voice interaction via macOS Menu Bar
+- [ ] Multi-user support
+- [ ] Plugin marketplace for community skills
+- [ ] End-to-end encryption for mesh communication
 
 ---
 
