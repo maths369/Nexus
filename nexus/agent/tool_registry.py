@@ -1924,6 +1924,207 @@ def build_tool_registry(
             tags=["evolution", "system"],
         ))
 
+    # ── BMAD 项目管理工具 ──
+
+    _PROJECT_BASE = "projects"
+
+    _PROJECT_DIRS = [
+        "planning",
+        "implementation",
+        "implementation/stories",
+    ]
+
+    _ARTIFACT_CHAIN = {
+        "product-brief": {"path": "planning/product-brief.md", "depends": [], "phase": "Analysis"},
+        "prd": {"path": "planning/prd.md", "depends": ["product-brief"], "phase": "Planning"},
+        "ux-spec": {"path": "planning/ux-spec.md", "depends": ["prd"], "phase": "Planning"},
+        "architecture": {"path": "planning/architecture.md", "depends": ["prd"], "phase": "Solutioning"},
+        "epics": {"path": "implementation/epics.md", "depends": ["prd", "architecture"], "phase": "Solutioning"},
+        "project-context": {"path": "project-context.md", "depends": ["architecture"], "phase": "Solutioning"},
+        "sprint-status": {"path": "implementation/sprint-status.yaml", "depends": ["epics"], "phase": "Implementation"},
+    }
+
+    async def project_init(name: str) -> str:
+        """初始化 BMAD 项目目录结构"""
+        slug = name.strip().lower().replace(" ", "-")
+        base = f"{_PROJECT_BASE}/{slug}"
+        created = []
+        for d in _PROJECT_DIRS:
+            dir_path = f"{base}/{d}"
+            try:
+                await document_service.update_page(
+                    relative_path=f"{dir_path}/.gitkeep",
+                    content="",
+                    title=None,
+                )
+                created.append(dir_path)
+            except Exception:
+                pass
+        # 创建 project-context.md 骨架
+        ctx_path = f"{base}/project-context.md"
+        ctx_content = f"# {name} — Project Context\n\n## 技术栈\n\n（待填写）\n\n## 编码规范\n\n（待填写）\n\n## 实施规则\n\n（待填写）\n"
+        await document_service.update_page(
+            relative_path=ctx_path,
+            content=ctx_content,
+            title=f"{name} — Project Context",
+        )
+        return _json({
+            "project": slug,
+            "base_path": base,
+            "created_dirs": created,
+            "next_step": "使用 bmad-pm (load_skill bmad-pm) 创建 PRD，或使用 bmad-analyst 做需求分析",
+        })
+
+    async def project_status(name: str) -> str:
+        """检查 BMAD 项目的产出物完成状态"""
+        slug = name.strip().lower().replace(" ", "-")
+        base = f"{_PROJECT_BASE}/{slug}"
+        results = []
+        completed_phases: set[str] = set()
+        for artifact, spec in _ARTIFACT_CHAIN.items():
+            path = f"{base}/{spec['path']}"
+            try:
+                content = content_store.read(path)
+                exists = bool(content and content.strip())
+            except Exception:
+                exists = False
+            deps_met = all(
+                any(r["artifact"] == d and r["exists"] for r in results)
+                for d in spec["depends"]
+            ) if spec["depends"] else True
+            results.append({
+                "artifact": artifact,
+                "path": path,
+                "exists": exists,
+                "deps_met": deps_met,
+                "phase": spec["phase"],
+            })
+            if exists:
+                completed_phases.add(spec["phase"])
+
+        # 推断当前阶段
+        all_phases = ["Analysis", "Planning", "Solutioning", "Implementation"]
+        current_phase = "Analysis"
+        for phase in all_phases:
+            phase_artifacts = [r for r in results if r["phase"] == phase]
+            if all(r["exists"] for r in phase_artifacts):
+                idx = all_phases.index(phase)
+                if idx + 1 < len(all_phases):
+                    current_phase = all_phases[idx + 1]
+            else:
+                current_phase = phase
+                break
+
+        return _json({
+            "project": slug,
+            "current_phase": current_phase,
+            "artifacts": results,
+            "completed_phases": sorted(completed_phases),
+        })
+
+    async def project_next(name: str) -> str:
+        """推荐 BMAD 项目的下一步操作"""
+        slug = name.strip().lower().replace(" ", "-")
+        base = f"{_PROJECT_BASE}/{slug}"
+        # 按产出物链顺序找第一个缺失的
+        for artifact, spec in _ARTIFACT_CHAIN.items():
+            path = f"{base}/{spec['path']}"
+            try:
+                content = content_store.read(path)
+                exists = bool(content and content.strip())
+            except Exception:
+                exists = False
+            if not exists:
+                skill_map = {
+                    "product-brief": ("bmad-pm", "CP (创建 Product Brief) 或使用 bmad-analyst 做市场/领域研究"),
+                    "prd": ("bmad-pm", "CP (创建 PRD)"),
+                    "ux-spec": ("bmad-ux-designer", "CU (创建 UX 设计)"),
+                    "architecture": ("bmad-architect", "CA (创建架构)"),
+                    "epics": ("bmad-pm", "CE (创建 Epic/Story 列表)"),
+                    "project-context": ("bmad-architect", "生成 project-context.md"),
+                    "sprint-status": ("bmad-sm", "SP (Sprint 规划)"),
+                }
+                skill_id, action = skill_map.get(artifact, ("", ""))
+                return _json({
+                    "project": slug,
+                    "next_artifact": artifact,
+                    "missing_path": f"{base}/{spec['path']}",
+                    "recommended_skill": skill_id,
+                    "recommended_action": action,
+                    "instruction": f"用 `load_skill {skill_id}` 加载对应 Skill，然后执行 {action}",
+                })
+        # 所有产出物都存在
+        return _json({
+            "project": slug,
+            "next_artifact": "stories",
+            "recommended_skill": "bmad-create-story",
+            "recommended_action": "创建下一个 Story 文件",
+            "instruction": "用 `load_skill bmad-create-story` 创建下一个开发 Story",
+        })
+
+    tools.extend([
+        ToolDefinition(
+            name="project_init",
+            description=(
+                "初始化 BMAD 项目目录结构（planning/ + implementation/ + project-context.md）。"
+                "用于开始一个新的软件项目。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "项目名称（如 'nexus-mesh', 'my-app'）",
+                    },
+                },
+                "required": ["name"],
+            },
+            handler=project_init,
+            risk_level=ToolRiskLevel.LOW,
+            tags=["bmad", "project"],
+        ),
+        ToolDefinition(
+            name="project_status",
+            description=(
+                "检查 BMAD 项目的产出物完成状态。"
+                "显示 PRD、架构、Epic、Story 等各阶段产出物是否已完成。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "项目名称",
+                    },
+                },
+                "required": ["name"],
+            },
+            handler=project_status,
+            risk_level=ToolRiskLevel.LOW,
+            tags=["bmad", "project"],
+        ),
+        ToolDefinition(
+            name="project_next",
+            description=(
+                "推荐 BMAD 项目的下一步操作。"
+                "根据产出物链分析当前进度，推荐应该使用哪个 Skill 做什么。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "项目名称",
+                    },
+                },
+                "required": ["name"],
+            },
+            handler=project_next,
+            risk_level=ToolRiskLevel.LOW,
+            tags=["bmad", "project"],
+        ),
+    ])
+
     if allowlist is None:
         return tools
     return [tool for tool in tools if tool.name in allowlist]
