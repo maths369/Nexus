@@ -21,9 +21,18 @@ _COMMAND_KEYWORDS: dict[str, str] = {
     "停一下": "pause",
     "继续": "resume",
     "恢复": "resume",
-    "重新开始": "restart",
+    "重新开始": "new",
+    "新任务": "new",
+    "新对话": "new",
     "取消": "cancel",
     "状态": "status",
+    "重启": "restart",
+    "重启服务": "restart",
+    "压缩": "compress",
+    "压缩对话": "compress",
+    "压缩上下文": "compress",
+    "帮助": "help",
+    "命令": "help",
 }
 
 _STATUS_KEYWORDS = [

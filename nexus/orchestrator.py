@@ -580,6 +580,66 @@ class Orchestrator:
                 session_id=session.session_id,
                 status="已取消",
             ))
+        elif cmd == "new":
+            # 开始新对话：abandon 当前 session，下条消息将创建新 session
+            if session:
+                self._sessions.update_session_status(
+                    session.session_id, SessionStatus.ABANDONED
+                )
+            await reply(self._formatter.format_result(
+                session_id=session_id,
+                result="已清除当前对话，下一条消息将开始新任务。",
+            ))
+        elif cmd == "restart":
+            # 重启 Hub 服务
+            await reply(self._formatter.format_result(
+                session_id=session_id,
+                result="正在重启 Hub 服务，请稍候 10 秒后重试…",
+            ))
+            import asyncio, subprocess
+            await asyncio.sleep(1)
+            subprocess.Popen(
+                ["systemctl", "--user", "restart", "nexus-api"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif cmd == "compress":
+            # 用 LLM 压缩当前 session 的对话历史
+            channel_key = message.metadata.get("channel_key") or message.channel.value
+            target_session, _ = self._sessions.get_or_create_persistent_session(
+                sender_id=message.sender_id,
+                channel=channel_key,
+            )
+            await reply(self._formatter.format_result(
+                session_id=target_session.session_id,
+                result="正在压缩对话历史，请稍候…",
+            ))
+            summary = await self._context.compress_with_llm(
+                session_id=target_session.session_id,
+                provider=self._run_manager._provider,
+            )
+            await reply(self._formatter.format_result(
+                session_id=target_session.session_id,
+                result=f"✅ 对话已压缩。摘要:\n\n{summary}",
+            ))
+        elif cmd == "help":
+            help_text = (
+                "📋 Nexus 支持的命令:\n\n"
+                "| 命令 | 中文别名 | 说明 |\n"
+                "|---|---|---|\n"
+                "| /new | 新对话、新任务、重新开始 | 结束当前对话，开始新任务 |\n"
+                "| /pause | 暂停、停、停一下 | 暂停当前任务 |\n"
+                "| /resume | 继续、恢复 | 恢复已暂停的任务 |\n"
+                "| /cancel | 取消 | 取消当前任务 |\n"
+                "| /status | 状态 | 查看当前任务状态 |\n"
+                "| /compress | 压缩、压缩对话 | 用 LLM 压缩对话历史 |\n"
+                "| /restart | 重启、重启服务 | 重启 Hub 服务 |\n"
+                "| /help | 帮助、命令 | 显示本帮助信息 |\n"
+            )
+            await reply(self._formatter.format_result(
+                session_id=session_id,
+                result=help_text,
+            ))
         elif cmd == "status":
             await self._handle_status_query(message, decision, reply)
         else:
