@@ -7,6 +7,7 @@ from typing import Any
 from nexus.agent.attempt import AttemptBuilder
 from nexus.agent.run import RunManager
 from nexus.agent.run_store import RunStore
+from nexus.agent.types import ToolDefinition, ToolRiskLevel
 from nexus.agent.tools_policy import ToolsPolicy
 from nexus.evolution.audit import AuditLog
 from nexus.evolution.sandbox import Sandbox
@@ -14,17 +15,19 @@ from nexus.evolution.skill_manager import SkillManager
 
 
 class _FakeGateway:
-    def __init__(self, responses: list[str]):
+    def __init__(self, responses: list[Any]):
         self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
     async def chat_completion(self, **kwargs) -> dict[str, Any]:
         self.calls.append(kwargs)
-        content = self._responses.pop(0) if self._responses else "done"
+        payload = self._responses.pop(0) if self._responses else "done"
+        if isinstance(payload, dict):
+            return payload
         return {
             "message": {
                 "role": "assistant",
-                "content": content,
+                "content": payload,
                 "tool_calls": [],
             }
         }
@@ -70,9 +73,9 @@ class _FakeCapabilityManager:
 def _create_installable_bundle(registry_dir: Path, skill_id: str = "office-conversion") -> None:
     skill_dir = registry_dir / skill_id
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "skill.yaml").write_text(
+    (skill_dir / "SKILL.md").write_text(
         (
-            "id: office-conversion\n"
+            "---\n"
             "name: Office Conversion\n"
             "description: 处理 PPT/PPTX 文档转换。\n"
             "tags:\n"
@@ -84,19 +87,6 @@ def _create_installable_bundle(registry_dir: Path, skill_id: str = "office-conve
             "  - pdf\n"
             "  - 转换\n"
             "  - 演示文稿\n"
-            "packages: []\n"
-            "verify_imports: []\n"
-            "verify_commands: []\n"
-            "install_commands: []\n"
-        ),
-        encoding="utf-8",
-    )
-    (skill_dir / "SKILL.md").write_text(
-        (
-            "---\n"
-            "name: Office Conversion\n"
-            "description: 处理 PPT/PPTX 文档转换。\n"
-            "tags: office, ppt, pdf\n"
             "---\n\n"
             "# Office Conversion\n\n"
             "遇到 PPT 转 PDF 时，优先完成任务，不要先说做不到。\n"
@@ -127,6 +117,7 @@ def _build_manager(
     gateway: _FakeGateway,
     *,
     capability_manager: _FakeCapabilityManager | None = None,
+    available_tools: list[ToolDefinition] | None = None,
 ) -> tuple[RunManager, SkillManager]:
     skills_dir = tmp_path / "skills"
     registry_dir = tmp_path / "skill_registry"
@@ -142,7 +133,7 @@ def _build_manager(
         python_executable=None,
     )
     attempt_builder = AttemptBuilder(
-        available_tools=[],
+        available_tools=available_tools or [],
         skill_manager=skill_manager,
     )
     run_manager = RunManager(
@@ -307,3 +298,73 @@ def test_run_manager_retries_after_missing_capability_response(tmp_path):
     assert run.attempt_count == 2
     assert "excel_processing" in run.metadata.get("auto_enabled_capabilities", [])
     assert "excel-processing" in run.metadata.get("auto_preloaded_skills", [])
+
+
+def test_run_manager_records_successful_mesh_dispatches(tmp_path):
+    async def dispatch_handler(task_description: str, constraints: str = "") -> str:
+        return f"任务已异步派发：{task_description} {constraints}".strip()
+
+    dispatch_tool = ToolDefinition(
+        name="mesh_dispatch__bWFjYm9vay1wcm8",
+        description="Dispatch to MacBook Pro",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_description": {"type": "string"},
+                "constraints": {"type": "string"},
+            },
+            "required": ["task_description"],
+        },
+        handler=dispatch_handler,
+        risk_level=ToolRiskLevel.MEDIUM,
+        tags=["mesh", "dispatch", "node:macbook-pro"],
+    )
+    gateway = _FakeGateway([
+        {
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-mesh-1",
+                        "type": "function",
+                        "function": {
+                            "name": dispatch_tool.name,
+                            "arguments": {
+                                "task_description": "打开语音备忘录，并开始录制",
+                            },
+                        },
+                    }
+                ],
+            }
+        },
+        {
+            "message": {
+                "role": "assistant",
+                "content": "已完成派发",
+                "tool_calls": [],
+            }
+        },
+    ])
+    run_manager, _skill_manager = _build_manager(
+        tmp_path,
+        gateway,
+        available_tools=[dispatch_tool],
+    )
+
+    run = asyncio.run(
+        run_manager.execute(
+            session_id="s-dispatch",
+            task="打开语音备忘录，并开始录制",
+            context_messages=[{"role": "user", "content": "打开语音备忘录，并开始录制"}],
+            model="qwen-test",
+        )
+    )
+
+    assert run.result == "已完成派发"
+    assert run.metadata.get("successful_mesh_dispatches") == [
+        {
+            "tool": dispatch_tool.name,
+            "task_description": "打开语音备忘录，并开始录制",
+        }
+    ]

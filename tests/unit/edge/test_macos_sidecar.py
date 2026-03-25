@@ -546,7 +546,7 @@ async def test_observable_edge_agent_uses_delegated_executor_before_edge_llm() -
     assignment = TaskAssignment(
         task_id="task-1",
         step_id="step-1",
-        assigned_node="macbook-pro-user",
+        assigned_node="macbook-pro-yanglei",
         tool_name="agent_loop",
         metadata={
             "execution_mode": "agent_loop",

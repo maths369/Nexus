@@ -6,10 +6,11 @@ from nexus.channel.adapter_feishu import FeishuAdapter, FeishuLongConnectionRunn
 
 
 class _FakeResponse:
-    def __init__(self, payload=None, *, content: bytes = b"", headers: dict | None = None):
+    def __init__(self, payload=None, *, content: bytes = b"", headers: dict | None = None, status_code: int = 200):
         self._payload = payload
         self.content = content
         self.headers = headers or {}
+        self.status_code = status_code
 
     def raise_for_status(self):
         return None

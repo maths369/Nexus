@@ -14,7 +14,7 @@ tags: web, search, browser, research
 
 ## 默认流程
 
-1. 优先调用 `search_web`
+1. 优先调用 `search_web_structured`
 2. 如果搜索结果不够清楚，再用：
    - `browser_navigate`
    - `browser_extract_text`
@@ -29,8 +29,17 @@ tags: web, search, browser, research
 ```text
 search_web(
   query="<查询词>",
-  engine="bing",
+  engine="google_grounded",
   max_chars=3000
+)
+```
+
+### A2. 结构化搜索（推荐）
+```text
+search_web_structured(
+  query="<查询词>",
+  provider="google_grounded",
+  count=8
 )
 ```
 
@@ -48,7 +57,6 @@ browser_extract_text()
 
 ## 注意事项
 
-1. 外部搜索结果可能有噪音，必要时继续打开具体页面核实
+1. 默认优先走 Google grounded search；如果配额耗尽或失败，运行时会自动降级到 Bing / DuckDuckGo
 2. 如果信息可能随时间变化，应明确说明是联网查询结果
 3. 如果浏览器工具不可用，不要假装查过网
-

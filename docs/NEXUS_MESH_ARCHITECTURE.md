@@ -4,11 +4,11 @@
 
 ## 0. 设计动因
 
-当前 Nexus 是一个单节点系统，运行在 Ubuntu 上。但实际使用中存在三种典型的物理节点（Hub，个人工作用笔记本，以及手机），各有优势和限制：
+当前 Nexus 是一个单节点系统，运行在 Ubuntu (NVIDIA 5090) 上。但实际使用中存在三个物理节点，各有优势和限制：
 
 | 节点 | 优势 | 限制 |
 |------|------|------|
-| **Ubuntu Server** (Hub) | 7x24 在线、大硬盘、GPU 推理、知识库 | 无浏览器 GUI、无本地文件交互 |
+| **Ubuntu Server** (5090) | 7x24 在线、大硬盘、GPU 推理、知识库 | 无浏览器 GUI、无本地文件交互 |
 | **MacBook Pro** | 浏览器、本地文件、录音录视频、主力交互界面 | CPU/GPU/内存紧张、间歇离线 |
 | **iPhone** | 随身携带、拍照、录音、录像、位置信息 | 算力极弱、屏幕小、只能做轻量交互 |
 
@@ -134,7 +134,7 @@ MacBook 合盖、iPhone 离开 WiFi 时，任务不应中断：
 
 ```yaml
 # Node Card for MacBook Pro
-node_id: "macbook-pro-user"
+node_id: "macbook-pro-yanglei"
 node_type: "edge"           # hub | edge | mobile
 display_name: "MacBook Pro"
 platform: "macos"
@@ -188,7 +188,7 @@ capabilities:
 resources:
   cpu_cores: 10
   memory_gb: 16
-  gpu: "Laptop GPU"
+  gpu: "Apple M3 Pro"
   gpu_memory_gb: 0       # 共享内存，不单独计
   disk_free_gb: 120
   battery_powered: true   # 电池供电可能影响任务调度
@@ -202,7 +202,7 @@ availability:
 
 ```yaml
 # Node Card for Ubuntu Server
-node_id: "ubuntu-server-hub"
+node_id: "ubuntu-server-5090"
 node_type: "hub"
 display_name: "Ubuntu Server"
 platform: "linux"
@@ -218,7 +218,7 @@ providers:
   - name: "ollama-qwen"
     model: "qwen2.5:72b"
     via: "local"                        # 本地 LLM
-    gpu: "Server GPU"
+    gpu: "RTX 5090"
     context_length: 32768
 
 capabilities:
@@ -227,7 +227,7 @@ capabilities:
     tools: ["read_vault", "write_vault", "search_vault", "knowledge_ingest"]
 
   - capability_id: "local_llm_inference"
-    description: "本地 LLM 推理（GPU 加速）"
+    description: "本地 LLM 推理（RTX 5090）"
     tools: ["local_llm_generate"]
     exclusive: true                     # 敏感数据不出本地
 
@@ -250,7 +250,7 @@ capabilities:
 resources:
   cpu_cores: 32
   memory_gb: 128
-  gpu: "Server GPU"
+  gpu: "NVIDIA RTX 5090"
   gpu_memory_gb: 32
   disk_free_gb: 4000
 
@@ -262,7 +262,7 @@ availability:
 
 ```yaml
 # Node Card for iPhone
-node_id: "iphone-user"
+node_id: "iphone-yanglei"
 node_type: "mobile"
 display_name: "iPhone"
 platform: "ios"
@@ -679,7 +679,7 @@ capabilities:
         - name: "llama3.1:8b"
           context_length: 128000
           speed: "~120 tok/s"
-      gpu: "Server GPU"
+      gpu: "RTX 5090 32GB"
       concurrent_requests: 2
 ```
 
@@ -1077,7 +1077,7 @@ nexus/
 # config/app.yaml 新增
 mesh:
   enabled: true
-  node_id: "ubuntu-server-hub"
+  node_id: "ubuntu-server-5090"
   node_type: "hub"
   mqtt:
     broker_host: "0.0.0.0"
@@ -1289,7 +1289,7 @@ class ArtifactTransfer:
 ```yaml
 # 每个节点有一对密钥
 security:
-  node_id: "macbook-pro-user"
+  node_id: "macbook-pro-yanglei"
   private_key: "./certs/node.key"
   certificate: "./certs/node.crt"
   hub_ca: "./certs/hub-ca.crt"
@@ -1395,7 +1395,7 @@ class EdgeNodeAgent:
 
 ### 9.2 差距二：本地 LLM 未作为可调度的 Mesh 能力
 
-**现状**：`ubuntu-server-hub.yaml` 声明了 `local_llm_inference` capability 和 `local_llm_generate` tool，但没有对应的 tool handler 实现。Ollama 在 Ubuntu 上运行但未接入 Mesh。
+**现状**：`ubuntu-server-5090.yaml` 声明了 `local_llm_inference` capability 和 `local_llm_generate` tool，但没有对应的 tool handler 实现。Ollama 在 Ubuntu 上运行但未接入 Mesh。
 
 **修正方案：Local LLM Service + Mesh 注册**
 

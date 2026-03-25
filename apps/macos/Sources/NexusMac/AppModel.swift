@@ -7,7 +7,9 @@ final class AppModel: ObservableObject {
     @Published var settings: SidecarSettings
     @Published var commandDraft: String = ""
     @Published private(set) var supervisorState: SidecarSupervisor.State = .stopped
+    @Published private(set) var mlxSupervisorState: MLXLocalAPISupervisor.State = .stopped
     @Published private(set) var health: SidecarHealthResponse?
+    @Published private(set) var mlxHealth: MLXLocalAPIHealthResponse?
     @Published private(set) var hubHealth: HubHealthResponse?
     @Published private(set) var snapshot: SidecarStatusSnapshot?
     @Published private(set) var conversation: [HubConversationEntry] = []
@@ -15,10 +17,12 @@ final class AppModel: ObservableObject {
     @Published private(set) var isSendingCommand = false
     @Published private(set) var recentLogs: [String] = []
     @Published private(set) var lastError: String?
+    @Published private(set) var mlxLastError: String?
     @Published private(set) var launchAgentStatus: LaunchAgentStatus?
     @Published private(set) var permissionChecks: [PermissionCheck] = PermissionDiagnostics.snapshot()
 
     private let supervisor = SidecarSupervisor()
+    private let mlxSupervisor = MLXLocalAPISupervisor()
     private var pollTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
     private var pollTick = 0
@@ -33,6 +37,8 @@ final class AppModel: ObservableObject {
     private var lastObservedHubAPIHealthy: Bool?
     private var lastObservedHubRuntimeReady: Bool?
     private var lastObservedLocalError: String?
+    private var lastKnownMLXAPIReachable: Bool?
+    private var lastObservedMLXLoaded: Bool?
 
     init() {
         self.settings = SidecarSettings.load()
@@ -55,12 +61,32 @@ final class AppModel: ObservableObject {
                 detail: error
             )
         }
+        mlxSupervisor.onOutput = { [weak self] line in
+            self?.appendMLXLog(line)
+        }
+        mlxSupervisor.onStateChange = { [weak self] state in
+            self?.mlxSupervisorState = state
+            self?.appendTrace(
+                lane: .engine,
+                title: "MLX local API supervisor \(state.traceLabel)",
+                detail: "The MLX local API supervisor state is now \(state.traceLabel)."
+            )
+        }
+        mlxSupervisor.onFailure = { [weak self] error in
+            self?.mlxLastError = error
+            self?.appendTrace(
+                lane: .error,
+                title: "MLX local API failure",
+                detail: error
+            )
+        }
 
         startPolling()
         Task {
             await refreshLaunchAgentStatus()
             await refreshHubHealth()
             await refreshPermissionChecks()
+            await refreshMLXServiceStatus()
         }
         if settings.autoStartSidecar {
             Task { [weak self] in
@@ -125,6 +151,88 @@ final class AppModel: ObservableObject {
                 title: "Failed to restart local engine",
                 detail: error.localizedDescription
             )
+        }
+    }
+
+    func startMLXService() {
+        let mlxSettings = MLXLocalAPISettings.defaultSettings()
+        appendTrace(
+            lane: .engine,
+            title: "MLX local API start requested",
+            detail: "Nexus asked the MLX local API to start at \(mlxSettings.host):\(mlxSettings.port)."
+        )
+        do {
+            try mlxSupervisor.start(settings: mlxSettings)
+            mlxLastError = nil
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(350))
+                await self?.refreshMLXServiceStatus()
+            }
+        } catch {
+            mlxLastError = error.localizedDescription
+            appendTrace(
+                lane: .error,
+                title: "Failed to start MLX local API",
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    func stopMLXService() {
+        let mlxSettings = MLXLocalAPISettings.defaultSettings()
+        appendTrace(
+            lane: .engine,
+            title: "MLX local API stop requested",
+            detail: "Nexus asked the MLX local API to stop."
+        )
+        mlxSupervisor.stop(settings: mlxSettings)
+        mlxHealth = nil
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            await self?.refreshMLXServiceStatus()
+        }
+    }
+
+    func refreshMLXServiceStatus() async {
+        let mlxSettings = MLXLocalAPISettings.defaultSettings()
+        let client = MLXLocalAPIClient(host: mlxSettings.host, port: mlxSettings.port)
+        do {
+            let health = try await client.health()
+            mlxHealth = health
+            mlxLastError = nil
+            if lastKnownMLXAPIReachable != true {
+                appendTrace(
+                    lane: .engine,
+                    title: "MLX local API reachable",
+                    detail: "The MLX local API responded at \(mlxSettings.host):\(mlxSettings.port)."
+                )
+            }
+            if lastObservedMLXLoaded != health.loaded {
+                appendTrace(
+                    lane: health.loaded ? .node : .engine,
+                    title: health.loaded ? "MLX model loaded" : "MLX service idle",
+                    detail: health.loaded
+                        ? "The MLX local API loaded \(health.model) on \(health.device)."
+                        : "The MLX local API is online at \(mlxSettings.host):\(mlxSettings.port), but the model has not been loaded yet."
+                )
+            }
+            lastKnownMLXAPIReachable = true
+            lastObservedMLXLoaded = health.loaded
+        } catch {
+            mlxHealth = nil
+            let shouldReport = lastKnownMLXAPIReachable != false || mlxSupervisorState != .stopped
+            if shouldReport {
+                appendTrace(
+                    lane: .error,
+                    title: "MLX local API unreachable",
+                    detail: "Nexus could not reach the MLX local API at \(mlxSettings.host):\(mlxSettings.port): \(error.localizedDescription)"
+                )
+            }
+            if mlxSupervisorState != .stopped {
+                mlxLastError = error.localizedDescription
+            }
+            lastKnownMLXAPIReachable = false
+            lastObservedMLXLoaded = nil
         }
     }
 
@@ -194,7 +302,46 @@ final class AppModel: ObservableObject {
     }
 
     func refreshPermissionChecks() async {
-        permissionChecks = PermissionDiagnostics.snapshot()
+        // Prefer the sidecar's permission status — it's the process that actually
+        // runs AppleScript, screen capture, etc.  The Swift app is a different
+        // executable with its own (irrelevant) permission grants.
+        let client = SidecarAPIClient(host: settings.localHost, port: settings.localPort)
+        do {
+            let response = try await client.permissions()
+            permissionChecks = response.permissions.map { entry in
+                let state: PermissionState = {
+                    switch entry.state {
+                    case "granted": return .granted
+                    case "denied": return .denied
+                    case "needsPrompt": return .needsPrompt
+                    default: return .unavailable
+                    }
+                }()
+                let pane: String? = {
+                    switch entry.id {
+                    case "accessibility":
+                        return "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                    case "screen_recording":
+                        return "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                    default:
+                        if entry.id.hasPrefix("automation.") {
+                            return "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+                        }
+                        return nil
+                    }
+                }()
+                return PermissionCheck(
+                    id: entry.id,
+                    title: entry.title,
+                    detail: entry.detail,
+                    state: state,
+                    systemSettingsPane: pane
+                )
+            }
+        } catch {
+            // Sidecar not reachable — fall back to local process checks
+            permissionChecks = PermissionDiagnostics.snapshot()
+        }
     }
 
     func requestPermission(_ check: PermissionCheck) async {
@@ -456,6 +603,7 @@ final class AppModel: ObservableObject {
 
     func quitApplication() {
         Task {
+            mlxSupervisor.stop()
             stopSidecar()
             if let error = await LaunchAgentManager.unloadForUserQuit() {
                 lastError = error
@@ -571,6 +719,75 @@ final class AppModel: ObservableObject {
         snapshot?.pendingApprovals.count ?? 0
     }
 
+    var mlxStatusTone: Color {
+        if let health = mlxHealth {
+            return health.loaded ? NexusPalette.mint : NexusPalette.amber
+        }
+        switch mlxSupervisorState {
+        case .running, .starting:
+            return NexusPalette.amber
+        case .stopped:
+            return NexusPalette.steel
+        }
+    }
+
+    var mlxStatusBadgeText: String {
+        if let health = mlxHealth {
+            return health.loaded ? "Loaded" : "Online"
+        }
+        switch mlxSupervisorState {
+        case .running, .starting:
+            return "Starting"
+        case .stopped:
+            return "Stopped"
+        }
+    }
+
+    var mlxStatusLabel: String {
+        if let health = mlxHealth {
+            return health.loaded ? "MLX model ready" : "MLX API online"
+        }
+        switch mlxSupervisorState {
+        case .running, .starting:
+            return "MLX API starting"
+        case .stopped:
+            return "MLX API stopped"
+        }
+    }
+
+    var mlxStatusDetail: String {
+        let mlxSettings = MLXLocalAPISettings.defaultSettings()
+        if let health = mlxHealth {
+            if health.loaded {
+                return "\(health.model) on \(health.device)"
+            }
+            return "Reachable at \(mlxSettings.host):\(mlxSettings.port); the model will load on first use."
+        }
+        switch mlxSupervisorState {
+        case .running, .starting:
+            return "Nexus is waiting for the local MLX API at \(mlxSettings.host):\(mlxSettings.port)."
+        case .stopped:
+            return "Start the local MLX API here, then let Nexus use it as the Mac node provider."
+        }
+    }
+
+    var mlxEndpointLabel: String {
+        let mlxSettings = MLXLocalAPISettings.defaultSettings()
+        return "\(mlxSettings.host):\(mlxSettings.port)"
+    }
+
+    var mlxServeScriptPath: String {
+        MLXLocalAPISettings.defaultSettings().serveScriptPath
+    }
+
+    var canStartMLXService: Bool {
+        mlxHealth == nil && mlxSupervisorState == .stopped
+    }
+
+    var canStopMLXService: Bool {
+        mlxHealth != nil || mlxSupervisorState != .stopped
+    }
+
     var primaryHubStatusLabel: String {
         if let hub = snapshot?.hub {
             switch hub.connectivityState {
@@ -677,6 +894,7 @@ final class AppModel: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.refreshStatus()
+                await self.refreshMLXServiceStatus()
                 try? await Task.sleep(for: .seconds(2))
             }
         }
@@ -690,6 +908,14 @@ final class AppModel: ObservableObject {
         appendTrace(
             lane: .engine,
             title: "Local engine log",
+            detail: line
+        )
+    }
+
+    private func appendMLXLog(_ line: String) {
+        appendTrace(
+            lane: .engine,
+            title: "MLX local API log",
             detail: line
         )
     }
@@ -909,6 +1135,19 @@ final class AppModel: ObservableObject {
 }
 
 private extension SidecarSupervisor.State {
+    var traceLabel: String {
+        switch self {
+        case .stopped:
+            return "stopped"
+        case .starting:
+            return "starting"
+        case .running:
+            return "running"
+        }
+    }
+}
+
+private extension MLXLocalAPISupervisor.State {
     var traceLabel: String {
         switch self {
         case .stopped:

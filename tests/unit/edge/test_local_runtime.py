@@ -256,7 +256,7 @@ class TestBuildEdgeProvider:
 
 
 class TestProviderConfigsFromNodeCard:
-    def test_extracts_api_providers(self) -> None:
+    def test_extracts_api_and_local_providers_for_edge_node(self) -> None:
         card = NodeCard(
             node_id="test-mac",
             node_type="edge",
@@ -273,24 +273,48 @@ class TestProviderConfigsFromNodeCard:
                         "api_key_env": "MOONSHOT_API_KEY",
                     },
                 ),
-                ProviderSpec(name="ollama", model="qwen2.5:72b", via="local"),
+                ProviderSpec(name="mlx-local-api", model="mlx-community/Qwen3.5-9B-OptiQ-4bit", via="local"),
             ],
         )
         configs = _provider_configs_from_node_card(card)
-        assert len(configs) == 1
+        assert len(configs) == 2
         assert configs[0]["name"] == "kimi"
         assert configs[0]["base_url"] == "https://api.moonshot.cn/v1"
         assert configs[0]["api_key_env"] == "MOONSHOT_API_KEY"
+        assert configs[1]["name"] == "mlx-local-api"
+        assert configs[1]["provider"] == "openai-compatible"
+        assert configs[1]["base_url"] == "http://localhost:8008/v1"
+        assert configs[1]["api_key"] == "mlx-local-api"
 
-    def test_skips_local_providers(self) -> None:
+    def test_local_provider_respects_explicit_openai_compatible_properties(self) -> None:
         card = NodeCard(
             node_id="test",
-            node_type="hub",
+            node_type="edge",
             display_name="Test",
             platform="linux",
-            providers=[ProviderSpec(name="ollama", model="qwen2.5:72b", via="local")],
+            providers=[
+                ProviderSpec(
+                    name="mlx-local-api",
+                    model="mlx-community/Qwen3.5-9B-OptiQ-4bit",
+                    via="local",
+                    properties={
+                        "provider_type": "openai-compatible",
+                        "base_url": "http://127.0.0.1:8008/v1",
+                        "api_key": "mlx-local-api",
+                    },
+                )
+            ],
         )
-        assert _provider_configs_from_node_card(card) == []
+        assert _provider_configs_from_node_card(card) == [
+            {
+                "name": "mlx-local-api",
+                "model": "mlx-community/Qwen3.5-9B-OptiQ-4bit",
+                "provider": "openai-compatible",
+                "base_url": "http://127.0.0.1:8008/v1",
+                "api_key": "mlx-local-api",
+                "api_key_env": "",
+            }
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,18 @@
+[Unit]
+Description=Nexus Weixin Plugin Host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Workspace/Nexus/weixin_host
+Environment=NEXUS_WEIXIN_HOST=127.0.0.1
+Environment=NEXUS_WEIXIN_PORT=18101
+Environment=NEXUS_WEIXIN_STATE_DIR=%h/Workspace/Nexus/data/weixin/plugin-host
+Environment=NEXUS_WEIXIN_TMP_DIR=%h/Workspace/Nexus/data/weixin/plugin-host/tmp
+ExecStart=/bin/bash -lc 'source %h/miniconda3/etc/profile.d/conda.sh && conda activate ai_assist && cd %h/Workspace/Nexus/weixin_host && npm start'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

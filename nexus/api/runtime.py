@@ -19,6 +19,7 @@ from nexus.agent.attempt import AttemptBuilder
 from nexus.agent.run import RunManager
 from nexus.agent.run_store import RunStore
 from nexus.agent.tool_registry import build_tool_registry
+from nexus.agent.approval import ApprovalEngine
 from nexus.agent.tools_policy import ToolsPolicy
 from nexus.channel.context_window import ContextWindowManager
 from nexus.channel.session_router import SessionRouter
@@ -43,6 +44,7 @@ from nexus.knowledge import (
 )
 from nexus.mesh import MeshRegistry, MQTTTransport, NodeCard, NodeType, TaskRouter
 from nexus.mesh.edge_journal_store import EdgeJournalStore
+from nexus.mesh.task_manager import TaskManager
 from nexus.provider import ProviderConfig, ProviderGateway
 from nexus.services.audio import AudioConfig, AudioService, RemoteAudioWorkerClient
 from nexus.services.artifact import ArtifactService
@@ -81,6 +83,7 @@ class NexusRuntime:
     settings: NexusSettings
     paths: NexusPaths
     provider: ProviderGateway
+    search_config: dict[str, object]
     session_store: SessionStore
     context_window: ContextWindowManager
     session_router: SessionRouter
@@ -114,9 +117,11 @@ class NexusRuntime:
     spreadsheet_service: SpreadsheetService
     memory_manager: MemoryManager
     capability_promotion_advisor: CapabilityPromotionAdvisor
+    approval_engine: ApprovalEngine | None = None
     mesh_transport: MQTTTransport | None = None
     mesh_registry: MeshRegistry | None = None
     mesh_task_router: TaskRouter | None = None
+    mesh_task_manager: TaskManager | None = None
     mesh_node_card: NodeCard | None = None
     edge_journal_store: EdgeJournalStore | None = None
 
@@ -195,6 +200,7 @@ def build_runtime(
             _deep_get(runtime_settings.raw, "provider.unhealthy_cooldown_seconds", 120.0) or 120.0
         ),
     )
+    search_config = runtime_settings.search_config()
 
     session_store = SessionStore(paths.sqlite / "sessions.db")
     context_window = ContextWindowManager(session_store=session_store)
@@ -325,6 +331,11 @@ def build_runtime(
         whitelist=tool_allowlist,
         auto_approve_levels=auto_approve,
     )
+    approval_engine = ApprovalEngine(
+        default_timeout=runtime_settings.approval_timeout
+        if hasattr(runtime_settings, "approval_timeout")
+        else 120.0,
+    )
     compressor = ContextCompressor(
         provider=provider,
         transcript_dir=paths.vault / "_system" / "context_transcripts",
@@ -353,9 +364,10 @@ def build_runtime(
         system_runner=system_runner,
         memory_manager=memory_manager,
         audit_log=audit_log,
+        search_config=search_config,
         allowlist=tool_allowlist,
     )
-    mesh_transport, mesh_registry, mesh_task_router, mesh_node_card = _build_mesh_components(
+    mesh_transport, mesh_registry, mesh_task_router, mesh_node_card, mesh_task_mgr = _build_mesh_components(
         runtime_settings=runtime_settings,
         provider=provider,
         available_tools=available_tools,
@@ -370,6 +382,7 @@ def build_runtime(
         memory=episodic_memory,
         memory_manager=memory_manager,
         skill_manager=skill_manager,
+        workspace_roots=workspace_service.allowed_roots,
     )
     run_manager = RunManager(
         run_store=run_store,
@@ -382,6 +395,7 @@ def build_runtime(
         capability_promotion_advisor=capability_promotion_advisor,
         capability_manager=capability_manager,
         skill_manager=skill_manager,
+        approval_engine=approval_engine,
         fallback_models=[
             config.model
             for config in [(primary_provider or configured_primary)]
@@ -393,6 +407,7 @@ def build_runtime(
         settings=runtime_settings,
         paths=paths,
         provider=provider,
+        search_config=search_config,
         session_store=session_store,
         context_window=context_window,
         session_router=session_router,
@@ -426,9 +441,11 @@ def build_runtime(
         spreadsheet_service=spreadsheet_service,
         memory_manager=memory_manager,
         capability_promotion_advisor=capability_promotion_advisor,
+        approval_engine=approval_engine,
         mesh_transport=mesh_transport,
         mesh_registry=mesh_registry,
         mesh_task_router=mesh_task_router,
+        mesh_task_manager=mesh_task_mgr,
         mesh_node_card=mesh_node_card,
         edge_journal_store=edge_journal_store,
     )
@@ -440,15 +457,15 @@ def _build_mesh_components(
     provider: ProviderGateway,
     available_tools: list,
     capability_manager: CapabilityManager | None = None,
-) -> tuple[MQTTTransport | None, MeshRegistry | None, TaskRouter | None, NodeCard | None]:
+) -> tuple[MQTTTransport | None, MeshRegistry | None, TaskRouter | None, NodeCard | None, TaskManager | None]:
     mesh_config = runtime_settings.mesh_config()
     if not mesh_config.get("enabled"):
-        return None, None, None, None
+        return None, None, None, None, None
 
     node_id = str(mesh_config.get("node_id") or "").strip()
     if not node_id:
         logger.warning("Mesh is enabled but node_id is missing; skipping mesh bootstrap")
-        return None, None, None, None
+        return None, None, None, None, None
 
     transport = MQTTTransport(
         node_id=node_id,
@@ -475,6 +492,16 @@ def _build_mesh_components(
         except Exception:
             logger.warning("Failed to load mesh node card: %s", node_card_path, exc_info=True)
 
+    # Create TaskManager for async fire-and-forget dispatch
+    data_dir = runtime_settings.root_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    task_db_path = str(data_dir / "task_store.db")
+    task_mgr = TaskManager(
+        transport=transport,
+        local_node_id=node_id,
+        db_path=task_db_path,
+    )
+
     task_router = TaskRouter(
         registry=registry,
         local_node_id=node_id,
@@ -482,8 +509,9 @@ def _build_mesh_components(
         transport=transport,
         local_tool_names={getattr(tool, "name", "") for tool in available_tools},
         capability_manager=capability_manager,
+        task_manager=task_mgr,
     )
-    return transport, registry, task_router, node_card
+    return transport, registry, task_router, node_card, task_mgr
 
 
 async def start_mesh_runtime(runtime: NexusRuntime) -> None:
@@ -496,6 +524,11 @@ async def start_mesh_runtime(runtime: NexusRuntime) -> None:
 
     await registry.setup_transport_handlers()
     await registry.start_timeout_monitor()
+
+    # Start TaskManager for async dispatch
+    task_mgr: TaskManager | None = getattr(runtime, "mesh_task_manager", None)
+    if task_mgr is not None:
+        await task_mgr.start()
 
     node_card = getattr(runtime, "mesh_node_card", None)
     if node_card is not None and node_card.node_type == NodeType.HUB:

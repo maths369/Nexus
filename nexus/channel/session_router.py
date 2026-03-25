@@ -1,4 +1,11 @@
-"""Session Router — classify inbound messages into new task, follow-up, resume, status, or command."""
+"""
+Session Router — 会话路由
+
+对标 OpenClaw 的会话管理模型：
+- 同一 sender 的消息默认延续活跃会话（session continuity）
+- 只有精确命令才做特殊处理
+- 不做关键词意图分类，让 LLM 理解用户意图
+"""
 
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 精确命令词（对标 OpenClaw command detection：只匹配完整消息或 /command 前缀）
 _COMMAND_KEYWORDS: dict[str, str] = {
     "停": "pause",
     "暂停": "pause",
@@ -35,6 +43,7 @@ _COMMAND_KEYWORDS: dict[str, str] = {
     "命令": "help",
 }
 
+# 状态查询关键词（功能性：需要查找对应 session）
 _STATUS_KEYWORDS = [
     "怎么样了",
     "进展",
@@ -43,90 +52,28 @@ _STATUS_KEYWORDS = [
     "还没回复",
     "还没好吗",
     "到哪一步了",
-    "状态",
 ]
 
+# 历史引用标记（用于决定是否查找历史会话）
 _HISTORY_MARKERS = [
     "上次",
     "之前",
     "刚才那个",
-    "那个",
-    "这个",
-    "继续",
-    "接着",
-    "恢复",
-]
-
-_NEW_TASK_MARKERS = [
-    "新问题",
-    "新任务",
-    "另一个",
-    "另外",
-    "顺便",
-    "再帮我",
-    "帮我",
-    "请你",
-    "麻烦你",
-    "我希望你",
-    "我想让你",
-    "希望你",
-]
-
-_FOLLOW_UP_MARKERS = [
-    "补充",
-    "细化",
-    "展开",
-    "修改",
-    "更新",
-    "继续",
-    "接着",
-    "基于这个",
-    "在此基础上",
-]
-
-_CAPABILITY_ACTION_MARKERS = [
-    "安装",
-    "启用",
-    "开通",
-    "增加",
-    "新增",
-    "获得",
-]
-
-_CAPABILITY_TARGET_MARKERS = [
-    "能力",
-    "skill",
-    "skills",
-    "capability",
-    "工具",
-]
-
-_INVENTORY_ACTION_MARKERS = [
-    "列出",
-    "有哪些",
-    "有哪",
-    "给我看看",
-    "盘点",
-    "汇总",
-    "统计",
-]
-
-_INVENTORY_TARGET_MARKERS = [
-    "pdf",
-    "文件",
-    "附件",
-    "图片",
-    "日志",
-    "会议",
-    "知识库",
-    "技能",
-    "能力",
-    "工具",
 ]
 
 
 class SessionRouter:
-    """Low-bloat router with explicit clarification instead of silent guessing."""
+    """
+    简化的会话路由器。
+
+    路由逻辑（对标 OpenClaw session-first routing）：
+    1. 附件 → NEW_TASK
+    2. 精确命令 → COMMAND
+    3. 状态查询 → STATUS_QUERY
+    4. 有活跃/新鲜 session → FOLLOW_UP
+    5. 显式历史引用 → 查找历史 session
+    6. 默认 → NEW_TASK
+    """
 
     CONFIDENCE_THRESHOLD = 0.6
 
@@ -141,9 +88,8 @@ class SessionRouter:
         self._provider = provider
 
     async def route(self, message: InboundMessage) -> RoutingDecision:
-        explicit_history = self._contains_history_marker(message.content)
-
-        if message.attachments and not self._contains_history_marker(message.content):
+        # 附件 → 新任务
+        if message.attachments:
             return RoutingDecision(
                 intent=MessageIntent.NEW_TASK,
                 confidence=0.97,
@@ -151,54 +97,42 @@ class SessionRouter:
                 metadata={"has_attachments": True},
             )
 
+        # 精确命令匹配
         decision = self._match_command(message)
         if decision:
             return decision
 
+        # 状态查询
         decision = self._match_status_query(message)
         if decision:
             return decision
 
-        if self._is_explicit_new_task(message.content) and not explicit_history:
-            return RoutingDecision(
-                intent=MessageIntent.NEW_TASK,
-                confidence=0.95,
-                reason="explicit new-task marker",
-            )
-
-        if self._is_capability_install_request(message.content) and not explicit_history:
-            return RoutingDecision(
-                intent=MessageIntent.NEW_TASK,
-                confidence=0.96,
-                reason="capability install request",
-            )
-
-        if self._is_inventory_query(message.content) and not explicit_history:
-            return RoutingDecision(
-                intent=MessageIntent.NEW_TASK,
-                confidence=0.94,
-                reason="inventory query",
-            )
-
+        # 活跃会话 follow-up（对标 OpenClaw：同 sender 默认延续 session）
         decision = await self._match_active_session(message)
         if decision and decision.confidence >= self.CONFIDENCE_THRESHOLD:
             return decision
 
-        # Align with OpenClaw's session-first routing:
-        # only consult historical sessions when the user explicitly refers to history.
-        if explicit_history:
+        # 显式历史引用 → 查找历史会话
+        if self._contains_history_marker(message.content):
             decision = await self._match_historical_session(message)
             if decision:
                 return decision
 
+        # 默认：新任务
         return RoutingDecision(
             intent=MessageIntent.NEW_TASK,
             confidence=1.0,
-            reason="default new task after session-first routing",
+            reason="default new task",
         )
 
     def _match_command(self, message: InboundMessage) -> RoutingDecision | None:
         text = message.content.strip()
+        provider_decision = self._match_provider_command(text)
+        if provider_decision is not None:
+            return provider_decision
+        search_decision = self._match_search_command(text)
+        if search_decision is not None:
+            return search_decision
         for keyword, action in _COMMAND_KEYWORDS.items():
             if text == keyword or text.startswith(f"/{action}"):
                 return RoutingDecision(
@@ -208,6 +142,60 @@ class SessionRouter:
                     metadata={"action": action},
                 )
         return None
+
+    def _match_provider_command(self, text: str) -> RoutingDecision | None:
+        normalized = text.strip()
+        lowered = normalized.lower()
+        if lowered in {"/provider", "/providers", "/provider list", "/provider current"}:
+            return RoutingDecision(
+                intent=MessageIntent.COMMAND,
+                confidence=1.0,
+                reason="command:provider",
+                metadata={"action": "provider", "provider_command": "status"},
+            )
+
+        match = re.fullmatch(
+            r"/(?:provider|providers)(?:\s+(?:switch|use|set))?\s+([a-zA-Z0-9._-]+)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        target = match.group(1).strip().lower()
+        return RoutingDecision(
+            intent=MessageIntent.COMMAND,
+            confidence=1.0,
+            reason="command:provider",
+            metadata={"action": "provider", "provider_command": "switch", "target": target},
+        )
+
+    def _match_search_command(self, text: str) -> RoutingDecision | None:
+        normalized = text.strip()
+        lowered = normalized.lower()
+        if lowered in {"/search", "/search list", "/search current"}:
+            return RoutingDecision(
+                intent=MessageIntent.COMMAND,
+                confidence=1.0,
+                reason="command:search",
+                metadata={"action": "search_provider", "search_command": "status"},
+            )
+
+        match = re.fullmatch(
+            r"/search(?:\s+(?:switch|use|set))?\s+([a-zA-Z0-9._-]+)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        target = match.group(1).strip().lower()
+        return RoutingDecision(
+            intent=MessageIntent.COMMAND,
+            confidence=1.0,
+            reason="command:search",
+            metadata={"action": "search_provider", "search_command": "switch", "target": target},
+        )
 
     def _match_status_query(self, message: InboundMessage) -> RoutingDecision | None:
         text = message.content.strip()
@@ -230,8 +218,7 @@ class SessionRouter:
         )
 
     async def _match_active_session(self, message: InboundMessage) -> RoutingDecision | None:
-        # Try active session first, then fall back to most recent session
-        # (which may be completed but still within the freshness window).
+        """对标 OpenClaw：同 sender 的消息默认延续活跃/新鲜 session。"""
         active = self._store.get_active_session(sender_id=message.sender_id)
         candidate = active
         if candidate is None:
@@ -241,23 +228,12 @@ class SessionRouter:
         if not self._context.is_within_freshness(candidate.session_id, message.timestamp):
             return None
 
-        text = message.content.strip()
-        if self._looks_like_follow_up(text, candidate):
-            return RoutingDecision(
-                intent=MessageIntent.FOLLOW_UP,
-                session_id=candidate.session_id,
-                confidence=0.88,
-                reason="fresh session follow-up",
-            )
-
-        if self._is_brief_ambiguous_reply(text):
-            return RoutingDecision(
-                intent=MessageIntent.FOLLOW_UP,
-                session_id=candidate.session_id,
-                confidence=0.65,
-                reason="brief reply within freshness window",
-            )
-        return None
+        return RoutingDecision(
+            intent=MessageIntent.FOLLOW_UP,
+            session_id=candidate.session_id,
+            confidence=0.85,
+            reason="session continuity (active/fresh session)",
+        )
 
     async def _match_historical_session(self, message: InboundMessage) -> RoutingDecision | None:
         candidates = self._store.find_relevant_sessions(
@@ -268,17 +244,15 @@ class SessionRouter:
         if not candidates:
             return None
 
-        explicit_history = self._contains_history_marker(message.content)
         if len(candidates) == 1:
             return RoutingDecision(
                 intent=MessageIntent.RESUME,
                 session_id=candidates[0].session_id,
-                confidence=0.82 if explicit_history else 0.66,
+                confidence=0.82,
                 reason="single historical candidate",
                 metadata={"candidates": [self._render_candidate(candidates[0])]},
             )
 
-        # Multiple plausible sessions: clarify instead of guessing.
         top_candidates = self._dedupe_candidates(candidates)[:3]
         return RoutingDecision(
             intent=MessageIntent.UNKNOWN,
@@ -336,48 +310,4 @@ class SessionRouter:
     @staticmethod
     def _contains_history_marker(text: str) -> bool:
         lowered = text.strip().lower()
-        return any(marker in lowered for marker in _STATUS_KEYWORDS + _HISTORY_MARKERS)
-
-    @staticmethod
-    def _is_explicit_new_task(text: str) -> bool:
-        lowered = text.strip().lower()
-        if any(marker in lowered for marker in _NEW_TASK_MARKERS):
-            return True
-        if len(lowered) >= 8 and lowered.startswith("帮我"):
-            return True
-        return False
-
-    @staticmethod
-    def _is_capability_install_request(text: str) -> bool:
-        lowered = text.strip().lower()
-        if not lowered:
-            return False
-        has_action = any(marker in lowered for marker in _CAPABILITY_ACTION_MARKERS)
-        has_target = any(marker in lowered for marker in _CAPABILITY_TARGET_MARKERS)
-        return has_action and has_target
-
-    @staticmethod
-    def _is_brief_ambiguous_reply(text: str) -> bool:
-        compact = re.sub(r"\s+", "", text)
-        return 0 < len(compact) <= 12 and not any(token in compact for token in _NEW_TASK_MARKERS)
-
-    @staticmethod
-    def _is_inventory_query(text: str) -> bool:
-        lowered = text.strip().lower()
-        if not lowered:
-            return False
-        has_action = any(marker in lowered for marker in _INVENTORY_ACTION_MARKERS)
-        has_target = any(marker in lowered for marker in _INVENTORY_TARGET_MARKERS)
-        return has_action and has_target
-
-    @staticmethod
-    def _looks_like_follow_up(text: str, session: Session) -> bool:
-        lowered = text.strip().lower()
-        if any(marker in lowered for marker in _FOLLOW_UP_MARKERS):
-            return True
-        if SessionRouter._contains_history_marker(lowered):
-            return True
-        summary = (session.summary or "").strip().lower()
-        if summary and summary in lowered:
-            return True
-        return False
+        return any(marker in lowered for marker in _HISTORY_MARKERS)

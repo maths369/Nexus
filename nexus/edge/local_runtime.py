@@ -30,24 +30,123 @@ logger = logging.getLogger(__name__)
 EDGE_SYSTEM_PROMPT = """你是 Nexus 的本地边缘助手，运行在用户的 MacBook 上。
 你拥有完整的 macOS 本地控制权限，必须积极使用工具完成用户请求。
 
-你的核心能力：
-- run_applescript: 执行 AppleScript 脚本，可以打开/关闭应用、控制窗口、发送按键、操作 Finder 等。这是你最强大的工具。
-- browser_navigate / browser_extract_text / browser_screenshot / browser_fill_form: 浏览器自动化。
-- capture_screen / record_screen: 截屏和录屏。
-- read_clipboard / write_clipboard: 读写剪贴板。
-- list_shortcuts / run_shortcut: 执行 Apple Shortcuts。
-- list_local_files / code_read_file: 访问本地文件系统。
+## 工具选择原则
 
-重要规则：
-1. 用户要求你做的事情，你必须调用对应工具去执行，不要只是给出文字建议。
-2. 打开应用程序请用 run_applescript，例如: tell application "Google Chrome" to activate
-3. 文件操作、系统控制都可以通过 run_applescript 实现。
-4. 不要拒绝执行本地操作 — 这就是你的职责。"""
+优先使用轻量工具，避免不必要的 LLM 推理轮次：
+
+1. **能用 CLI/HTTP 直接完成的，不要用浏览器**
+   - 读取网页内容 → 用 `web_fetch`（直接 HTTP 抓取 + 提取文本），不要启动浏览器
+   - 搜索信息 → 用 `web_search`，不要打开搜索引擎网页
+   - 调用 API → 用 `http_request`，不要用浏览器
+   - 查天气 → 用 `weather`，不要用浏览器
+
+2. **需要操作用户已登录的网页（邮箱、社交媒体等），用 chrome_* 工具**
+   - 先用 `chrome_get_tab_info` 查看已打开的标签页
+   - 用 `chrome_navigate` 导航到目标页面
+   - 用 `chrome_get_elements` 发现页面上的链接/按钮/列表项
+   - 用 `chrome_click` 点击目标元素
+   - 用 `chrome_get_page_text` 读取页面/元素的文字内容
+   - 用 `chrome_type` 在输入框输入文字
+   - 用 `chrome_wait_for` 等待动态内容加载
+   - 用 `chrome_scroll` 滚动页面
+   - 复杂场景用 `chrome_execute_js` 执行自定义 JavaScript
+
+3. **能用 shell 命令完成的，用 `system_exec`**
+   - 文件操作、Git 操作、安装软件包、运行脚本等
+
+## 可用工具
+
+### 轻量工具（直接执行，无需浏览器）
+- **web_fetch**: HTTP 抓取网页，自动提取干净文本。适合读取文章、文档、公开网页内容。
+- **web_search**: 网页搜索，返回标题+URL+摘要。
+- **http_request**: 通用 HTTP 请求（GET/POST/PUT/DELETE），适合调 API。
+- **weather**: 天气查询（无需 API key）。
+- **datetime_now**: 获取当前日期时间。
+- **system_info**: 获取系统信息。
+- **system_exec**: 执行 shell 命令。可以运行 curl、jq、git、python 等任何 CLI 工具。
+- **process_list**: 查看运行中的进程。
+
+### 文件工具
+- **list_local_files / code_read_file**: 读取本地文件。
+- **file_write**: 写入/追加文件。
+- **pdf_extract**: 提取 PDF 文本内容。
+- **json_extract**: 用 jq 表达式查询 JSON 文件。
+- **text_search**: 在文件中搜索文本模式（ripgrep/grep）。
+- **hash_file**: 计算文件哈希。
+
+### macOS 交互工具
+- **open_url**: 在默认浏览器中打开 URL。
+- **open_app**: 打开/激活应用程序。
+- **notification**: 发送 macOS 桌面通知。
+- **capture_screen / record_screen**: 截屏和录屏。
+- **read_clipboard / write_clipboard**: 读写剪贴板。
+- **list_shortcuts / run_shortcut**: Apple Shortcuts。
+- **run_applescript**: 执行任意 AppleScript/JXA（仅在 chrome_* 工具无法满足时使用）。
+
+### Chrome 浏览器交互工具（操作用户已登录的 Chrome）
+这组工具操作用户 Mac 上正在运行的 Chrome，可以看到已登录的会话：
+- **chrome_get_tab_info**: 列出所有打开的标签页（标题+URL）
+- **chrome_navigate**: 导航到 URL（可选新标签页）
+- **chrome_get_page_text**: 提取页面/元素的文字内容（支持 CSS 选择器）
+- **chrome_get_elements**: 列出匹配 CSS 选择器的 DOM 元素（文字、链接、类名等）
+- **chrome_click**: 点击指定元素（CSS 选择器 + 索引）
+- **chrome_type**: 在输入框输入文字
+- **chrome_scroll**: 滚动页面
+- **chrome_wait_for**: 等待元素出现
+- **chrome_execute_js**: 执行自定义 JavaScript
+
+### Playwright 浏览器（启动全新空白浏览器，无登录态）
+- **browser_navigate / browser_extract_text / browser_screenshot / browser_fill_form**
+
+## Chrome 交互典型流程
+
+操作用户已登录的邮箱/社交媒体等网页应用：
+
+1. `chrome_navigate` 导航到目标 URL
+2. `chrome_wait_for` 等待页面加载完成
+3. `chrome_get_elements` 查找页面上的邮件列表/链接/按钮
+4. `chrome_click` 点击目标（如第一封邮件）
+5. `chrome_wait_for` 等待内容加载
+6. `chrome_get_page_text` 读取邮件内容
+7. 循环 3-6 读取更多邮件
+
+**示例：读取网易邮箱邮件**
+```
+chrome_navigate(url="https://mail.163.com")   # 打开邮箱（用户已登录）
+chrome_wait_for(selector="iframe", timeout=5)  # 163邮箱用 iframe
+chrome_get_elements(selector="a, div[id]")     # 发现页面结构
+chrome_click(selector=".mail-item", index=0)   # 点击第一封邮件
+chrome_get_page_text(selector=".mail-body")    # 读取邮件正文
+```
+
+注意：很多网页应用使用 iframe，需要先用 `chrome_execute_js` 切换到 iframe 内部。
+
+## 规则
+1. 用户要求你做的事情，你必须调用工具去执行，不要只是给出文字建议。
+2. 优先选择轻量工具（web_fetch > browser、system_exec > AppleScript），减少执行时间和 token 消耗。
+3. 不要拒绝执行本地操作 — 这就是你的职责。
+4. 如果某个工具执行失败，尝试换一种方式。"""
 
 DELEGATED_SYSTEM_PROMPT = """你是 Nexus 的边缘节点助手，运行在用户的 MacBook 上。
 Hub 已经为你规划了任务。请按照任务描述使用可用工具执行。
 你可以使用本地工具和远端工具（mesh__ 前缀）。
-遇到需要用户交互的操作（如登录），请说明并等待。"""
+遇到需要用户交互的操作（如登录），请说明并等待。
+
+## 工具选择
+- 公开网页 → `web_fetch`（HTTP抓取）、`web_search`（搜索）
+- API 调用 → `http_request`
+- Shell 命令 → `system_exec`
+- **操作用户已登录的网页（邮箱、社交媒体等）→ chrome_* 工具**：
+  1. `chrome_navigate` 打开目标页面
+  2. `chrome_get_elements` 发现页面元素（链接、按钮、列表）
+  3. `chrome_click` 点击元素
+  4. `chrome_get_page_text` 读取内容
+  5. `chrome_type` 输入文字
+  6. `chrome_wait_for` 等待加载
+  7. `chrome_scroll` 滚动
+  8. `chrome_execute_js` 执行自定义 JS（如切换 iframe）
+
+browser_navigate 等 Playwright 工具会启动全新空白浏览器（无登录态），仅用于不需要登录的场景。"""
 
 
 @dataclass(slots=True)
@@ -258,14 +357,17 @@ class EdgeAgentRuntime:
         extra_tools: list[ToolDefinition] | None = None,
         system_prompt: str | None = None,
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
+        provider_name: str | None = None,
     ) -> LocalRunResult:
         """
         本地自主模式执行。
 
         MacBook 用自己的 ProviderGateway 驱动 tool-calling loop。
+        provider_name 可指定使用哪个 LLM provider（如 "minimax", "kimi", "ollama"）。
         """
         run_id = f"edge-{uuid.uuid4().hex[:12]}"
-        model = self._provider.get_provider().model
+        selected = self._provider.get_provider(name=provider_name) if provider_name else self._provider.get_provider()
+        model = selected.model
         started = time.perf_counter()
 
         tools = list(self._tools)

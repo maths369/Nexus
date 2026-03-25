@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable, TYPE_CHECKING
 
 from .types import AttemptConfig, Run, ToolDefinition
+from .tool_profiles import ToolProfile
 
 if TYPE_CHECKING:
     from nexus.knowledge.retrieval import RetrievalIndex
@@ -48,6 +49,7 @@ class AttemptBuilder:
         memory_manager: MemoryManager | None = None,
         skill_manager: SkillManager | None = None,
         bootstrap_file: str = "system_prompt.md",
+        workspace_roots: list[Path] | None = None,
     ):
         self._all_tools = available_tools
         self._retrieval = retrieval
@@ -55,6 +57,7 @@ class AttemptBuilder:
         self._memory_manager = memory_manager
         self._skill_manager = skill_manager
         self._bootstrap_file = bootstrap_file
+        self._workspace_roots = workspace_roots or []
 
     async def build(
         self,
@@ -64,6 +67,7 @@ class AttemptBuilder:
         stream_callback: Callable[[str], Awaitable[None]] | None = None,
         extra_tools: list[ToolDefinition] | None = None,
         disabled_tool_names: set[str] | None = None,
+        tool_profile: ToolProfile | None = None,
     ) -> AttemptConfig:
         """
         构建一次 attempt 的完整配置。
@@ -78,27 +82,38 @@ class AttemptBuilder:
         # Step 1: 系统提示
         system_prompt = self._load_system_prompt()
 
+        # Step 1.1: 注入当前日期时间（LLM 无法自行获取）
+        from datetime import datetime
+        now = datetime.now()
+        system_prompt += (
+            f"\n\n## 当前时间\n"
+            f"当前日期时间: {now.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(星期{'一二三四五六日'[now.weekday()]})"
+        )
+
         # Step 1.5: 身份注入 (SOUL.md + USER.md)
         identity_context = self._inject_identity()
         if identity_context:
             system_prompt += f"\n\n{identity_context}"
+
+        # Step 1.6: 项目上下文注入 (PROJECT.md / CLAUDE.md / pyproject.toml)
+        project_context = self._inject_project_context()
+        if project_context:
+            system_prompt += f"\n\n{project_context}"
 
         # Step 2: 选择工具集并注入真实工具目录
         tools = self._select_tools(
             run.task,
             extra_tools=extra_tools,
             disabled_tool_names=disabled_tool_names,
+            tool_profile=tool_profile,
         )
         system_prompt += self._render_tool_catalog(tools)
 
-        # Step 2.5: Skill 描述注入 (Layer 1 — 仅名称和描述，约 100 tokens/skill)
-        skill_descriptions = self._inject_skill_descriptions()
-        if skill_descriptions:
-            system_prompt += skill_descriptions
-
-        auto_preloaded_skills = self._inject_auto_preloaded_skill_content(run)
-        if auto_preloaded_skills:
-            system_prompt += auto_preloaded_skills
+        # Step 2.5: Skill 注入（对标 OpenClaw：所有 eligible skills 完整内容注入）
+        skills_prompt = self._inject_skills_prompt()
+        if skills_prompt:
+            system_prompt += f"\n\n{skills_prompt}"
 
         installable_skill_hints = self._inject_installable_skill_hints(run.task)
         if installable_skill_hints:
@@ -177,31 +192,157 @@ class AttemptBuilder:
             return ""
 
     # ------------------------------------------------------------------
+    # 项目上下文注入
+    # ------------------------------------------------------------------
+
+    # 按优先级扫描的 bootstrap 文件名
+    _BOOTSTRAP_FILENAMES = (
+        "PROJECT.md",
+        "CLAUDE.md",
+        "AGENTS.md",
+        "README.md",
+    )
+    # 项目元数据文件（提取关键字段）
+    _META_FILENAMES = (
+        "pyproject.toml",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+    )
+    # Bootstrap 内容上限
+    _MAX_BOOTSTRAP_CHARS = 8_000
+
+    def _inject_project_context(self) -> str:
+        """
+        扫描 workspace_roots 中的项目描述文件，注入到 system prompt。
+
+        优先级:
+        1. PROJECT.md / CLAUDE.md / AGENTS.md — 完整注入
+        2. README.md — 截取前 2000 字符
+        3. pyproject.toml / package.json — 提取项目名、描述、依赖列表
+        """
+        if not self._workspace_roots:
+            return ""
+
+        parts: list[str] = []
+        total_chars = 0
+
+        for root in self._workspace_roots:
+            if not root.is_dir():
+                continue
+
+            # 扫描 bootstrap 文件
+            for name in self._BOOTSTRAP_FILENAMES:
+                fp = root / name
+                if not fp.is_file():
+                    continue
+                try:
+                    content = fp.read_text(encoding="utf-8").strip()
+                except Exception:
+                    continue
+                if not content:
+                    continue
+
+                # README 截断
+                if name == "README.md" and len(content) > 2000:
+                    content = content[:2000] + "\n\n... (截断)"
+
+                budget = self._MAX_BOOTSTRAP_CHARS - total_chars
+                if budget <= 0:
+                    break
+                if len(content) > budget:
+                    content = content[:budget] + "\n\n... (截断)"
+
+                parts.append(f"### {name} ({root.name}/)\n{content}")
+                total_chars += len(content)
+
+                # PROJECT.md / CLAUDE.md 找到一个就够了（同一项目）
+                if name in ("PROJECT.md", "CLAUDE.md", "AGENTS.md"):
+                    break
+
+            # 扫描项目元数据
+            for name in self._META_FILENAMES:
+                fp = root / name
+                if not fp.is_file():
+                    continue
+                try:
+                    meta_summary = self._summarize_project_meta(fp)
+                except Exception:
+                    continue
+                if meta_summary:
+                    parts.append(f"### {name} ({root.name}/)\n{meta_summary}")
+                break  # 一个项目只需要一个 meta 文件
+
+        if not parts:
+            return ""
+
+        return "## 项目上下文\n以下是当前工作区的项目描述，请据此理解项目结构和约定。\n\n" + "\n\n".join(parts)
+
+    @staticmethod
+    def _summarize_project_meta(path: Path) -> str:
+        """从项目元数据文件中提取关键信息"""
+        content = path.read_text(encoding="utf-8")
+        name = path.name
+
+        if name == "pyproject.toml":
+            lines = []
+            in_project = False
+            in_deps = False
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped == "[project]" or stripped == "[tool.poetry]":
+                    in_project = True
+                    continue
+                if stripped.startswith("[") and in_project:
+                    in_project = False
+                if stripped == "[project.dependencies]" or stripped == "[tool.poetry.dependencies]":
+                    in_deps = True
+                    continue
+                if stripped.startswith("[") and in_deps:
+                    in_deps = False
+
+                if in_project and "=" in stripped:
+                    key = stripped.split("=")[0].strip()
+                    if key in ("name", "description", "version", "python"):
+                        lines.append(stripped)
+                if in_deps and "=" in stripped:
+                    lines.append(f"  dep: {stripped}")
+            return "\n".join(lines[:20]) if lines else ""
+
+        if name == "package.json":
+            import json as _json_mod
+            try:
+                data = _json_mod.loads(content)
+            except Exception:
+                return ""
+            parts = []
+            for key in ("name", "description", "version"):
+                if key in data:
+                    parts.append(f"{key}: {data[key]}")
+            deps = data.get("dependencies", {})
+            if deps:
+                parts.append(f"dependencies: {', '.join(list(deps.keys())[:15])}")
+            return "\n".join(parts)
+
+        # Cargo.toml, go.mod — 返回前 500 字符
+        return content[:500]
+
+    # ------------------------------------------------------------------
     # Skill 注入 (Layer 1)
     # ------------------------------------------------------------------
 
-    def _inject_skill_descriptions(self) -> str:
-        """
-        Layer 1 Skill 注入: 将已安装 skill 的名称和描述注入 system prompt。
+    def _inject_skills_prompt(self) -> str:
+        """对标 OpenClaw：将所有 eligible 的已安装 skill 完整内容注入 system prompt。
 
-        每个 skill 约占 100 tokens，不会过度膨胀 system prompt。
-        Agent 可通过 load_skill 工具按需加载完整内容 (Layer 2)。
+        LLM 根据用户任务自行决定使用哪些 skill，无需二次 load_skill 调用。
         """
         if not self._skill_manager:
             return ""
 
         try:
-            descriptions = self._skill_manager.get_skill_descriptions()
-            if not descriptions:
-                return ""
-
-            return (
-                "\n\n## 可用 Skills\n"
-                "遇到相关任务时，先用 `load_skill` 工具加载对应 skill 的详细指令。\n\n"
-                f"{descriptions}\n"
-            )
+            return self._skill_manager.format_skills_for_prompt()
         except Exception as e:
-            logger.warning(f"Skill descriptions injection failed: {e}")
+            logger.warning(f"Skills prompt injection failed: {e}")
             return ""
 
     def _inject_installable_skill_hints(self, task: str) -> str:
@@ -236,44 +377,6 @@ class AttemptBuilder:
                 f"- `{item.get('skill_id')}` — {item.get('description', '')}（{installed_text}，匹配分数 {item.get('match_score', 0)}）"
             )
         return "\n" + "\n".join(lines) + "\n"
-
-    def _inject_auto_preloaded_skill_content(self, run: Run) -> str:
-        """
-        Inject full instructions for skills that the runtime explicitly preloaded
-        for this task after managed auto-install / auto-select.
-        """
-        if not self._skill_manager:
-            return ""
-
-        raw_ids = run.metadata.get("auto_preloaded_skills", [])
-        if not isinstance(raw_ids, list):
-            return ""
-
-        skill_ids: list[str] = []
-        seen: set[str] = set()
-        for item in raw_ids:
-            skill_id = str(item).strip()
-            if not skill_id or skill_id in seen:
-                continue
-            seen.add(skill_id)
-            skill_ids.append(skill_id)
-
-        if not skill_ids:
-            return ""
-
-        blocks: list[str] = [
-            "",
-            "## 本轮已自动预加载的 Skills",
-            "这些 Skills 已由运行时基于当前任务自动选择或安装。优先按这些指令执行，不要先退回到“我不会”或手工方案说明。",
-        ]
-        for skill_id in skill_ids[:3]:
-            content = self._skill_manager.get_skill_content(skill_id)
-            if content.startswith("Error:"):
-                continue
-            blocks.append(content)
-        if len(blocks) <= 3:
-            return ""
-        return "\n" + "\n\n".join(blocks) + "\n"
 
     # ------------------------------------------------------------------
     # 记忆注入
@@ -333,22 +436,29 @@ class AttemptBuilder:
         *,
         extra_tools: list[ToolDefinition] | None = None,
         disabled_tool_names: set[str] | None = None,
+        tool_profile: ToolProfile | None = None,
     ) -> list[ToolDefinition]:
         """
         根据任务类型选择可用工具。
 
-        当前阶段：返回所有工具。
-        未来：根据意图分类结果过滤工具集。
+        过滤顺序:
+        1. disabled_tool_names — 移除明确禁用的工具
+        2. extra_tools — 追加额外工具（去重）
+        3. tool_profile — 根据 Profile 过滤工具子集
         """
         disabled = set(disabled_tool_names or set())
         tools = [tool for tool in self._all_tools if tool.name not in disabled]
-        if not extra_tools:
-            return tools
 
-        seen = {tool.name for tool in tools}
-        for tool in extra_tools:
-            if tool.name in seen:
-                continue
-            seen.add(tool.name)
-            tools.append(tool)
+        if extra_tools:
+            seen = {tool.name for tool in tools}
+            for tool in extra_tools:
+                if tool.name in seen:
+                    continue
+                seen.add(tool.name)
+                tools.append(tool)
+
+        # Profile 过滤（如果指定）
+        if tool_profile is not None:
+            tools = tool_profile.filter(tools)
+
         return tools

@@ -63,6 +63,7 @@ def test_build_runtime_wires_core_agent_capabilities():
     assert "browser_screenshot" in tool_names
     assert "browser_fill_form" in tool_names
     assert "search_web" in tool_names
+    assert "search_web_structured" in tool_names
     assert "skill_create" in tool_names
     assert "skill_update" in tool_names
     assert "skill_list_installed" in tool_names
@@ -165,7 +166,7 @@ def test_project_runtime_loads_installable_skills_from_registry():
     assert "office-conversion" in installable
     assert "notebooklm-integration" in installable
     assert installable["office-conversion"]["manifest_path"].endswith(
-        "skill_registry/office-conversion/skill.yaml"
+        "skill_registry/office-conversion/SKILL.md"
     )
 
 

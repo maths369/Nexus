@@ -15,6 +15,7 @@ import asyncio
 import logging
 import uuid
 import re
+from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from nexus.channel.types import (
@@ -30,6 +31,9 @@ from nexus.channel.context_window import ContextWindowManager
 from nexus.channel.message_formatter import MessageFormatter
 from nexus.agent.run import RunManager
 from nexus.agent.types import RunStatus
+from nexus.agent.tool_profiles import ToolProfile
+from nexus.provider.gateway import ProviderGateway, ProviderGatewayError
+from nexus.shared.config import switch_primary_provider, switch_search_provider
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,9 @@ class Orchestrator:
         context_window: ContextWindowManager,
         run_manager: RunManager,
         formatter: MessageFormatter,
+        provider_gateway: ProviderGateway | None = None,
+        search_config: dict[str, Any] | None = None,
+        config_path: Path | None = None,
         available_tools: list[Any] | None = None,
         skill_manager: Any | None = None,
         capability_manager: Any | None = None,
@@ -64,6 +71,9 @@ class Orchestrator:
         self._context = context_window
         self._run_manager = run_manager
         self._formatter = formatter
+        self._provider_gateway = provider_gateway or getattr(run_manager, "_provider", None)
+        self._search_config = search_config or {}
+        self._config_path = Path(config_path).resolve() if config_path is not None else None
         self._available_tools = available_tools or []
         self._skill_manager = skill_manager
         self._capability_manager = capability_manager
@@ -82,11 +92,6 @@ class Orchestrator:
 
         Channel Adapter 调用此方法即可，不用关心内部路由逻辑。
         """
-        if await self._handle_control_plane_action(message, reply):
-            return
-        if await self._handle_runtime_fact_query(message, reply):
-            return
-
         logger.info(
             "Orchestrator inbound: channel=%s sender=%s message_id=%s preview=%s",
             message.channel.value,
@@ -109,330 +114,8 @@ class Orchestrator:
         else:
             await self._handle_new_task(message, decision, reply)
 
-    async def _handle_runtime_fact_query(
-        self,
-        message: InboundMessage,
-        reply: ReplyFn,
-    ) -> bool:
-        """
-        对极少数“系统真相”问题做确定性回答，避免被会话历史污染。
-
-        这里只处理 runtime capability / self-evolution 能力盘点，
-        不扩散到普通任务型问题。
-        """
-        is_mesh_query = self._is_mesh_inventory_query(message.content)
-        is_evolution_query = self._is_self_evolution_query(message.content)
-        if not is_mesh_query and not is_evolution_query:
-            return False
-
-        tool_names = {tool.name for tool in self._available_tools}
-        capability_tools = [
-            name for name in (
-                "capability_list_available",
-                "capability_status",
-                "capability_enable",
-                "capability_create",
-                "capability_register",
-                "capability_stage",
-                "capability_verify",
-                "capability_promote",
-                "capability_rollback",
-            )
-            if name in tool_names
-        ]
-        skill_tools = [
-            name for name in (
-                "skill_list_installable",
-                "skill_install",
-                "skill_list_installed",
-                "skill_create",
-                "skill_update",
-                "load_skill",
-            )
-            if name in tool_names
-        ]
-        audit_tools = [
-            name for name in ("evolution_audit",) if name in tool_names
-        ]
-
-        installed_skills: list[str] = []
-        installable_skills: list[dict[str, Any]] = []
-        if self._skill_manager is not None:
-            try:
-                installed_skills = sorted(
-                    skill["skill_id"] for skill in self._skill_manager.list_skills()
-                )
-                installable_skills = list(self._skill_manager.list_installable_skills())
-            except Exception:
-                installed_skills = []
-                installable_skills = []
-
-        capabilities: list[dict[str, Any]] = []
-        if self._capability_manager is not None:
-            try:
-                capabilities = list(self._capability_manager.list_capabilities())
-            except Exception:
-                capabilities = []
-
-        sections: list[str] = []
-
-        if is_mesh_query:
-            sections.append(self._render_mesh_inventory(tool_names))
-
-        if is_evolution_query:
-            if not capability_tools and not skill_tools and not audit_tools:
-                sections.append("根据当前真实运行时，我现在没有注入自我进化相关工具。")
-            else:
-                sections.append(
-                    self._render_self_evolution_inventory(
-                        tool_names=tool_names,
-                        capability_tools=capability_tools,
-                        skill_tools=skill_tools,
-                        audit_tools=audit_tools,
-                        capabilities=capabilities,
-                        installable_skills=installable_skills,
-                        installed_skills=installed_skills,
-                    )
-                )
-
-        content = "\n\n---\n\n".join(section for section in sections if section.strip())
-
-        active = self._sessions.get_active_session(message.sender_id)
-        session_id = active.session_id if active else ""
-        if session_id:
-            self._sessions.add_event(session_id=session_id, role="user", content=message.content)
-            self._sessions.add_event(session_id=session_id, role="assistant", content=content)
-        await reply(self._formatter.format_result(session_id=session_id, result=content))
-        return True
-
-    def _render_mesh_inventory(self, tool_names: set[str]) -> str:
-        if self._mesh_registry is None:
-            return "当前未初始化 Mesh registry，所以我现在无法给出可靠的节点与能力盘点。"
-
-        try:
-            cards = list(self._mesh_registry.list_nodes(online_only=False))
-        except Exception as exc:
-            return f"Mesh registry 当前不可用：{exc}"
-
-        if not cards:
-            return "当前 Mesh 网络中还没有已注册节点。"
-
-        online_count = 0
-        lines = [
-            "## Mesh 网络当前真实状态",
-            "",
-            f"当前 Mesh 注册表中共有 **{len(cards)}** 个节点。",
-        ]
-        for card in cards:
-            status = self._mesh_registry.get_node_status(card.node_id)
-            online = bool(status.online) if status else False
-            if online:
-                online_count += 1
-            capability_ids = sorted(card.capability_ids())
-            capabilities = "、".join(capability_ids) if capability_ids else "无"
-            lines.append(
-                f"- **{card.display_name}** (`{card.node_id}` · {card.node_type.value} · {'online' if online else 'offline'})"
-            )
-            lines.append(f"  capabilities: {capabilities}")
-
-        lines.insert(3, f"其中在线节点 **{online_count}** 个，离线节点 **{len(cards) - online_count}** 个。")
-
-        online_edges = [
-            card for card in cards
-            if getattr(card, "node_type", None) is not None
-            and card.node_type.value == "edge"
-            and bool((self._mesh_registry.get_node_status(card.node_id).online) if self._mesh_registry.get_node_status(card.node_id) else False)
-        ]
-        if online_edges:
-            node_names = "、".join(f"{card.display_name}(`{card.node_id}`)" for card in online_edges)
-            lines.extend([
-                "",
-                f"当前可调度的在线边缘节点：{node_names}",
-                "说明：`mesh_dispatch__*` 不是常驻基础工具，而是 TaskRouter 在识别到跨节点步骤时按在线 edge 节点动态注入。",
-            ])
-        else:
-            lines.extend([
-                "",
-                "当前没有在线的 edge 节点可供跨节点委托。",
-            ])
-        if any(name.startswith("mesh_dispatch__") for name in tool_names):
-            lines.append("当前这轮运行里已经注入了 `mesh_dispatch__*` 工具。")
-        return "\n".join(lines)
-
-    def _render_self_evolution_inventory(
-        self,
-        *,
-        tool_names: set[str],
-        capability_tools: list[str],
-        skill_tools: list[str],
-        audit_tools: list[str],
-        capabilities: list[dict[str, Any]],
-        installable_skills: list[dict[str, Any]],
-        installed_skills: list[str],
-    ) -> str:
-        lines = [
-            "是的，我具备受控的自我进化能力。",
-            "",
-            "当前真实运行时里已注入的自我进化相关工具：",
-        ]
-        if capability_tools:
-            lines.append("")
-            lines.append("正式 capability（兼容层）：")
-            for name in capability_tools:
-                lines.append(f"- `{name}`")
-        if skill_tools:
-            lines.append("")
-            lines.append("受管 Skill 扩展：")
-            for name in skill_tools:
-                lines.append(f"- `{name}`")
-        if audit_tools:
-            lines.append("")
-            lines.append("审计：")
-            for name in audit_tools:
-                lines.append(f"- `{name}`")
-        if "system_run" in tool_names:
-            lines.append("")
-            lines.append("底层 substrate：")
-            lines.append("- `system_run`")
-            lines.append("")
-            lines.append("说明：长期扩展优先走 `skill_list_installable -> skill_install -> load_skill`；`system_run` 只负责底层安装、脚本执行和验证，不代表正式能力本身。")
-        if capabilities:
-            lines.append("")
-            lines.append("当前可用的正式 capability（兼容层）：")
-            for item in capabilities:
-                status = "已启用" if item.get("enabled") else "未启用"
-                lines.append(
-                    f"- `{item.get('capability_id')}`: {item.get('name')}（{status}）"
-                )
-        if installable_skills:
-            lines.append("")
-            lines.append(f"当前可安装 Skills（{len(installable_skills)} 个）：")
-            preview_installable = installable_skills[:8]
-            for item in preview_installable:
-                status = "已安装" if item.get("installed") else "未安装"
-                lines.append(
-                    f"- `{item.get('skill_id')}`: {item.get('description', '')}（{status}）"
-                )
-            if len(installable_skills) > len(preview_installable):
-                lines.append(f"- 以及其他 {len(installable_skills) - len(preview_installable)} 个")
-        if installed_skills:
-            lines.append("")
-            lines.append(
-                f"当前已安装 Skills（{len(installed_skills)} 个）："
-            )
-            preview = installed_skills[:8]
-            for skill_id in preview:
-                lines.append(f"- `{skill_id}`")
-            if len(installed_skills) > len(preview):
-                lines.append(f"- 以及其他 {len(installed_skills) - len(preview)} 个")
-        lines.append("")
-        lines.append(
-            "边界：这是受控自我进化，不是任意安装任意软件；正式扩展对象优先是受管 Skill，capability 目前只保留兼容层。"
-        )
-        return "\n".join(lines)
-
-    async def _handle_control_plane_action(
-        self,
-        message: InboundMessage,
-        reply: ReplyFn,
-    ) -> bool:
-        installable = self._match_installable_skill_request(message.content)
-        if installable is not None and self._skill_manager is not None:
-            result = await self._skill_manager.install_from_catalog(installable["skill_id"], actor="agent")
-            content = self._render_skill_install_result(installable, result)
-            await reply(self._formatter.format_result(session_id="", result=content))
-            return True
-
-        capability = self._match_enable_capability_request(message.content)
-        if capability is not None and self._capability_manager is not None:
-            result = await self._capability_manager.enable(capability["capability_id"], actor="agent")
-            content = self._render_capability_enable_result(capability, result)
-            await reply(self._formatter.format_result(session_id="", result=content))
-            return True
-
-        return False
-
-    def _match_installable_skill_request(self, text: str) -> dict[str, Any] | None:
-        if self._skill_manager is None:
-            return None
-        compact = text.strip().lower()
-        if not compact:
-            return None
-        if not any(token in compact for token in ("安装", "install", "装上")):
-            return None
-        specs = list(self._skill_manager.list_installable_skills())
-        for item in specs:
-            skill_id = str(item.get("skill_id") or "").lower()
-            name = str(item.get("name") or "").lower()
-            if skill_id and skill_id in compact:
-                return item
-            if name and name in compact:
-                return item
-        return None
-
-    def _match_enable_capability_request(self, text: str) -> dict[str, Any] | None:
-        if self._capability_manager is None:
-            return None
-        compact = text.strip().lower()
-        if not compact:
-            return None
-        if not any(token in compact for token in ("启用", "enable", "开通", "开启")):
-            return None
-        capabilities = list(self._capability_manager.list_capabilities())
-        for item in capabilities:
-            capability_id = str(item.get("capability_id") or "").lower()
-            name = str(item.get("name") or "").lower()
-            if capability_id and capability_id in compact:
-                return item
-            if name and name in compact:
-                return item
-        return None
-
-    @staticmethod
-    def _render_skill_install_result(skill: dict[str, Any], result: dict[str, Any]) -> str:
-        success = bool(result.get("success"))
-        status = "已安装成功" if success else "安装失败"
-        reason = str(result.get("reason") or "")
-        return "\n".join([
-            f"Skill `{skill.get('skill_id')}` {status}。",
-            *([""] if reason else []),
-            *([reason] if reason else []),
-        ])
-
-    @staticmethod
-    def _render_capability_enable_result(capability: dict[str, Any], result: Any) -> str:
-        success = bool(getattr(result, "success", False))
-        reason = str(getattr(result, "reason", "") or "")
-        status = "已启用成功" if success else "启用失败"
-        return "\n".join([
-            f"Capability `{capability.get('capability_id')}` {status}。",
-            *([""] if reason else []),
-            *([reason] if reason else []),
-        ])
-
-    @staticmethod
-    def _is_self_evolution_query(text: str) -> bool:
-        compact = re.sub(r"\s+", "", text.strip().lower())
-        if not compact:
-            return False
-        if "自我进化" in compact:
-            return True
-        if "capability" in compact:
-            return True
-        if "技能包" in compact or "扩展包" in compact:
-            return True
-        if "skill" in compact and any(token in compact for token in ("工具", "能力", "安装", "进化")):
-            return True
-        return False
-
-    @staticmethod
-    def _is_mesh_inventory_query(text: str) -> bool:
-        compact = re.sub(r"\s+", "", text.strip().lower())
-        if not compact:
-            return False
-        mesh_tokens = ("mesh", "节点", "设备", "macbook", "ubuntuhub", "hub", "edge")
-        action_tokens = ("几个", "多少", "有哪些", "能力", "能干什么", "在线", "离线", "控制下")
-        return any(token in compact for token in mesh_tokens) and any(token in compact for token in action_tokens)
+    # _handle_runtime_fact_query / _handle_control_plane_action 已移除。
+    # 所有消息统一交给 LLM 理解意图，不再做关键词硬编码拦截。
 
     # ------------------------------------------------------------------
     # 意图处理器
@@ -444,21 +127,16 @@ class Orchestrator:
         decision: RoutingDecision,
         reply: ReplyFn,
     ) -> None:
-        """处理新任务意图 — 复用持久 session（同 sender + channel 同 session）"""
+        """处理新任务意图 — 总是开启新 session，并收口旧的 active session。"""
         channel_key = message.metadata.get("channel_key") or message.channel.value
-        session, created = self._sessions.get_or_create_persistent_session(
+        self._sessions.close_other_active_sessions(
+            sender_id=message.sender_id,
+            new_status=SessionStatus.ABANDONED,
+        )
+        session = self._sessions.create_session(
             sender_id=message.sender_id,
             channel=channel_key,
-        )
-        if created:
-            self._sessions.close_other_active_sessions(
-                sender_id=message.sender_id,
-                keep_session_id=session.session_id,
-                new_status=SessionStatus.ABANDONED,
-            )
-        # 更新 summary 为最新任务
-        self._sessions.update_session_summary(
-            session.session_id, message.content[:100],
+            summary=message.content[:100],
         )
         # 记录用户消息
         self._record_inbound_message(session.session_id, message)
@@ -468,7 +146,7 @@ class Orchestrator:
         ))
 
         # 启动 run
-        await self._start_run(session.session_id, message.content, reply)
+        await self._start_run(session.session_id, message.content, reply, route_hint=str(message.metadata.get("route_mode", "auto")))
 
     async def _handle_follow_up(
         self,
@@ -490,7 +168,7 @@ class Orchestrator:
         # 记录用户消息
         self._record_inbound_message(session_id, message)
         # 启动 run（带上下文）
-        await self._start_run(session_id, message.content, reply)
+        await self._start_run(session_id, message.content, reply, route_hint=str(message.metadata.get("route_mode", "auto")))
 
     async def _handle_resume(
         self,
@@ -515,7 +193,7 @@ class Orchestrator:
                 new_status=SessionStatus.ABANDONED,
             )
         self._record_inbound_message(session_id, message)
-        await self._start_run(session_id, message.content, reply)
+        await self._start_run(session_id, message.content, reply, route_hint=str(message.metadata.get("route_mode", "auto")))
 
     async def _handle_status_query(
         self,
@@ -563,6 +241,25 @@ class Orchestrator:
             sender_id=message.sender_id
         )
         session_id = session.session_id if session else ""
+        action = str((decision.metadata or {}).get("action") or "").strip().lower()
+
+        if action == "provider":
+            await self._handle_provider_command(
+                session_id=session_id,
+                provider_command=str((decision.metadata or {}).get("provider_command") or "status"),
+                target=str((decision.metadata or {}).get("target") or ""),
+                reply=reply,
+            )
+            return
+
+        if action == "search_provider":
+            await self._handle_search_command(
+                session_id=session_id,
+                search_command=str((decision.metadata or {}).get("search_command") or "status"),
+                target=str((decision.metadata or {}).get("target") or ""),
+                reply=reply,
+            )
+            return
 
         if cmd == "pause" and session:
             self._sessions.update_session_status(
@@ -634,6 +331,10 @@ class Orchestrator:
                 "| /status | 状态 | 查看当前任务状态 |\n"
                 "| /compress | 压缩、压缩对话 | 用 LLM 压缩对话历史 |\n"
                 "| /restart | 重启、重启服务 | 重启 Hub 服务 |\n"
+                "| /provider | - | 查看当前后端与可切换列表 |\n"
+                "| /provider gemini-3-flash-preview | - | 切换到指定已配置后端 |\n"
+                "| /search | - | 查看当前搜索后端与兜底链路 |\n"
+                "| /search google_grounded | - | 切换搜索后端 |\n"
                 "| /help | 帮助、命令 | 显示本帮助信息 |\n"
             )
             await reply(self._formatter.format_result(
@@ -647,6 +348,152 @@ class Orchestrator:
                 session_id=session_id,
                 result=f"命令 '{cmd}' 已收到。",
             ))
+
+    async def _handle_provider_command(
+        self,
+        *,
+        session_id: str,
+        provider_command: str,
+        target: str,
+        reply: ReplyFn,
+    ) -> None:
+        gateway = self._provider_gateway
+        if gateway is None:
+            await reply(self._formatter.format_error(
+                session_id=session_id,
+                error="当前运行时没有可切换的 provider 网关。",
+            ))
+            return
+
+        providers = gateway.list_providers()
+        current = gateway.primary_provider
+
+        if provider_command != "switch" or not target:
+            lines = [f"当前后端：`{current.name}` (`{current.model}`)"]
+            lines.append("")
+            lines.append("可切换后端：")
+            for provider in providers:
+                status = "已配置" if provider.resolved_api_key() else "缺少 API Key"
+                marker = " (当前)" if provider.name == current.name else ""
+                lines.append(f"- `{provider.name}`: `{provider.model}` [{status}]{marker}")
+            lines.append("")
+            lines.append("使用方式：`/provider gemini-3-flash-preview`")
+            await reply(self._formatter.format_result(session_id=session_id, result="\n".join(lines)))
+            return
+
+        try:
+            selected = gateway.get_provider(name=target)
+        except ProviderGatewayError:
+            available = ", ".join(f"`{provider.name}`" for provider in providers)
+            await reply(self._formatter.format_clarify(
+                session_id=session_id,
+                question=f"未找到后端 `{target}`。请选择已配置后端。",
+                options=[available] if available else ["先配置 provider"],
+            ))
+            return
+
+        if not selected.resolved_api_key():
+            await reply(self._formatter.format_error(
+                session_id=session_id,
+                error=f"后端 `{selected.name}` 已配置但当前运行环境缺少可用 API Key。",
+            ))
+            return
+
+        gateway.switch_primary_provider(selected.name)
+        self._run_manager.set_fallback_models([provider.model for provider in gateway.list_providers()])
+
+        persisted = False
+        if self._config_path is not None:
+            try:
+                switch_primary_provider(self._config_path, selected.name)
+                persisted = True
+            except Exception:
+                logger.exception("Failed to persist primary provider switch: %s", selected.name)
+
+        lines = [
+            f"已切换当前后端到 `{selected.name}` (`{selected.model}`)。",
+            f"持久化配置：{'已写入 config/app.yaml' if persisted else '未写入，仅本次运行有效'}",
+        ]
+        await reply(self._formatter.format_result(session_id=session_id, result="\n".join(lines)))
+
+    async def _handle_search_command(
+        self,
+        *,
+        session_id: str,
+        search_command: str,
+        target: str,
+        reply: ReplyFn,
+    ) -> None:
+        search_settings = self._search_config
+        provider_settings = search_settings.setdefault("provider", {})
+        google_settings = search_settings.setdefault("google_grounded", {})
+        supported = {
+            "google_grounded": "Google grounded search",
+            "bing": "Bing 结果页抽取",
+            "duckduckgo": "DuckDuckGo 结果页抽取",
+        }
+        aliases = {
+            "google": "google_grounded",
+            "grounded": "google_grounded",
+            "ddg": "duckduckgo",
+        }
+
+        current = str(provider_settings.get("primary") or "google_grounded").strip() or "google_grounded"
+        fallback_chain = [
+            str(item).strip()
+            for item in (provider_settings.get("fallbacks") or [])
+            if str(item).strip()
+        ]
+
+        if search_command != "switch" or not target:
+            lines = [f"当前搜索后端：`{current}`"]
+            if fallback_chain:
+                lines.append(f"兜底链路：`{' -> '.join(fallback_chain)}`")
+            lines.append("")
+            lines.append("可切换搜索后端：")
+            for name, description in supported.items():
+                status = "可用"
+                if name == "google_grounded" and not google_settings.get("api_key"):
+                    status = "缺少 GEMINI_API_KEY"
+                marker = " (当前)" if name == current else ""
+                lines.append(f"- `{name}`: {description} [{status}]{marker}")
+            lines.append("")
+            lines.append("使用方式：`/search google_grounded`")
+            await reply(self._formatter.format_result(session_id=session_id, result="\n".join(lines)))
+            return
+
+        selected = aliases.get(target.strip().lower(), target.strip().lower())
+        if selected not in supported:
+            await reply(self._formatter.format_clarify(
+                session_id=session_id,
+                question=f"未找到搜索后端 `{target}`。请选择已支持的搜索后端。",
+                options=["google_grounded", "bing", "duckduckgo"],
+            ))
+            return
+
+        if selected == "google_grounded" and not google_settings.get("api_key"):
+            await reply(self._formatter.format_error(
+                session_id=session_id,
+                error="搜索后端 `google_grounded` 需要 GEMINI_API_KEY，但当前运行环境未配置。",
+            ))
+            return
+
+        provider_settings["primary"] = selected
+        persisted = False
+        if self._config_path is not None:
+            try:
+                switch_search_provider(self._config_path, selected)
+                persisted = True
+            except Exception:
+                logger.exception("Failed to persist search provider switch: %s", selected)
+
+        lines = [
+            f"已切换当前搜索后端到 `{selected}` ({supported[selected]})。",
+            f"持久化配置：{'已写入 config/app.yaml' if persisted else '未写入，仅本次运行有效'}",
+        ]
+        if fallback_chain:
+            lines.append(f"当前兜底链路仍为：`{' -> '.join(fallback_chain)}`")
+        await reply(self._formatter.format_result(session_id=session_id, result="\n".join(lines)))
 
     async def _handle_unknown(
         self,
@@ -685,11 +532,43 @@ class Orchestrator:
     # Run 执行
     # ------------------------------------------------------------------
 
+    # 编码相关关键词 — 命中任意一个即使用 coding profile
+    _CODING_KEYWORDS = frozenset({
+        "代码", "code", "编程", "脚本", "script", "函数", "function",
+        "修复", "fix", "bug", "debug", "重构", "refactor",
+        "文件", "file", "目录", "directory", "路径", "path",
+        "安装", "install", "pip", "npm", "依赖", "dependency",
+        "编译", "build", "运行", "run", "执行", "execute",
+        "git", "commit", "push", "pull", "branch",
+        "测试", "test", "部署", "deploy",
+        "技能", "skill", "进化", "evolve", "创建技能",
+        "grep", "搜索代码", "search", "查找文件",
+    })
+
+    def _select_tool_profile(self, task: str) -> ToolProfile | None:
+        """
+        根据任务内容选择 Tool Profile。
+
+        策略：
+        - 任务包含编码相关关键词 → coding profile
+        - 否则 → None（使用全量工具集，由 LLM 自行决策）
+
+        这是一个轻量级提示，不做硬限制。LLM 仍然是最终决策者。
+        """
+        task_lower = task.lower()
+        for keyword in self._CODING_KEYWORDS:
+            if keyword in task_lower:
+                logger.debug("Task matches coding keyword '%s', using coding profile", keyword)
+                return ToolProfile.coding()
+        return None
+
     async def _start_run(
         self,
         session_id: str,
         task: str,
         reply: ReplyFn,
+        *,
+        route_hint: str = "auto",
     ) -> None:
         """启动一个 run 并将结果通过 reply 回调返回"""
         # 获取 session 锁，防止并发
@@ -722,6 +601,7 @@ class Orchestrator:
                         session_id=session_id,
                         task=effective_task,
                         context_messages=context_messages,
+                        route_hint=route_hint,
                     )
                     self._sessions.update_session_metadata(
                         session_id,
@@ -771,6 +651,9 @@ class Orchestrator:
                     # 对于 Web，通过 WebSocket 推送
                     pass
 
+                # 根据任务内容选择 Tool Profile
+                tool_profile = self._select_tool_profile(effective_task)
+
                 # 执行 run
                 run = await self._run_manager.execute(
                     session_id=session_id,
@@ -779,6 +662,7 @@ class Orchestrator:
                     stream_callback=stream_to_reply,
                     extra_tools=extra_tools,
                     disabled_tool_names=disabled_tool_names,
+                    tool_profile=tool_profile,
                 )
                 logger.info(
                     "Run finished: session_id=%s run_id=%s status=%s error=%s",
@@ -787,6 +671,9 @@ class Orchestrator:
                     run.status.value,
                     run.error,
                 )
+
+                # LLM-driven routing: 不再 force-dispatch。
+                # LLM 在 agent loop 中自行决定是否调用 mesh_dispatch 工具。
 
                 if self._task_router is not None:
                     self._task_router.mark_session_plan_finished(
@@ -803,6 +690,29 @@ class Orchestrator:
                             },
                         )
 
+                # ── 追踪 vault 写入产出物到 session artifacts ──
+                vault_artifacts = run.metadata.get("vault_write_artifacts")
+                if isinstance(vault_artifacts, list) and vault_artifacts:
+                    try:
+                        normalized = [
+                            {
+                                "artifact_type": "vault_output",
+                                "filename": item.get("title") or item.get("relative_path", ""),
+                                "relative_path": item.get("relative_path", ""),
+                                "page_relative_path": item.get("relative_path", ""),
+                            }
+                            for item in vault_artifacts
+                            if isinstance(item, dict) and item.get("relative_path")
+                        ]
+                        if normalized:
+                            self._sessions.append_recent_artifacts(session_id, normalized)
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist vault write artifacts for session %s",
+                            session_id,
+                            exc_info=True,
+                        )
+
                 # 记录 assistant 回复到 session
                 if run.result:
                     self._sessions.add_event(
@@ -813,22 +723,29 @@ class Orchestrator:
 
                 # 发送结果
                 if run.status == RunStatus.SUCCEEDED:
-                    # Keep session active so follow-up messages can be
-                    # associated within the freshness window.  The session
-                    # router's freshness check will naturally expire it.
+                    self._sessions.update_session_status(
+                        session_id,
+                        SessionStatus.COMPLETED,
+                    )
                     await reply(self._formatter.format_result(
                         session_id=session_id,
                         result=run.result,
                     ))
                 else:
-                    # Keep session active even on failure (persistent session model).
-                    # The session stays alive so the user can retry or follow up.
+                    self._sessions.update_session_status(
+                        session_id,
+                        SessionStatus.PAUSED,
+                    )
                     await reply(self._formatter.format_error(
                         session_id=session_id,
-                        error=run.error or "执行失败，请重试。",
+                        error=self._format_run_failure_error(run),
                     ))
 
             except Exception as e:
+                self._sessions.update_session_status(
+                    session_id,
+                    SessionStatus.PAUSED,
+                )
                 logger.error(
                     f"Run execution failed for session {session_id}: {e}",
                     exc_info=True,
@@ -838,6 +755,217 @@ class Orchestrator:
                     error=str(e),
                 ))
 
+    def _format_run_failure_error(self, run: Any) -> str:
+        base_error = str(getattr(run, "error", "") or "执行失败，请重试。").strip()
+        attempt_models = [
+            str(item).strip()
+            for item in ((getattr(run, "metadata", {}) or {}).get("attempt_models") or [])
+            if str(item).strip()
+        ]
+        if len(attempt_models) <= 1:
+            return base_error
+
+        humanized = (
+            self._formatter._humanize_error(base_error)
+            if hasattr(self._formatter, "_humanize_error")
+            else base_error
+        )
+        chain = " -> ".join(f"`{model}`" for model in attempt_models)
+        return f"本次请求已依次尝试 {chain}。{humanized}"
+
+    async def _force_dispatch_undispatched_steps(
+        self,
+        session_id: str,
+        run: Any,
+        reply: ReplyFn,
+    ) -> None:
+        """Fallback for when the LLM generates text instead of calling
+        mesh_dispatch tools.
+
+        After a successful run, we inspect the TaskRouter plan for
+        agent-loop steps that were assigned to edge nodes.  If the run
+        event metadata does not contain evidence that a successful
+        ``mesh_dispatch__*`` tool invocation already happened for a
+        given step, we fire the dispatch programmatically.
+        """
+        task_router = self._task_router
+        if task_router is None:
+            return
+
+        plan = task_router.get_session_plan(session_id)
+        if plan is None:
+            return
+
+        agent_loop_steps = task_router.get_agent_loop_steps(plan)
+        if not agent_loop_steps:
+            return
+
+        remote_proxy = getattr(task_router, "_remote_proxy", None)
+        if remote_proxy is None:
+            return
+
+        successful_dispatches = self._successful_mesh_dispatches(run)
+        steps_by_node: dict[str, list[Any]] = {}
+        for step in agent_loop_steps:
+            node_id = step.assigned_node or ""
+            if node_id:
+                steps_by_node.setdefault(node_id, []).append(step)
+
+        for step in agent_loop_steps:
+            node_id = step.assigned_node or ""
+            if not node_id:
+                continue
+
+            if self._step_has_successful_dispatch(
+                step=step,
+                remote_proxy=remote_proxy,
+                successful_dispatches=successful_dispatches,
+                node_steps=steps_by_node.get(node_id, []),
+            ):
+                continue
+
+            # The LLM did not dispatch this step — force-execute it.
+            logger.warning(
+                "Force-dispatching undispatched agent-loop step %s to %s "
+                "(session=%s, run=%s). The LLM did not call mesh_dispatch.",
+                step.step_id,
+                node_id,
+                session_id,
+                run.run_id,
+            )
+            try:
+                # Build a callback so that when the edge node completes,
+                # the result is automatically pushed back to the EventSource
+                # (Feishu / Desktop / etc.)
+                async def _on_task_event(event, _reply=reply, _sid=session_id):
+                    if event.event_type == "completed":
+                        result_text = event.metadata.get("result") or event.content
+                        await _reply(self._formatter.format_result(
+                            session_id=_sid,
+                            result=result_text,
+                        ))
+                        logger.info(
+                            "Async task result pushed back to EventSource: "
+                            "session=%s task=%s",
+                            _sid, event.task_id,
+                        )
+                    elif event.event_type == "failed":
+                        error_text = event.metadata.get("error") or event.content
+                        await _reply(self._formatter.format_error(
+                            session_id=_sid,
+                            error=f"边缘节点执行失败: {error_text}",
+                        ))
+                    elif event.event_type == "timed_out":
+                        await _reply(self._formatter.format_error(
+                            session_id=_sid,
+                            error=f"边缘节点执行超时: {event.content}",
+                        ))
+
+                dispatch_result = await remote_proxy.dispatch_to_edge(
+                    target_node=node_id,
+                    task_description=step.description,
+                    session_id=session_id,
+                    source_type="fallback",
+                    source_id=run.run_id,
+                    on_event=_on_task_event,
+                )
+                logger.info(
+                    "Force-dispatch succeeded for step %s -> %s: %s",
+                    step.step_id,
+                    node_id,
+                    dispatch_result[:200],
+                )
+                dispatch_record = {
+                    "tool": remote_proxy.dispatch_alias_for(node_id),
+                    "task_description": step.description,
+                }
+                successful_dispatches.append(dispatch_record)
+                self._remember_successful_mesh_dispatch(run, dispatch_record)
+
+                # Append the dispatch result to the run result so the user
+                # sees that the task was actually sent.
+                run.result = (run.result or "").rstrip() + "\n\n" + dispatch_result
+
+                # Notify the user that the dispatch happened as fallback.
+                await reply(self._formatter.format_status(
+                    session_id=session_id,
+                    status="已自动派发任务到边缘节点",
+                    progress=dispatch_result,
+                ))
+            except Exception as exc:
+                logger.error(
+                    "Force-dispatch failed for step %s -> %s: %s",
+                    step.step_id,
+                    node_id,
+                    exc,
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _normalize_dispatch_task_text(text: str) -> str:
+        return re.sub(r"\s+", " ", text or "").strip()
+
+    @staticmethod
+    def _successful_mesh_dispatches(run: Any) -> list[dict[str, str]]:
+        metadata = getattr(run, "metadata", {})
+        raw = metadata.get("successful_mesh_dispatches", []) if isinstance(metadata, dict) else []
+        dispatches: list[dict[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool") or "").strip()
+            if not tool_name:
+                continue
+            dispatches.append(
+                {
+                    "tool": tool_name,
+                    "task_description": str(item.get("task_description") or ""),
+                }
+            )
+        return dispatches
+
+    def _step_has_successful_dispatch(
+        self,
+        *,
+        step: Any,
+        remote_proxy: Any,
+        successful_dispatches: list[dict[str, str]],
+        node_steps: list[Any],
+    ) -> bool:
+        node_id = step.assigned_node or ""
+        if not node_id:
+            return False
+
+        dispatch_alias = remote_proxy.dispatch_alias_for(node_id)
+        dispatches_for_node = [
+            item for item in successful_dispatches
+            if item.get("tool") == dispatch_alias
+        ]
+        if not dispatches_for_node:
+            return False
+
+        normalized_step = self._normalize_dispatch_task_text(step.description)
+        if any(
+            self._normalize_dispatch_task_text(item.get("task_description", "")) == normalized_step
+            for item in dispatches_for_node
+        ):
+            return True
+
+        return len(node_steps) == 1
+
+    @staticmethod
+    def _remember_successful_mesh_dispatch(run: Any, dispatch_record: dict[str, str]) -> None:
+        metadata = getattr(run, "metadata", None)
+        if not isinstance(metadata, dict):
+            return
+
+        raw = metadata.setdefault("successful_mesh_dispatches", [])
+        if not isinstance(raw, list):
+            raw = []
+            metadata["successful_mesh_dispatches"] = raw
+        if dispatch_record not in raw:
+            raw.append(dispatch_record)
+
     def _augment_task_with_recent_artifacts(
         self,
         session_id: str,
@@ -846,21 +974,9 @@ class Orchestrator:
         recent_artifacts = self._sessions.get_recent_artifacts(session_id, limit=3)
         if not recent_artifacts:
             return task
-        compact = re.sub(r"\s+", "", task.strip().lower())
-        markers = (
-            "上传",
-            "附件",
-            "这个pdf",
-            "这个文件",
-            "这份pdf",
-            "这份文件",
-            "刚上传",
-            "刚发的",
-            "管理在vault",
-        )
-        if not any(marker in compact for marker in markers):
-            return task
-        lines = [task.strip(), "", "[最近附件引用]"]
+        # 始终注入最近 artifacts 引用，不再依赖关键词门控。
+        # 这样无论用户怎么措辞，LLM 都能看到最近处理过的文件。
+        lines = [task.strip(), "", "[最近附件/产出物引用]"]
         for item in recent_artifacts:
             parts = [
                 f"- {item.get('artifact_type', 'file')} `{item.get('filename') or '未命名附件'}`",
@@ -875,7 +991,7 @@ class Orchestrator:
             if transcript_relative_path:
                 parts.append(f"转录 `{transcript_relative_path}`")
             lines.append("，".join(parts))
-        lines.append("若用户提到“刚上传的文件/这个PDF/附件”，默认指向以上最近附件，不要再次索要文件路径。")
+        lines.append("以上是本会话最近处理的附件和产出物。若用户提到相关文件,优先指代这些路径,不要再次索要文件路径。")
         return "\n".join(lines).strip()
 
     def _record_inbound_message(

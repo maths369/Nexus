@@ -48,7 +48,7 @@ class FeishuAdapter:
         self._subscription_mode = str(cfg.get("subscription_mode", "webhook") or "webhook")
         self._require_mention_in_group = bool(cfg.get("require_mention_in_group", False))
         self._bot_open_id = str(cfg.get("bot_open_id", "") or "")
-        self._client = client or httpx.AsyncClient(timeout=20.0)
+        self._client = client or httpx.AsyncClient(timeout=20.0, trust_env=True)
         self._access_token: str | None = None
         self._access_token_expires_at: float = 0.0
 

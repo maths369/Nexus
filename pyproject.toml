@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "nexus"
 version = "0.1.0"
 description = "星策 — Personal AI Agent Runtime"
-readme = "README.md"
+readme = "ARCHITECTURE_BLUEPRINT.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 

@@ -81,9 +81,13 @@ class ProviderGateway:
     def list_providers(self) -> list[ProviderConfig]:
         return [self._primary, *self._fallbacks]
 
+    @property
+    def primary_provider(self) -> ProviderConfig:
+        return self._primary
+
     def get_provider(self, name: str | None = None, model: str | None = None) -> ProviderConfig:
         for candidate in self.list_providers():
-            if name and candidate.name == name:
+            if name and self._matches_provider_query(candidate, name):
                 return candidate
             if model and candidate.model == model:
                 return candidate
@@ -92,6 +96,23 @@ class ProviderGateway:
                 f"Provider not configured: name={name or '-'} model={model or '-'}"
             )
         return self._primary
+
+    def switch_primary_provider(self, name: str) -> ProviderConfig:
+        providers = self.list_providers()
+        selected_index = next(
+            (idx for idx, candidate in enumerate(providers) if self._matches_provider_query(candidate, name)),
+            None,
+        )
+        if selected_index is None:
+            raise ProviderGatewayError(f"Provider not configured: name={name}")
+        if selected_index == 0:
+            return self._primary
+
+        selected = providers[selected_index]
+        remaining = [candidate for idx, candidate in enumerate(providers) if idx != selected_index]
+        self._primary = selected
+        self._fallbacks = remaining
+        return selected
 
     def get_health_snapshot(self, provider_name: str | None = None) -> dict[str, Any]:
         if provider_name:
@@ -156,6 +177,7 @@ class ProviderGateway:
         temperature: float = 0.7,
         max_tokens: int = 4096,
         stream_callback=None,
+        extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Call an OpenAI-compatible chat completion endpoint and normalize output.
@@ -180,6 +202,7 @@ class ProviderGateway:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     stream_callback=stream_callback,
+                    extra_body=extra_body,
                 )
             except ProviderGatewayError as exc:
                 last_error = exc
@@ -205,6 +228,7 @@ class ProviderGateway:
         temperature: float,
         max_tokens: int,
         stream_callback,
+        extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         client = self._get_client(provider)
         kwargs: dict[str, Any] = {
@@ -214,6 +238,9 @@ class ProviderGateway:
             "max_tokens": max_tokens,
             "timeout": provider.timeout_seconds,
         }
+        # 调用方传入的 extra_body 优先
+        if extra_body:
+            kwargs["extra_body"] = {**extra_body}
 
         if tools:
             kwargs["tools"] = tools
@@ -260,7 +287,7 @@ class ProviderGateway:
                 if attempt > provider.max_retries or not self._should_retry(exc):
                     self._record_health(provider, status="down", latency_ms=None, error=str(exc))
                     raise ProviderGatewayError(
-                        f"Provider request failed ({provider.name}): {exc}"
+                        self._terminal_error_message(provider, exc)
                     ) from exc
 
                 delay = self._backoff_seconds(provider, attempt)
@@ -470,6 +497,8 @@ class ProviderGateway:
 
     @staticmethod
     def _should_retry(exc: Exception) -> bool:
+        if ProviderGateway._is_hard_quota_error(exc):
+            return False
         retry_type_names = [
             "APITimeoutError",
             "APIConnectionError",
@@ -510,6 +539,36 @@ class ProviderGateway:
         )
 
     @staticmethod
+    def _is_hard_quota_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        if "quota exceeded" not in message and "insufficient_quota" not in message:
+            return False
+        return any(
+            token in message
+            for token in [
+                "freetier",
+                "free tier",
+                "limit: 0",
+                "per day",
+                "per minute",
+                "resourceexhausted",
+                "resource_exhausted",
+                "billing details",
+                "current quota",
+            ]
+        )
+
+    @staticmethod
+    def _terminal_error_message(provider: ProviderConfig, exc: Exception) -> str:
+        message = str(exc)
+        if ProviderGateway._is_hard_quota_error(exc):
+            return (
+                f"Provider quota exhausted ({provider.name}): "
+                "当前额度已用尽，请切换后端或稍后重试。"
+            )
+        return f"Provider request failed ({provider.name}): {message}"
+
+    @staticmethod
     def _required_temperature_from_error(exc: Exception) -> float | None:
         message = str(exc).lower()
         if "invalid temperature" not in message or "only" not in message:
@@ -546,3 +605,16 @@ class ProviderGateway:
         base = provider.retry_backoff_seconds * (2 ** max(0, attempt - 1))
         jitter = random.uniform(0.0, 0.3)
         return min(provider.retry_max_backoff_seconds, base + jitter)
+
+    @staticmethod
+    def _matches_provider_query(provider: ProviderConfig, query: str) -> bool:
+        normalized = str(query or "").strip().lower()
+        if not normalized:
+            return False
+        candidates = {
+            str(provider.name or "").strip().lower(),
+            str(provider.provider or "").strip().lower(),
+            str(provider.model or "").strip().lower(),
+            str(provider.provider_id or "").strip().lower(),
+        }
+        return normalized in {value for value in candidates if value}

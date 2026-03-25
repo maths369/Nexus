@@ -28,7 +28,9 @@ class MessageIntent(str, enum.Enum):
 
 class ChannelType(str, enum.Enum):
     FEISHU = "feishu"
+    WEIXIN = "weixin"
     WEB = "web"
+    DESKTOP = "desktop"
 
 
 # ---------------------------------------------------------------------------

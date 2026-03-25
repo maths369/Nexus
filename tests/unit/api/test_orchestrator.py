@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import yaml
 
 from nexus.agent.types import Run, RunStatus
 from nexus.channel.context_window import ContextWindowManager
@@ -17,9 +18,12 @@ from nexus.mesh import (
     ProviderSpec,
     RemoteToolProxy,
     ResourceSpec,
+    TaskPlan,
     TaskRouter,
+    TaskStep,
 )
 from nexus.orchestrator import Orchestrator
+from nexus.provider.gateway import ProviderConfig, ProviderGateway
 
 
 class _FakeRouter:
@@ -33,6 +37,7 @@ class _FakeRouter:
 class _FakeRunManager:
     def __init__(self):
         self.last_kwargs = None
+        self.fallback_models = None
 
     async def execute(self, **kwargs):
         self.last_kwargs = kwargs
@@ -44,6 +49,9 @@ class _FakeRunManager:
             result='done',
             model='qwen-max',
         )
+
+    def set_fallback_models(self, models):
+        self.fallback_models = list(models)
 
 
 class _FailingRunManager(_FakeRunManager):
@@ -57,6 +65,42 @@ class _FailingRunManager(_FakeRunManager):
             error='boom',
             model='qwen-max',
         )
+
+
+class _FakeRemoteProxy:
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def dispatch_alias_for(self, node_id: str) -> str:
+        return RemoteToolProxy.dispatch_alias_for(node_id)
+
+    async def dispatch_to_edge(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        task_number = len(self.calls)
+        return (
+            f"任务已异步派发到 {kwargs['target_node']}，"
+            f"task_id: task-fallback-{task_number:02d}。"
+        )
+
+
+class _FakeTaskRouterForFallback:
+    def __init__(self, plan: TaskPlan, remote_proxy: _FakeRemoteProxy):
+        self._plan = plan
+        self._remote_proxy = remote_proxy
+
+    def get_session_plan(self, session_id: str):
+        if session_id == self._plan.session_id:
+            return self._plan
+        return None
+
+    @staticmethod
+    def get_agent_loop_steps(plan: TaskPlan) -> list[TaskStep]:
+        return [
+            step
+            for step in plan.steps
+            if step.metadata.get("execution_mode") == "agent_loop"
+            and step.assigned_node
+        ]
 
 
 def _hub_card() -> NodeCard:
@@ -171,6 +215,244 @@ def test_orchestrator_unknown_includes_router_candidates(tmp_path):
     assert '今日会议纪要' in replies[0].content
 
 
+def test_orchestrator_switches_provider_and_persists_config(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    run_manager = _FakeRunManager()
+    provider = ProviderGateway(
+        primary=ProviderConfig(name="qwen", model="qwen-plus", api_key="qwen-key"),
+        fallbacks=[
+            ProviderConfig(name="kimi", model="kimi-k2.5", api_key="kimi-key"),
+            ProviderConfig(name="gemini", model="gemini-2.5-flash", api_key="gemini-key"),
+        ],
+    )
+    config_path = tmp_path / "config" / "app.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "provider:",
+                "  primary:",
+                "    name: qwen",
+                "    model: qwen-plus",
+                "    provider_type: qwen",
+                "  fallbacks:",
+                "  - name: kimi",
+                "    model: kimi-k2.5",
+                "    provider_type: moonshot",
+                "  - name: gemini",
+                "    model: gemini-2.5-flash",
+                "    provider_type: openai-compatible",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(
+            RoutingDecision(
+                intent=MessageIntent.COMMAND,
+                reason="command:provider",
+                metadata={"action": "provider", "provider_command": "switch", "target": "gemini"},
+            )
+        ),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=run_manager,
+        formatter=MessageFormatter(),
+        provider_gateway=provider,
+        config_path=config_path,
+    )
+    replies = []
+
+    async def reply(message):
+        replies.append(message)
+
+    asyncio.run(orchestrator.handle_message(_message("/provider gemini"), reply))
+
+    assert provider.primary_provider.name == "gemini"
+    assert run_manager.fallback_models == ["gemini-2.5-flash", "qwen-plus", "kimi-k2.5"]
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["provider"]["primary"]["name"] == "gemini"
+    assert replies
+    assert "已切换当前后端到 `gemini`" in replies[0].content
+
+
+def test_orchestrator_provider_status_lists_current_and_available(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(
+            RoutingDecision(
+                intent=MessageIntent.COMMAND,
+                reason="command:provider",
+                metadata={"action": "provider", "provider_command": "status"},
+            )
+        ),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_FakeRunManager(),
+        formatter=MessageFormatter(),
+        provider_gateway=ProviderGateway(
+            primary=ProviderConfig(name="qwen", model="qwen-plus", api_key="qwen-key"),
+            fallbacks=[ProviderConfig(name="gemini", model="gemini-2.5-flash", api_key="gemini-key")],
+        ),
+    )
+    replies = []
+
+    async def reply(message):
+        replies.append(message)
+
+    asyncio.run(orchestrator.handle_message(_message("/provider"), reply))
+
+    assert replies
+    assert "当前后端：" in replies[0].content
+    assert "`qwen`" in replies[0].content
+    assert "`gemini`" in replies[0].content
+
+
+def test_orchestrator_switches_search_provider_and_persists_config(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    config_path = tmp_path / "config" / "app.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "search:",
+                "  provider:",
+                "    primary: google_grounded",
+                "    fallback: bing",
+                "    fallbacks:",
+                "    - bing",
+                "    - duckduckgo",
+                "  google_grounded:",
+                "    enabled: true",
+                "    api_key_env: GEMINI_API_KEY",
+                "    api_key: gemini-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    search_config = {
+        "provider": {
+            "primary": "google_grounded",
+            "fallback": "bing",
+            "fallbacks": ["bing", "duckduckgo"],
+        },
+        "google_grounded": {
+            "enabled": True,
+            "api_key": "gemini-key",
+        },
+    }
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(
+            RoutingDecision(
+                intent=MessageIntent.COMMAND,
+                reason="command:search",
+                metadata={"action": "search_provider", "search_command": "switch", "target": "bing"},
+            )
+        ),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_FakeRunManager(),
+        formatter=MessageFormatter(),
+        search_config=search_config,
+        config_path=config_path,
+    )
+    replies = []
+
+    async def reply(message):
+        replies.append(message)
+
+    asyncio.run(orchestrator.handle_message(_message("/search bing"), reply))
+
+    assert search_config["provider"]["primary"] == "bing"
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert persisted["search"]["provider"]["primary"] == "bing"
+    assert replies
+    assert "已切换当前搜索后端到 `bing`" in replies[0].content
+
+
+def test_orchestrator_search_status_lists_current_and_fallbacks(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(
+            RoutingDecision(
+                intent=MessageIntent.COMMAND,
+                reason="command:search",
+                metadata={"action": "search_provider", "search_command": "status"},
+            )
+        ),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_FakeRunManager(),
+        formatter=MessageFormatter(),
+        search_config={
+            "provider": {
+                "primary": "google_grounded",
+                "fallback": "bing",
+                "fallbacks": ["bing", "duckduckgo"],
+            },
+            "google_grounded": {
+                "enabled": True,
+                "api_key": "gemini-key",
+            },
+        },
+    )
+    replies = []
+
+    async def reply(message):
+        replies.append(message)
+
+    asyncio.run(orchestrator.handle_message(_message("/search"), reply))
+
+    assert replies
+    assert "当前搜索后端：" in replies[0].content
+    assert "`google_grounded`" in replies[0].content
+    assert "`bing -> duckduckgo`" in replies[0].content
+
+
+def test_orchestrator_failed_run_mentions_attempted_provider_chain(tmp_path):
+    class _RetryingFailRunManager(_FakeRunManager):
+        async def execute(self, **kwargs):
+            return Run(
+                run_id="run-3",
+                session_id=kwargs["session_id"],
+                status=RunStatus.FAILED,
+                task=kwargs["task"],
+                error="Provider quota exhausted (gemini-3-flash-preview): 当前额度已用尽，请切换后端或稍后重试。",
+                model="gemini-3-flash-preview",
+                metadata={
+                    "attempt_models": [
+                        "qwen-plus",
+                        "gemini-2.5-flash",
+                        "gemini-3-flash-preview",
+                    ]
+                },
+            )
+
+    store = SessionStore(tmp_path / "sessions.db")
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(
+            RoutingDecision(
+                intent=MessageIntent.NEW_TASK,
+                reason="default new task",
+            )
+        ),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_RetryingFailRunManager(),
+        formatter=MessageFormatter(),
+    )
+    replies = []
+
+    async def reply(message):
+        replies.append(message)
+
+    asyncio.run(orchestrator.handle_message(_message("帮我查 ISO14971"), reply))
+
+    assert len(replies) >= 2
+    assert "本次请求已依次尝试 `qwen-plus` -> `gemini-2.5-flash` -> `gemini-3-flash-preview`。" in replies[-1].content
+    assert "当前后端 `gemini-3-flash-preview` 已达到额度限制。" in replies[-1].content
+
+
 class _FakeSkillManager:
     def __init__(self):
         self.installed_from_catalog: list[str] = []
@@ -211,107 +493,17 @@ class _FakeCapabilityManager:
         return type("R", (), {"success": True, "reason": f"enabled by {actor}"})()
 
 
-def test_orchestrator_self_evolution_query_bypasses_session_context(tmp_path):
-    store = SessionStore(tmp_path / 'sessions.db')
-    skill_manager = _FakeSkillManager()
-    capability_manager = _FakeCapabilityManager()
-    active = store.create_session('user-1', 'feishu', summary='旧任务')
-    store.add_event(
-        session_id=active.session_id,
-        role='assistant',
-        content='我没有自我进化能力',
-    )
-    orchestrator = Orchestrator(
-        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.FOLLOW_UP, session_id=active.session_id)),
-        session_store=store,
-        context_window=ContextWindowManager(store),
-        run_manager=_FakeRunManager(),
-        formatter=MessageFormatter(),
-        available_tools=[
-            type('T', (), {'name': 'skill_list_installable'})(),
-            type('T', (), {'name': 'skill_install'})(),
-            type('T', (), {'name': 'skill_create'})(),
-            type('T', (), {'name': 'skill_update'})(),
-            type('T', (), {'name': 'skill_list_installed'})(),
-            type('T', (), {'name': 'load_skill'})(),
-            type('T', (), {'name': 'capability_list_available'})(),
-            type('T', (), {'name': 'capability_status'})(),
-            type('T', (), {'name': 'capability_enable'})(),
-            type('T', (), {'name': 'evolution_audit'})(),
-        ],
-        skill_manager=skill_manager,
-        capability_manager=capability_manager,
-    )
-    replies = []
+## test_orchestrator_self_evolution_query_bypasses_session_context — 已移除
+## 原因：_handle_runtime_fact_query 已删除，"自我进化"等关键词不再做硬编码拦截，
+## 统一交给 LLM 理解用户意图。
 
-    async def reply(message):
-        replies.append(message)
-
-    asyncio.run(orchestrator.handle_message(_message('你有自我进化能力吗？'), reply))
-
-    assert replies
-    assert '受控的自我进化能力' in replies[0].content
-    assert '我没有自我进化能力' not in replies[0].content
-    assert 'skill_list_installable' in replies[0].content
-    assert 'skill_install' in replies[0].content
-    assert 'office-conversion' in replies[0].content
+## test_orchestrator_mesh_inventory_query_bypasses_session_context — 已移除
+## 原因：同上，Mesh 盘点查询也不再做关键词拦截。
 
 
-def test_orchestrator_mesh_inventory_query_bypasses_session_context(tmp_path):
-    store = SessionStore(tmp_path / 'sessions.db')
-    active = store.create_session('user-1', 'feishu', summary='旧节点对话')
-    store.add_event(
-        session_id=active.session_id,
-        role='assistant',
-        content='当前只有 Hub 节点可用，没有 Mac 节点。',
-    )
-    registry = MeshRegistry()
-    asyncio.run(registry.register_node(_hub_card()))
-    asyncio.run(registry.register_node(_edge_card()))
-    orchestrator = Orchestrator(
-        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.FOLLOW_UP, session_id=active.session_id)),
-        session_store=store,
-        context_window=ContextWindowManager(store),
-        run_manager=_FakeRunManager(),
-        formatter=MessageFormatter(),
-        mesh_registry=registry,
-    )
-    replies = []
-
-    async def reply(message):
-        replies.append(message)
-
-    asyncio.run(orchestrator.handle_message(_message('那好，我想问你，现在你的控制下，有几个节点？每个节点都有什么能力？'), reply))
-
-    assert replies
-    assert 'Mesh 注册表中共有 **2** 个节点' in replies[0].content
-    assert 'MacBook Pro' in replies[0].content
-    assert 'browser_automation' in replies[0].content
-    assert '当前只有 Hub 节点可用' not in replies[0].content
-
-
-def test_orchestrator_can_install_skill_from_catalog_deterministically(tmp_path):
-    store = SessionStore(tmp_path / 'sessions.db')
-    skill_manager = _FakeSkillManager()
-    orchestrator = Orchestrator(
-        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
-        session_store=store,
-        context_window=ContextWindowManager(store),
-        run_manager=_FakeRunManager(),
-        formatter=MessageFormatter(),
-        skill_manager=skill_manager,
-    )
-    replies = []
-
-    async def reply(message):
-        replies.append(message)
-
-    asyncio.run(orchestrator.handle_message(_message('请安装 office-conversion skill'), reply))
-
-    assert skill_manager.installed_from_catalog == ['office-conversion']
-    assert replies
-    assert 'office-conversion' in replies[0].content
-    assert '已安装成功' in replies[0].content
+## test_orchestrator_can_install_skill_from_catalog_deterministically — 已移除
+## 原因：_match_installable_skill_request 已删除，技能安装不再做关键词匹配，
+## 统一交给 LLM 理解用户意图并调用工具。
 
 
 def test_orchestrator_records_recent_attachments_and_augments_follow_up(tmp_path):
@@ -369,7 +561,7 @@ def test_orchestrator_records_recent_attachments_and_augments_follow_up(tmp_path
     assert run_manager.last_kwargs is not None
     effective_task = run_manager.last_kwargs["task"]
     context_messages = run_manager.last_kwargs["context_messages"]
-    assert "最近附件引用" in effective_task
+    assert "最近附件" in effective_task
     assert "report.pdf" in effective_task
     assert "inbox/imports/feishu/导入-PDF-report.md" in effective_task
     assert context_messages[0]["role"] == "system"
@@ -457,11 +649,9 @@ def test_orchestrator_injects_remote_tools_for_mesh_run(tmp_path):
     assert run_manager.last_kwargs is not None
     extra_tools = run_manager.last_kwargs["extra_tools"]
     extra_names = {tool.name for tool in extra_tools}
-    # Browser step on edge node now uses dispatch tool (agent_loop) instead of individual mesh__ tools
+    # LLM-driven routing: dispatch tools 被注入，LLM 自行决定是否使用
     dispatch_alias = RemoteToolProxy.dispatch_alias_for("macbook-pro")
     assert dispatch_alias in extra_names
-    assert "Mesh 执行上下文" in run_manager.last_kwargs["task"]
-    assert any("跨节点执行计划" in item.content for item in replies)
 
 
 def test_orchestrator_blocks_when_required_node_is_offline(tmp_path):
@@ -494,8 +684,164 @@ def test_orchestrator_blocks_when_required_node_is_offline(tmp_path):
 
     asyncio.run(orchestrator.handle_message(_message("打开浏览器抓取网页内容"), reply))
 
-    assert run_manager.last_kwargs is None
-    assert any(item.message_type.value == "blocked" for item in replies)
-    session = store.get_most_recent_session("user-1")
-    assert session is not None
-    assert session.status.value == "paused"
+    # LLM-driven routing: 不再阻断任务。没有 edge 节点在线时，
+    # 不注入 dispatch tools，LLM 用自己的能力处理或告知用户。
+    assert run_manager.last_kwargs is not None
+    extra_tools = run_manager.last_kwargs["extra_tools"]
+    # 没有 edge 节点在线 → 没有 dispatch tools
+    assert len(extra_tools) == 0
+
+
+def _agent_loop_plan(session_id: str, steps: list[TaskStep]) -> TaskPlan:
+    return TaskPlan(
+        task_id="plan-1",
+        session_id=session_id,
+        user_task="agent-loop task",
+        steps=steps,
+    )
+
+
+def test_orchestrator_force_dispatch_ignores_hallucinated_result_text(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    session_id = "session-force-1"
+    step = TaskStep(
+        step_id="step-1",
+        description="打开语音备忘录，并开始录制",
+        assigned_node="macbook-pro",
+        metadata={"execution_mode": "agent_loop"},
+    )
+    remote_proxy = _FakeRemoteProxy()
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_FakeRunManager(),
+        formatter=MessageFormatter(),
+        task_router=_FakeTaskRouterForFallback(_agent_loop_plan(session_id, [step]), remote_proxy),
+    )
+    run = Run(
+        run_id="run-force-1",
+        session_id=session_id,
+        status=RunStatus.SUCCEEDED,
+        task=step.description,
+        result="任务已异步派发到 macbook-pro，task_id: task-fake-123。",
+        model="qwen-max",
+    )
+    replies = []
+
+    async def reply(message):
+        replies.append(message)
+
+    asyncio.run(
+        orchestrator._force_dispatch_undispatched_steps(
+            session_id=session_id,
+            run=run,
+            reply=reply,
+        )
+    )
+
+    assert len(remote_proxy.calls) == 1
+    assert remote_proxy.calls[0]["target_node"] == "macbook-pro"
+    assert remote_proxy.calls[0]["task_description"] == step.description
+    assert any("已自动派发任务到边缘节点" in item.content for item in replies)
+
+
+def test_orchestrator_force_dispatch_skips_matching_successful_dispatch_record(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    session_id = "session-force-2"
+    step = TaskStep(
+        step_id="step-1",
+        description="打开语音备忘录，并开始录制",
+        assigned_node="macbook-pro",
+        metadata={"execution_mode": "agent_loop"},
+    )
+    remote_proxy = _FakeRemoteProxy()
+    dispatch_alias = remote_proxy.dispatch_alias_for("macbook-pro")
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_FakeRunManager(),
+        formatter=MessageFormatter(),
+        task_router=_FakeTaskRouterForFallback(_agent_loop_plan(session_id, [step]), remote_proxy),
+    )
+    run = Run(
+        run_id="run-force-2",
+        session_id=session_id,
+        status=RunStatus.SUCCEEDED,
+        task=step.description,
+        result="done",
+        model="qwen-max",
+        metadata={
+            "successful_mesh_dispatches": [
+                {
+                    "tool": dispatch_alias,
+                    "task_description": step.description,
+                }
+            ]
+        },
+    )
+
+    asyncio.run(
+        orchestrator._force_dispatch_undispatched_steps(
+            session_id=session_id,
+            run=run,
+            reply=lambda _message: asyncio.sleep(0),
+        )
+    )
+
+    assert remote_proxy.calls == []
+
+
+def test_orchestrator_force_dispatch_only_dispatches_missing_step_on_same_node(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    session_id = "session-force-3"
+    step_a = TaskStep(
+        step_id="step-a",
+        description="打开语音备忘录",
+        assigned_node="macbook-pro",
+        metadata={"execution_mode": "agent_loop"},
+    )
+    step_b = TaskStep(
+        step_id="step-b",
+        description="点击录制按钮",
+        assigned_node="macbook-pro",
+        metadata={"execution_mode": "agent_loop"},
+    )
+    remote_proxy = _FakeRemoteProxy()
+    dispatch_alias = remote_proxy.dispatch_alias_for("macbook-pro")
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_FakeRunManager(),
+        formatter=MessageFormatter(),
+        task_router=_FakeTaskRouterForFallback(_agent_loop_plan(session_id, [step_a, step_b]), remote_proxy),
+    )
+    run = Run(
+        run_id="run-force-3",
+        session_id=session_id,
+        status=RunStatus.SUCCEEDED,
+        task="打开语音备忘录并开始录制",
+        result="done",
+        model="qwen-max",
+        metadata={
+            "successful_mesh_dispatches": [
+                {
+                    "tool": dispatch_alias,
+                    "task_description": step_a.description,
+                }
+            ]
+        },
+    )
+
+    asyncio.run(
+        orchestrator._force_dispatch_undispatched_steps(
+            session_id=session_id,
+            run=run,
+            reply=lambda _message: asyncio.sleep(0),
+        )
+    )
+
+    assert len(remote_proxy.calls) == 1
+    assert remote_proxy.calls[0]["task_description"] == step_b.description

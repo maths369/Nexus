@@ -49,6 +49,9 @@ EXCLUDED_TOOLS = frozenset({
 # 子 Agent 默认最大迭代次数
 SUBAGENT_MAX_ITERATIONS = 20
 
+# 子 Agent 最大嵌套深度（防止无限递归）
+MAX_SUBAGENT_DEPTH = 3
+
 DEFAULT_SUBAGENT_SYSTEM = (
     "你是一个子任务执行Agent。\n"
     "完成给定任务后，用简洁的文字总结你的发现和结果。\n"
@@ -71,12 +74,14 @@ class SubagentRunner:
         model: str = "qwen-max",
         system_prompt: str = "",
         max_iterations: int = SUBAGENT_MAX_ITERATIONS,
+        depth: int = 0,
     ):
         self._provider = provider
         self._policy = tools_policy
         self._model = model
         self._system_prompt = system_prompt or DEFAULT_SUBAGENT_SYSTEM
         self._max_iterations = max_iterations
+        self._depth = depth
         self._dispatch_count = 0
 
     @property
@@ -104,13 +109,61 @@ class SubagentRunner:
         """
         from .core import execute_tool_loop, MAX_TOOL_ITERATIONS
 
-        # 过滤工具：排除递归和不必要的工具
+        # 深度检查
+        child_depth = self._depth + 1
+        if child_depth > MAX_SUBAGENT_DEPTH:
+            msg = f"子代理嵌套深度超过限制 ({MAX_SUBAGENT_DEPTH})，拒绝执行。请简化任务拆分。"
+            logger.warning(msg)
+            return msg
+
+        # 过滤工具：排除不必要的工具
+        excluded = set(EXCLUDED_TOOLS)
+        # 在最后一层禁止再递归
+        if child_depth >= MAX_SUBAGENT_DEPTH:
+            excluded.add("dispatch_subagent")
+
         child_tools = [
             t for t in (tools or [])
-            if t.name not in EXCLUDED_TOOLS
+            if t.name not in excluded
         ]
 
-        subagent_id = f"sub-{uuid.uuid4().hex[:8]}"
+        # 如果子代理可以再派子代理，注入一个带深度跟踪的 dispatch handler
+        if child_depth < MAX_SUBAGENT_DEPTH:
+            for i, t in enumerate(child_tools):
+                if t.name == "dispatch_subagent":
+                    # 替换为带深度追踪的 handler
+                    child_runner = SubagentRunner(
+                        provider=self._provider,
+                        tools_policy=self._policy,
+                        model=self._model,
+                        system_prompt=self._system_prompt,
+                        max_iterations=self._max_iterations,
+                        depth=child_depth,
+                    )
+
+                    async def _dispatch_with_depth(
+                        prompt: str,
+                        description: str = "",
+                        _runner: SubagentRunner = child_runner,
+                        _tools: list[ToolDefinition] = child_tools,
+                    ) -> str:
+                        return await _runner.dispatch(
+                            prompt=prompt,
+                            description=description,
+                            tools=_tools,
+                        )
+
+                    child_tools[i] = ToolDefinition(
+                        name=t.name,
+                        description=t.description + f" (当前深度: {child_depth}/{MAX_SUBAGENT_DEPTH})",
+                        parameters=t.parameters,
+                        handler=_dispatch_with_depth,
+                        risk_level=t.risk_level,
+                        tags=t.tags,
+                    )
+                    break
+
+        subagent_id = f"sub-d{child_depth}-{uuid.uuid4().hex[:8]}"
         desc_label = description or prompt[:60]
         logger.info(f"[{subagent_id}] Subagent dispatched: {desc_label}")
 

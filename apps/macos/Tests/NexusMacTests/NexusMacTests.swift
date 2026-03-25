@@ -70,6 +70,47 @@ final class NexusMacTests: XCTestCase {
         XCTAssertEqual(command.arguments.first, "conda")
     }
 
+    func testMLXLaunchCommandUsesExecutableServeScriptWhenAvailable() throws {
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+
+        let servePath = tempRoot.appendingPathComponent("serve.sh")
+        FileManager.default.createFile(atPath: servePath.path, contents: Data(), attributes: [.posixPermissions: 0o755])
+
+        let settings = MLXLocalAPISettings(
+            root: tempRoot.path,
+            serveScriptPath: servePath.path,
+            host: "127.0.0.1",
+            port: 8008
+        )
+
+        let command = settings.makeLaunchCommand()
+        XCTAssertEqual(command.executable, servePath.path)
+        XCTAssertEqual(command.arguments, [])
+        XCTAssertEqual(command.currentDirectory, tempRoot.path)
+    }
+
+    func testMLXLaunchCommandFallsBackToZshForNonExecutableScript() throws {
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+
+        let servePath = tempRoot.appendingPathComponent("serve.sh")
+        FileManager.default.createFile(atPath: servePath.path, contents: Data("echo test".utf8))
+
+        let settings = MLXLocalAPISettings(
+            root: tempRoot.path,
+            serveScriptPath: servePath.path,
+            host: "127.0.0.1",
+            port: 8008
+        )
+
+        let command = settings.makeLaunchCommand()
+        XCTAssertEqual(command.executable, "/bin/zsh")
+        XCTAssertEqual(command.arguments, [servePath.path])
+    }
+
     @MainActor
     func testCollectProcessOutputHandlesLargeStdoutWithoutBlocking() {
         let output = SidecarSupervisor.collectProcessOutput(
@@ -107,9 +148,9 @@ final class NexusMacTests: XCTestCase {
         )
 
         let merged = partial.merged(with: fallback)
-        XCTAssertEqual(merged.brokerHost, "YOUR_HUB_IP")
+        XCTAssertEqual(merged.brokerHost, "100.121.67.94")
         XCTAssertEqual(merged.brokerPort, 1883)
-        XCTAssertEqual(merged.hubAPIHost, "YOUR_HUB_IP")
+        XCTAssertEqual(merged.hubAPIHost, "100.121.67.94")
         XCTAssertEqual(merged.hubAPIPort, 18100)
         XCTAssertEqual(merged.meshTransport, "tcp")
     }
@@ -221,5 +262,28 @@ final class NexusMacTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(150))
         XCTAssertEqual(supervisor.state, .stopped)
         XCTAssertEqual(lines.filter { $0 == "hello" }.count, 2)
+    }
+
+    @MainActor
+    func testMLXSupervisorCanStartTwiceWithFreshPipes() async throws {
+        let supervisor = MLXLocalAPISupervisor()
+        var lines: [String] = []
+        supervisor.onOutput = { line in
+            lines.append(line)
+        }
+        let command = SidecarLaunchCommand(
+            executable: "/bin/sh",
+            arguments: ["-c", "printf 'mlx\\n'"],
+            currentDirectory: "/tmp"
+        )
+
+        try supervisor.start(command: command, environment: ProcessInfo.processInfo.environment)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(supervisor.state, .stopped)
+
+        try supervisor.start(command: command, environment: ProcessInfo.processInfo.environment)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(supervisor.state, .stopped)
+        XCTAssertEqual(lines.filter { $0 == "mlx" }.count, 2)
     }
 }

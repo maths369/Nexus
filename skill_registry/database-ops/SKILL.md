@@ -1,7 +1,28 @@
 ---
 name: Database Operations
 description: 为新的数据库读取、模式检查、样本查询和导出任务提供受控工作流。
-tags: database, sql, postgres, mysql, sqlite
+tags:
+- database
+- sql
+- postgres
+- mysql
+- sqlite
+keywords:
+- 数据库
+- sql
+- postgres
+- mysql
+- sqlite
+- 查询
+- 导出
+packages:
+- sqlalchemy>=2.0.0
+- psycopg[binary]>=3.2.0
+- pymysql>=1.1.0
+verify_imports:
+- sqlalchemy
+- psycopg
+- pymysql
 ---
 
 # Database Operations

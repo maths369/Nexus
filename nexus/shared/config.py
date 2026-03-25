@@ -134,6 +134,39 @@ class NexusSettings:
         command = _deep_get(self.raw, "browser.worker_command", []) or []
         return [str(part) for part in command]
 
+    def search_config(self) -> dict[str, Any]:
+        raw = dict(_deep_get(self.raw, "search", {}) or {})
+        provider_raw = dict(raw.get("provider") or {})
+        google_raw = dict(raw.get("google_grounded") or raw.get("google") or {})
+        google_api_key_env = str(google_raw.get("api_key_env") or "GEMINI_API_KEY")
+        google_api_key = str(os.getenv(google_api_key_env) or google_raw.get("api_key") or "")
+        return {
+            "provider": {
+                "primary": str(provider_raw.get("primary") or "google_grounded"),
+                "fallback": str(provider_raw.get("fallback") or "bing"),
+                "fallbacks": [
+                    str(item).strip().lower()
+                    for item in (
+                        provider_raw.get("fallbacks")
+                        or [provider_raw.get("fallback") or "bing", "duckduckgo"]
+                    )
+                    if str(item).strip()
+                ],
+            },
+            "google_grounded": {
+                "enabled": _coerce_bool(google_raw.get("enabled", True), True),
+                "base_url": str(
+                    google_raw.get("base_url")
+                    or "https://generativelanguage.googleapis.com/v1beta"
+                ),
+                "api_key_env": google_api_key_env,
+                "api_key": google_api_key,
+                "model": str(google_raw.get("model") or "gemini-2.5-flash"),
+                "timeout_seconds": float(google_raw.get("timeout_seconds", 20) or 20),
+                "max_output_tokens": int(google_raw.get("max_output_tokens", 768) or 768),
+            },
+        }
+
     @property
     def tool_policy_enabled(self) -> bool:
         return bool(_deep_get(self.raw, "tool_policy.enabled", True))
@@ -254,6 +287,51 @@ class NexusSettings:
             "long_connection_log_level": str(raw.get("long_connection_log_level", "INFO") or "INFO"),
         }
 
+    def weixin_config(self) -> dict[str, Any]:
+        raw = dict(_deep_get(self.raw, "weixin", {}) or {})
+        state_dir = self.resolve_path(
+            os.getenv("WEIXIN_STATE_DIR") or raw.get("state_dir") or "./data/weixin"
+        )
+        return {
+            "enabled": _coerce_bool(raw.get("enabled"), False),
+            "base_url": str(os.getenv("WEIXIN_BASE_URL") or raw.get("base_url") or "https://ilinkai.weixin.qq.com"),
+            "bot_type": str(os.getenv("WEIXIN_BOT_TYPE") or raw.get("bot_type") or "3"),
+            "state_dir": str(state_dir),
+            "plugin_state_dir": str(
+                self.resolve_path(
+                    os.getenv("WEIXIN_PLUGIN_STATE_DIR") or raw.get("plugin_state_dir") or (state_dir / "plugin-host")
+                )
+            ),
+            "plugin_host_base_url": str(
+                os.getenv("WEIXIN_PLUGIN_HOST_BASE_URL")
+                or raw.get("plugin_host_base_url")
+                or "http://127.0.0.1:18101"
+            ),
+            "long_poll_timeout_ms": int(
+                os.getenv("WEIXIN_LONG_POLL_TIMEOUT_MS") or raw.get("long_poll_timeout_ms") or 35000
+            ),
+            "retry_delay_seconds": float(
+                os.getenv("WEIXIN_RETRY_DELAY_SECONDS") or raw.get("retry_delay_seconds") or 2.0
+            ),
+            "backoff_delay_seconds": float(
+                os.getenv("WEIXIN_BACKOFF_DELAY_SECONDS") or raw.get("backoff_delay_seconds") or 30.0
+            ),
+            "max_consecutive_failures": int(
+                os.getenv("WEIXIN_MAX_CONSECUTIVE_FAILURES") or raw.get("max_consecutive_failures") or 3
+            ),
+            "session_expired_pause_seconds": float(
+                os.getenv("WEIXIN_SESSION_EXPIRED_PAUSE_SECONDS")
+                or raw.get("session_expired_pause_seconds")
+                or 600.0
+            ),
+            "login_timeout_ms": int(
+                os.getenv("WEIXIN_LOGIN_TIMEOUT_MS") or raw.get("login_timeout_ms") or 480000
+            ),
+            "default_account_id": str(
+                os.getenv("WEIXIN_DEFAULT_ACCOUNT_ID") or raw.get("default_account_id") or "default"
+            ),
+        }
+
     def mesh_config(self) -> dict[str, Any]:
         raw = dict(_deep_get(self.raw, "mesh", {}) or {})
         mqtt = dict(raw.get("mqtt", {}) or {})
@@ -327,3 +405,81 @@ def update_nexus_config(config_path: Path, updates: dict[str, Any]) -> dict[str,
         _deep_set(raw, key, value)
     save_nexus_config(config_target, raw)
     return raw
+
+
+def _provider_identity_candidates(entry: dict[str, Any]) -> set[str]:
+    values = {
+        str(entry.get("name") or "").strip().lower(),
+        str(entry.get("provider_type") or "").strip().lower(),
+        str(entry.get("provider") or "").strip().lower(),
+        str(entry.get("model") or "").strip().lower(),
+    }
+    return {value for value in values if value}
+
+
+def switch_primary_provider(config_path: Path, provider_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    config_target = Path(config_path)
+    raw: dict[str, Any] = {}
+    if config_target.exists():
+        raw = yaml.safe_load(config_target.read_text(encoding="utf-8")) or {}
+
+    provider_section = dict(raw.get("provider") or {})
+    primary_raw = dict(provider_section.get("primary") or {})
+    fallback_raws = [dict(item or {}) for item in (provider_section.get("fallbacks") or [])]
+    query = str(provider_name or "").strip().lower()
+    if not query:
+        raise ValueError("provider_name is required")
+
+    if query in _provider_identity_candidates(primary_raw):
+        return raw, primary_raw
+
+    selected_index = next(
+        (
+            idx
+            for idx, item in enumerate(fallback_raws)
+            if query in _provider_identity_candidates(item)
+        ),
+        None,
+    )
+    if selected_index is None:
+        raise ValueError(f"Provider not configured: {provider_name}")
+
+    selected = fallback_raws.pop(selected_index)
+    new_fallbacks: list[dict[str, Any]] = []
+    if primary_raw:
+        new_fallbacks.append(primary_raw)
+    new_fallbacks.extend(fallback_raws)
+
+    provider_section["primary"] = selected
+    provider_section["fallbacks"] = new_fallbacks
+    raw["provider"] = provider_section
+    save_nexus_config(config_target, raw)
+    return raw, selected
+
+
+def switch_search_provider(config_path: Path, provider_name: str) -> tuple[dict[str, Any], str]:
+    config_target = Path(config_path)
+    raw: dict[str, Any] = {}
+    if config_target.exists():
+        raw = yaml.safe_load(config_target.read_text(encoding="utf-8")) or {}
+
+    query = str(provider_name or "").strip().lower()
+    aliases = {
+        "google": "google_grounded",
+        "google_grounded": "google_grounded",
+        "grounded": "google_grounded",
+        "bing": "bing",
+        "duckduckgo": "duckduckgo",
+        "ddg": "duckduckgo",
+    }
+    selected = aliases.get(query)
+    if not selected:
+        raise ValueError(f"Search provider not supported: {provider_name}")
+
+    search_section = dict(raw.get("search") or {})
+    provider_section = dict(search_section.get("provider") or {})
+    provider_section["primary"] = selected
+    search_section["provider"] = provider_section
+    raw["search"] = search_section
+    save_nexus_config(config_target, raw)
+    return raw, selected

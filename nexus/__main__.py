@@ -288,6 +288,8 @@ def _build_orchestrator():
         context_window=runtime.context_window,
         run_manager=runtime.run_manager,
         formatter=MessageFormatter(),
+        provider_gateway=runtime.provider,
+        config_path=runtime.settings.config_path,
         available_tools=runtime.available_tools,
         skill_manager=runtime.skill_manager,
         capability_manager=runtime.capability_manager,

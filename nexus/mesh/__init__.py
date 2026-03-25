@@ -27,6 +27,8 @@ from .task_protocol import (
     task_result_topic,
     task_status_topic,
 )
+from .task_manager import TaskManager
+from .task_store import Task, TaskEvent, TaskStatus, TaskStore
 from .transport import InMemoryTransport, MQTTTransport, MeshTransport, MeshMessage, MessageType
 
 __all__ = [
@@ -57,4 +59,9 @@ __all__ = [
     "task_assign_topic",
     "task_result_topic",
     "task_status_topic",
+    "Task",
+    "TaskEvent",
+    "TaskManager",
+    "TaskStatus",
+    "TaskStore",
 ]

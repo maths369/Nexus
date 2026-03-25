@@ -27,9 +27,11 @@ from .types import (
     RunStatus,
 )
 from .core import execute_tool_loop
+from .tool_profiles import ToolProfile
 
 if TYPE_CHECKING:
     from .attempt import AttemptBuilder
+    from .approval import ApprovalEngine
     from .background import BackgroundTaskManager
     from .compressor import ContextCompressor
     from .run_store import RunStore
@@ -66,6 +68,7 @@ class RunManager:
         capability_promotion_advisor: CapabilityPromotionAdvisor | None = None,
         capability_manager: CapabilityManager | None = None,
         skill_manager: SkillManager | None = None,
+        approval_engine: ApprovalEngine | None = None,
     ):
         self._store = run_store
         self._attempt = attempt_builder
@@ -78,6 +81,7 @@ class RunManager:
         self._capability_promotion_advisor = capability_promotion_advisor
         self._capability_manager = capability_manager
         self._skill_manager = skill_manager
+        self._approval_engine = approval_engine
 
     async def execute(
         self,
@@ -88,6 +92,7 @@ class RunManager:
         stream_callback=None,
         extra_tools=None,
         disabled_tool_names=None,
+        tool_profile: ToolProfile | None = None,
     ) -> Run:
         """
         执行一个新的 Run。
@@ -114,6 +119,9 @@ class RunManager:
             run.attempt_count += 1
             current_model = self._select_model(run)
             run.model = current_model
+            attempted_models = run.metadata.setdefault("attempt_models", [])
+            if current_model and current_model not in attempted_models:
+                attempted_models.append(current_model)
 
             logger.info(
                 f"[{run.run_id}] Attempt {run.attempt_count}/{run.max_attempts} "
@@ -137,6 +145,7 @@ class RunManager:
                     stream_callback=stream_callback,
                     extra_tools=extra_tools,
                     disabled_tool_names=set(disabled_tool_names or []),
+                    tool_profile=tool_profile,
                 )
 
                 # 执行工具调用循环
@@ -148,7 +157,12 @@ class RunManager:
                     compressor=self._compressor,
                     todo_manager=self._todo_manager,
                     background_manager=self._background_manager,
+                    approval_engine=self._approval_engine,
+                    session_id=session_id,
                 )
+
+                self._record_successful_mesh_dispatches(run, events)
+                self._record_vault_write_artifacts(run, events)
 
                 # 保存事件
                 for event in events:
@@ -203,9 +217,6 @@ class RunManager:
         return run
 
     async def _maybe_prepare_extensions_for_task(self, run: Run) -> list[RunEvent]:
-        if self._is_meta_extension_query(run.task):
-            return []
-
         events: list[RunEvent] = []
 
         if self._capability_manager is not None and run.metadata.get("auto_capability_preflight_done") is not True:
@@ -466,50 +477,6 @@ class RunManager:
         self._mark_preloaded_skill(run, skill_id)
 
     @staticmethod
-    def _is_meta_extension_query(task: str) -> bool:
-        lowered = task.lower()
-        meta_markers = [
-            "哪些技能",
-            "哪些工具",
-            "installable",
-            "skill_list",
-            "技能包",
-            "扩展包",
-            "如何扩展",
-            "怎么扩展",
-            "什么能力",
-            "自我进化",
-        ]
-        action_markers = [
-            "帮我",
-            "请",
-            "转换",
-            "读取",
-            "解析",
-            "处理",
-            "生成",
-            "导出",
-            "导入",
-            "抓取",
-            "同步",
-            "连接",
-            "调用",
-            "删除",
-            "移动",
-            "写入",
-            "read",
-            "convert",
-            "process",
-            "parse",
-            "export",
-            "import",
-            "sync",
-        ]
-        return any(marker in lowered for marker in meta_markers) and not any(
-            marker in lowered for marker in action_markers
-        )
-
-    @staticmethod
     def _response_suggests_missing_extension(text: str) -> bool:
         lowered = text.lower()
         patterns = [
@@ -647,6 +614,131 @@ class RunManager:
                     tokens.append(item)
         return tokens
 
+    @staticmethod
+    def _extract_successful_mesh_dispatches(events: list[RunEvent]) -> list[dict[str, str]]:
+        tool_calls: dict[str, dict[str, str]] = {}
+        dispatches: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        for event in events:
+            if event.event_type == "tool_call":
+                call_id = str(event.data.get("call_id") or "").strip()
+                tool_name = str(event.data.get("tool") or "").strip()
+                if not call_id or not tool_name.startswith("mesh_dispatch__"):
+                    continue
+                arguments = event.data.get("arguments")
+                task_description = ""
+                if isinstance(arguments, dict):
+                    task_description = str(arguments.get("task_description") or "")
+                tool_calls[call_id] = {
+                    "tool": tool_name,
+                    "task_description": task_description,
+                }
+                continue
+
+            if event.event_type != "tool_result":
+                continue
+
+            call_id = str(event.data.get("call_id") or "").strip()
+            if not call_id or not bool(event.data.get("success")):
+                continue
+
+            record = tool_calls.get(call_id)
+            if record is None:
+                continue
+
+            key = (record["tool"], record["task_description"])
+            if key in seen:
+                continue
+            seen.add(key)
+            dispatches.append(dict(record))
+
+        return dispatches
+
+    def _record_successful_mesh_dispatches(self, run: Run, events: list[RunEvent]) -> None:
+        dispatches = self._extract_successful_mesh_dispatches(events)
+        if not dispatches:
+            return
+
+        existing = run.metadata.setdefault("successful_mesh_dispatches", [])
+        if not isinstance(existing, list):
+            existing = []
+            run.metadata["successful_mesh_dispatches"] = existing
+
+        seen = {
+            (
+                str(item.get("tool") or ""),
+                str(item.get("task_description") or ""),
+            )
+            for item in existing
+            if isinstance(item, dict)
+        }
+        for record in dispatches:
+            key = (record["tool"], record["task_description"])
+            if key in seen:
+                continue
+            seen.add(key)
+            existing.append(record)
+
+    @staticmethod
+    def _extract_vault_write_artifacts(events: list[RunEvent]) -> list[dict[str, str]]:
+        """从 run events 中提取成功的 write_vault / document_append_block 调用，
+        以便 orchestrator 将产出物注册到 session artifacts。"""
+        # 收集 write 类工具的 call_id → 参数
+        _WRITE_TOOLS = {"write_vault", "document_append_block", "create_page"}
+        tool_calls: dict[str, dict[str, str]] = {}
+        artifacts: list[dict[str, str]] = []
+        seen_paths: set[str] = set()
+
+        for event in events:
+            if event.event_type == "tool_call":
+                call_id = str(event.data.get("call_id") or "").strip()
+                tool_name = str(event.data.get("tool") or "").strip()
+                if not call_id or tool_name not in _WRITE_TOOLS:
+                    continue
+                arguments = event.data.get("arguments")
+                rel_path = ""
+                title = ""
+                if isinstance(arguments, dict):
+                    rel_path = str(arguments.get("relative_path") or "").strip()
+                    title = str(arguments.get("title") or "").strip()
+                tool_calls[call_id] = {
+                    "tool": tool_name,
+                    "relative_path": rel_path,
+                    "title": title,
+                }
+                continue
+
+            if event.event_type != "tool_result":
+                continue
+            call_id = str(event.data.get("call_id") or "").strip()
+            if not call_id or not bool(event.data.get("success")):
+                continue
+            record = tool_calls.get(call_id)
+            if record is None or not record["relative_path"]:
+                continue
+            if record["relative_path"] in seen_paths:
+                continue
+            seen_paths.add(record["relative_path"])
+            artifacts.append(record)
+
+        return artifacts
+
+    def _record_vault_write_artifacts(self, run: Run, events: list[RunEvent]) -> None:
+        artifacts = self._extract_vault_write_artifacts(events)
+        if not artifacts:
+            return
+        existing = run.metadata.setdefault("vault_write_artifacts", [])
+        if not isinstance(existing, list):
+            existing = []
+            run.metadata["vault_write_artifacts"] = existing
+        seen = {str(item.get("relative_path") or "") for item in existing if isinstance(item, dict)}
+        for record in artifacts:
+            if record["relative_path"] in seen:
+                continue
+            seen.add(record["relative_path"])
+            existing.append(record)
+
     # ------------------------------------------------------------------
     # 状态转换
     # ------------------------------------------------------------------
@@ -673,6 +765,9 @@ class RunManager:
         if self._fallback_models:
             return self._fallback_models[0]
         return "qwen-max"
+
+    def set_fallback_models(self, fallback_models: list[str]) -> None:
+        self._fallback_models = [str(model) for model in fallback_models if str(model).strip()]
 
     def _select_model(self, run: Run) -> str:
         """根据重试次数选择模型（故障切换）"""

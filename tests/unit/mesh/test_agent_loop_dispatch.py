@@ -109,21 +109,16 @@ async def _setup_router(
 
 class TestTaskRouterAgentLoop:
     @pytest.mark.asyncio
-    async def test_browser_step_gets_agent_loop(self) -> None:
-        """Steps with browser_automation on edge nodes should get execution_mode=agent_loop."""
+    async def test_plan_task_creates_single_local_step(self) -> None:
+        """plan_task (LLM-driven) creates a single local step — no heuristic routing."""
         router, _, _ = await _setup_router()
         plan = await router.plan_task(
             session_id="s1",
             task="请在MacBook上打开浏览器抓取网页内容",
             context=[],
         )
-        browser_steps = [
-            s for s in plan.steps
-            if "browser_automation" in s.required_capabilities
-        ]
-        assert len(browser_steps) > 0
-        for step in browser_steps:
-            assert step.metadata.get("execution_mode") == "agent_loop"
+        assert len(plan.steps) == 1
+        assert plan.steps[0].assigned_node == "ubuntu-hub"
 
     @pytest.mark.asyncio
     async def test_multi_cap_step_gets_agent_loop(self) -> None:
@@ -152,18 +147,27 @@ class TestTaskRouterAgentLoop:
         assert step.metadata.get("execution_mode") is None
 
     @pytest.mark.asyncio
-    async def test_get_agent_loop_steps(self) -> None:
-        """get_agent_loop_steps returns only agent-loop steps."""
+    async def test_get_agent_loop_steps_filters_correctly(self) -> None:
+        """get_agent_loop_steps returns only agent-loop steps assigned to remote nodes."""
         router, _, _ = await _setup_router()
-        plan = await router.plan_task(
+        # 手动构造 agent-loop step
+        step = TaskStep(
+            step_id="test-step",
+            description="Browser task",
+            required_capabilities=["browser_automation"],
+        )
+        await router.assign_step(step)
+        from nexus.mesh.task_router import TaskPlan
+        plan = TaskPlan(
+            task_id="test-plan",
             session_id="s2",
-            task="请在MacBook上截屏并保存到知识库",
-            context=[],
+            user_task="test",
+            steps=[step],
         )
         agent_steps = router.get_agent_loop_steps(plan)
-        for step in agent_steps:
-            assert step.metadata["execution_mode"] == "agent_loop"
-            assert step.assigned_node != "ubuntu-hub"
+        for s in agent_steps:
+            assert s.metadata["execution_mode"] == "agent_loop"
+            assert s.assigned_node != "ubuntu-hub"
 
     @pytest.mark.asyncio
     async def test_should_use_agent_loop_single_browser_cap(self) -> None:
@@ -209,7 +213,7 @@ class TestRemoteToolProxyDispatch:
         assert tool.name == proxy.dispatch_alias_for("macbook-pro")
         assert "task_description" in tool.parameters["properties"]
         assert "委托任务给" in tool.description
-        assert "打开应用" in tool.description
+        assert "操作应用" in tool.description
 
     @pytest.mark.asyncio
     async def test_dispatch_alias_for(self) -> None:
@@ -241,7 +245,8 @@ class TestRemoteToolProxyDispatch:
 
 class TestAugmentedTaskAgentLoop:
     @pytest.mark.asyncio
-    async def test_augmented_task_includes_dispatch_instructions(self) -> None:
+    async def test_augmented_task_includes_edge_nodes(self) -> None:
+        """_augment_task 应包含可用边缘节点的描述。"""
         router, _, _ = await _setup_router()
         plan = await router.plan_task(
             session_id="s3",
@@ -249,23 +254,20 @@ class TestAugmentedTaskAgentLoop:
             context=[],
         )
         augmented = router._augment_task("请在MacBook上打开浏览器登录网站", plan)
-        if router.get_agent_loop_steps(plan):
-            assert "你必须使用以下工具" in augmented
-            assert "必须调用对应的工具" in augmented
-            assert "mesh_dispatch__" in augmented
+        assert "可用的边缘节点" in augmented
+        assert "mesh_dispatch__" in augmented
 
     @pytest.mark.asyncio
-    async def test_extra_tools_include_dispatch_tool(self) -> None:
+    async def test_prepare_run_injects_dispatch_tools(self) -> None:
+        """prepare_run 应注入所有在线 edge 节点的 dispatch 工具。"""
         router, _, _ = await _setup_router()
         routing = await router.prepare_run(
             session_id="s4",
             task="请在MacBook上打开浏览器抓取网页内容",
             context_messages=[],
         )
-        agent_steps = router.get_agent_loop_steps(routing.plan)
-        if agent_steps:
-            dispatch_names = [t.name for t in routing.extra_tools if t.name.startswith("mesh_dispatch__")]
-            assert len(dispatch_names) > 0
+        dispatch_names = [t.name for t in routing.extra_tools if t.name.startswith("mesh_dispatch__")]
+        assert len(dispatch_names) > 0
 
 
 # ---------------------------------------------------------------------------

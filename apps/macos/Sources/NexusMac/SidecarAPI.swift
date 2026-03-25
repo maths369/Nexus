@@ -312,6 +312,7 @@ struct SidecarLaunchCommand: Equatable {
     let executable: String
     let arguments: [String]
     let currentDirectory: String
+    var environment: [String: String] = [:]
 }
 
 enum CommandMode: String, Codable, CaseIterable {
@@ -376,6 +377,17 @@ private struct LocalCommandResponse: Decodable {
     let result: LocalCommandResult
 }
 
+struct SidecarPermissionEntry: Decodable {
+    let id: String
+    let title: String
+    let state: String
+    let detail: String
+}
+
+struct SidecarPermissionsResponse: Decodable {
+    let permissions: [SidecarPermissionEntry]
+}
+
 final class SidecarAPIClient {
     private let baseURL: URL
     private let session: URLSession
@@ -411,6 +423,10 @@ final class SidecarAPIClient {
             method: "POST",
             body: ApprovalActionPayload(comment: comment)
         )
+    }
+
+    func permissions() async throws -> SidecarPermissionsResponse {
+        try await request(path: "permissions")
     }
 
     func localCommand(task: String, systemPrompt: String? = nil) async throws -> LocalCommandResult {

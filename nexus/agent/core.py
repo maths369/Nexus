@@ -27,6 +27,15 @@ from .types import (
     ToolResult,
 )
 from .context import estimate_messages_tokens
+from .tool_loop_detection import (
+    LoopDetectionConfig,
+    LoopDetectionState,
+    LoopSeverity,
+    detect_tool_call_loop,
+    record_tool_call,
+    record_tool_call_outcome,
+    should_emit_loop_warning,
+)
 
 if TYPE_CHECKING:
     from nexus.provider.gateway import ProviderGateway
@@ -34,6 +43,7 @@ if TYPE_CHECKING:
     from .background import BackgroundTaskManager
     from .compressor import ContextCompressor
     from .todo import TodoManager
+    from .approval import ApprovalEngine
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +62,10 @@ async def execute_tool_loop(
     compressor: ContextCompressor | None = None,
     todo_manager: TodoManager | None = None,
     background_manager: BackgroundTaskManager | None = None,
+    loop_detection_config: LoopDetectionConfig | None = None,
+    approval_engine: ApprovalEngine | None = None,
+    session_id: str | None = None,
+    channel: str | None = None,
 ) -> tuple[str, list[RunEvent]]:
     """
     核心工具调用循环。
@@ -61,11 +75,13 @@ async def execute_tool_loop(
       1. 压缩上下文（如果有 compressor）
       2. 发送 messages + tools 给 LLM
       3. 如果 LLM 返回 tool_calls:
-         a. 对每个 tool_call 执行治理检查
-         b. 处理特殊工具（compact）
-         c. 执行通过检查的工具
-         d. 追踪 todo 使用，必要时注入提醒
-         e. 继续循环
+         a. Tool loop 检测（参考 OpenClaw tool-loop-detection）
+         b. 对每个 tool_call 执行治理检查
+         c. 处理特殊工具（compact）
+         d. 执行通过检查的工具
+         e. 记录 outcome 到检测器
+         f. 追踪 todo 使用，必要时注入提醒
+         g. 继续循环
       4. 如果 LLM 返回纯文本或 stop，结束循环
 
     Args:
@@ -76,6 +92,7 @@ async def execute_tool_loop(
         compressor: 可选的上下文压缩器（三层压缩）
         todo_manager: 可选的 Todo 管理器（进度追踪 + 提醒）
         background_manager: 可选的后台任务管理器
+        loop_detection_config: 可选的 loop 检测配置
 
     Returns:
         (final_text, events): 最终回复文本和执行事件列表
@@ -87,6 +104,10 @@ async def execute_tool_loop(
     # 构建工具 schema 列表（OpenAI function calling 格式）
     tool_schemas = _build_tool_schemas(config.tools)
     tool_map = {t.name: t for t in config.tools}
+
+    # Tool loop 检测状态（对标 OpenClaw ToolLoopDetectionState）
+    loop_state = LoopDetectionState()
+    loop_config = loop_detection_config or LoopDetectionConfig()
 
     while iteration < MAX_TOOL_ITERATIONS:
         iteration += 1
@@ -175,6 +196,7 @@ async def execute_tool_loop(
                 run_id=run_id,
                 event_type="tool_call",
                 data={
+                    "call_id": tc.call_id,
                     "tool": tc.tool_name,
                     "arguments": tc.arguments,
                     "iteration": iteration,
@@ -194,38 +216,150 @@ async def execute_tool_loop(
                 logger.info(f"[{run_id}] Manual compact triggered, focus='{focus[:60]}'")
                 continue  # 跳过正常工具执行
 
-            # 治理检查
-            tool_def = tool_map.get(tc.tool_name)
-            if not tool_def:
+            # --- Tool loop 检测（对标 OpenClaw before-tool-call hook）---
+            loop_result = detect_tool_call_loop(
+                loop_state, tc.tool_name, tc.arguments, loop_config,
+            )
+            if loop_result.stuck and loop_result.severity == LoopSeverity.CRITICAL:
+                # Critical → 阻断执行
                 result = ToolResult(
                     call_id=tc.call_id,
                     tool_name=tc.tool_name,
                     success=False,
                     output="",
-                    error=f"Unknown tool: {tc.tool_name}",
+                    error=loop_result.message,
+                )
+                events.append(RunEvent(
+                    event_id=str(uuid.uuid4()),
+                    run_id=run_id,
+                    event_type="tool_loop_blocked",
+                    data={
+                        "tool": tc.tool_name,
+                        "kind": loop_result.kind.value if loop_result.kind else "",
+                        "count": loop_result.count,
+                    },
+                ))
+                logger.warning(
+                    f"[{run_id}] Tool loop BLOCKED ({loop_result.kind}): "
+                    f"{tc.tool_name} count={loop_result.count}"
+                )
+                # 记录调用（即使被阻断也要记录，维护滑动窗口）
+                record_tool_call(loop_state, tc.tool_name, tc.arguments, tc.call_id, loop_config)
+                record_tool_call_outcome(
+                    loop_state, tc.call_id, tc.tool_name, tc.arguments,
+                    error=loop_result.message,
                 )
             else:
-                policy_result = await tools_policy.check(tc, tool_def)
-                if not policy_result.allowed:
+                # Warning → 允许执行但记录警告
+                if loop_result.stuck and loop_result.severity == LoopSeverity.WARNING:
+                    if should_emit_loop_warning(loop_state, loop_result):
+                        events.append(RunEvent(
+                            event_id=str(uuid.uuid4()),
+                            run_id=run_id,
+                            event_type="tool_loop_warning",
+                            data={
+                                "tool": tc.tool_name,
+                                "kind": loop_result.kind.value if loop_result.kind else "",
+                                "count": loop_result.count,
+                                "message": loop_result.message,
+                            },
+                        ))
+                        logger.warning(
+                            f"[{run_id}] Tool loop WARNING ({loop_result.kind}): "
+                            f"{tc.tool_name} count={loop_result.count}"
+                        )
+
+                # 记录调用到滑动窗口
+                record_tool_call(loop_state, tc.tool_name, tc.arguments, tc.call_id, loop_config)
+
+                # 治理检查 + 执行
+                tool_def = tool_map.get(tc.tool_name)
+                if not tool_def:
                     result = ToolResult(
                         call_id=tc.call_id,
                         tool_name=tc.tool_name,
                         success=False,
                         output="",
-                        error=f"Tool blocked by policy: {policy_result.reason}",
+                        error=f"Unknown tool: {tc.tool_name}",
                     )
-                    events.append(RunEvent(
-                        event_id=str(uuid.uuid4()),
-                        run_id=run_id,
-                        event_type="tool_blocked",
-                        data={
-                            "tool": tc.tool_name,
-                            "reason": policy_result.reason,
-                        },
-                    ))
                 else:
-                    # 执行工具
-                    result = await _execute_tool(tc, tool_def)
+                    policy_result = await tools_policy.check(tc, tool_def)
+                    if not policy_result.allowed:
+                        # 如果需要审批且有审批引擎，走审批流程
+                        if policy_result.requires_approval and approval_engine:
+                            events.append(RunEvent(
+                                event_id=str(uuid.uuid4()),
+                                run_id=run_id,
+                                event_type="approval_requested",
+                                data={
+                                    "tool": tc.tool_name,
+                                    "risk_level": tool_def.risk_level.value,
+                                },
+                            ))
+                            approval = await approval_engine.request_approval(
+                                tc, tool_def, run_id,
+                                session_id=session_id,
+                                channel=channel,
+                            )
+                            if approval.approved:
+                                # 审批通过，执行工具
+                                events.append(RunEvent(
+                                    event_id=str(uuid.uuid4()),
+                                    run_id=run_id,
+                                    event_type="approval_granted",
+                                    data={
+                                        "tool": tc.tool_name,
+                                        "approval_id": approval.approval_id,
+                                    },
+                                ))
+                                result = await _execute_tool(tc, tool_def)
+                            else:
+                                # 审批拒绝
+                                result = ToolResult(
+                                    call_id=tc.call_id,
+                                    tool_name=tc.tool_name,
+                                    success=False,
+                                    output="",
+                                    error=f"工具被用户拒绝: {approval.comment or '未通过审批'}",
+                                )
+                                events.append(RunEvent(
+                                    event_id=str(uuid.uuid4()),
+                                    run_id=run_id,
+                                    event_type="approval_rejected",
+                                    data={
+                                        "tool": tc.tool_name,
+                                        "approval_id": approval.approval_id,
+                                        "reason": approval.comment,
+                                    },
+                                ))
+                        else:
+                            # 无审批引擎或不需要审批，直接阻断
+                            result = ToolResult(
+                                call_id=tc.call_id,
+                                tool_name=tc.tool_name,
+                                success=False,
+                                output="",
+                                error=f"Tool blocked by policy: {policy_result.reason}",
+                            )
+                            events.append(RunEvent(
+                                event_id=str(uuid.uuid4()),
+                                run_id=run_id,
+                                event_type="tool_blocked",
+                                data={
+                                    "tool": tc.tool_name,
+                                    "reason": policy_result.reason,
+                                },
+                            ))
+                    else:
+                        # 执行工具
+                        result = await _execute_tool(tc, tool_def)
+
+                # 记录 outcome 到检测器
+                record_tool_call_outcome(
+                    loop_state, tc.call_id, tc.tool_name, tc.arguments,
+                    output=result.output if result.success else None,
+                    error=result.error if not result.success else None,
+                )
 
             # 追踪 todo 使用
             if tc.tool_name == "todo_write":
@@ -237,6 +371,7 @@ async def execute_tool_loop(
                 run_id=run_id,
                 event_type="tool_result",
                 data={
+                    "call_id": tc.call_id,
                     "tool": tc.tool_name,
                     "success": result.success,
                     "duration_ms": result.duration_ms,
@@ -343,17 +478,34 @@ def _parse_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:
     return calls
 
 
+# 工具结果全局截断上限 (防止 context 溢出)
+TOOL_RESULT_MAX_CHARS = 50_000
+
+
+def _truncate_output(output: str, tool_name: str) -> str:
+    """截断过长的工具输出"""
+    if len(output) <= TOOL_RESULT_MAX_CHARS:
+        return output
+    truncated = output[:TOOL_RESULT_MAX_CHARS]
+    logger.warning(
+        "Tool '%s' output truncated: %d → %d chars",
+        tool_name, len(output), TOOL_RESULT_MAX_CHARS,
+    )
+    return truncated + f"\n\n... [截断, 原始 {len(output)} 字符, 保留前 {TOOL_RESULT_MAX_CHARS} 字符]"
+
+
 async def _execute_tool(call: ToolCall, tool_def: ToolDefinition) -> ToolResult:
     """执行单个工具调用"""
     start = time.monotonic()
     try:
         output = await tool_def.handler(**call.arguments)
         duration = (time.monotonic() - start) * 1000
+        text = _truncate_output(str(output), call.tool_name)
         return ToolResult(
             call_id=call.call_id,
             tool_name=call.tool_name,
             success=True,
-            output=str(output),
+            output=text,
             duration_ms=duration,
         )
     except Exception as e:

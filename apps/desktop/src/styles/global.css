@@ -1,0 +1,223 @@
+@import "./layout.css";
+
+/* === Nexus Desktop — Claude/Notion Dark Theme === */
+
+:root {
+  /* Background layers */
+  --bg-base: #1a1a1a;
+  --bg-surface: #212121;
+  --bg-elevated: #2a2a2a;
+  --bg-hover: #333333;
+  --bg-active: #3a3a3a;
+  --bg-sidebar: #191919;
+  --bg-input: #2a2a2a;
+
+  /* Grid notebook background */
+  --grid-color: rgba(255, 255, 255, 0.07);
+  --grid-size: 36px;
+
+  /* Text */
+  --text-primary: #ececec;
+  --text-secondary: #a0a0a0;
+  --text-tertiary: #6b6b6b;
+  --text-accent: #c4a882;
+  --text-link: #7cabcf;
+
+  /* Borders */
+  --border-subtle: #2e2e2e;
+  --border-default: #3a3a3a;
+  --border-strong: #555;
+
+  /* Accents */
+  --accent-primary: #c4a882;
+  --accent-green: #5bb98c;
+  --accent-blue: #6ba3d6;
+  --accent-orange: #d4944c;
+  --accent-red: #d45c5c;
+  --accent-purple: #a78bda;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+
+  /* Sizing */
+  --sidebar-width: 260px;
+  --right-panel-width: 300px;
+  --titlebar-height: 52px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+  --font-mono: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar — Notion style */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+/* Selection */
+::selection {
+  background: rgba(196, 168, 130, 0.25);
+}
+
+/* Focus */
+:focus-visible {
+  outline: 1.5px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+
+input, textarea {
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+input:focus, textarea:focus {
+  outline: none;
+}
+
+a {
+  color: var(--text-link);
+  text-decoration: none;
+}
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(10, 10, 10, 0.55);
+}
+
+.dialog-card {
+  width: min(420px, 100%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  padding: 18px;
+}
+
+.dialog-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.dialog-subtitle {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.dialog-body {
+  margin-top: 14px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.dialog-input {
+  width: 100%;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+}
+
+.dialog-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.dialog-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.dialog-btn {
+  min-width: 84px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.dialog-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.dialog-btn-primary {
+  background: rgba(196, 168, 130, 0.14);
+  border-color: rgba(196, 168, 130, 0.4);
+  color: var(--text-accent);
+}
+
+.dialog-btn-danger {
+  background: rgba(212, 92, 92, 0.14);
+  border-color: rgba(212, 92, 92, 0.4);
+  color: #f0b1b1;
+}
+
+/* === Layout === */
+.app-layout {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* Drag region for macOS title bar */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-drag button,
+.titlebar-drag input,
+.titlebar-drag a {
+  -webkit-app-region: no-drag;
+}

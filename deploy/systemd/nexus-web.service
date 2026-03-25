@@ -5,7 +5,7 @@ Requires=nexus-api.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/USER/nexus/web
+WorkingDirectory=/home/surgery/Workspace/Nexus/web
 ExecStartPre=/usr/bin/npm ci
 ExecStartPre=/usr/bin/npm run build
 ExecStart=/usr/bin/npm run preview -- --host 127.0.0.1 --port 5175

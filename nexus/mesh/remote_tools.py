@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json as _json_module
+import logging
 import uuid
 from typing import Any
 
@@ -12,8 +13,12 @@ from nexus.agent.types import ToolDefinition, ToolRiskLevel
 
 from .node_card import NodeType
 from .registry import MeshRegistry
+from .task_manager import TaskManager
 from .task_protocol import TaskAssignment, task_assign_topic, task_result_topic
+from .task_store import TaskEvent, TaskStatus
 from .transport import MeshMessage, MeshTransport, MessageType
+
+logger = logging.getLogger(__name__)
 
 
 def _risk_level(value: str | None) -> ToolRiskLevel:
@@ -36,12 +41,14 @@ class RemoteToolProxy:
         local_node_id: str,
         local_tool_names: set[str] | None = None,
         default_timeout_seconds: float = 30.0,
+        task_manager: TaskManager | None = None,
     ) -> None:
         self._transport = transport
         self._registry = registry
         self._local_node_id = local_node_id
         self._local_tool_names = set(local_tool_names or set())
         self._default_timeout = default_timeout_seconds
+        self._task_manager = task_manager
 
     def build_remote_tools(self) -> list[ToolDefinition]:
         tools: dict[str, ToolDefinition] = {}
@@ -81,17 +88,35 @@ class RemoteToolProxy:
                 continue
             seen.add(node.node_id)
             alias = self.dispatch_alias_for(node.node_id)
-            # Collect capability descriptions for richer tool description
-            cap_names = [c.capability_id for c in node.capabilities]
-            cap_summary = "、".join(cap_names) if cap_names else "通用任务"
+            # Dynamically build description from registered capabilities
+            cap_descriptions = []
+            for c in node.capabilities:
+                desc = c.description or c.capability_id
+                cap_descriptions.append(desc)
+            if cap_descriptions:
+                cap_section = "已注册能力：" + "；".join(cap_descriptions)
+            else:
+                cap_section = (
+                    "通用 Mac 自动化节点，可通过 AppleScript 控制任何应用、"
+                    "浏览器、文件系统、摄像头、麦克风等"
+                )
+            # Include discovered tool names for LLM awareness
+            all_tool_names: list[str] = []
+            for c in node.capabilities:
+                all_tool_names.extend(c.tools)
+            tool_hint = ""
+            if all_tool_names:
+                tool_hint = f"\n可用工具包括：{', '.join(all_tool_names[:20])}"
             tools.append(ToolDefinition(
                 name=alias,
                 description=(
-                    f"委托任务给 {node.display_name} ({node.node_id}) 执行。"
-                    f"该节点能力：{cap_summary}。"
-                    f"调用此工具后，{node.display_name} 会自主规划并执行多步操作"
-                    f"（包括打开应用、浏览器操作、文件操作、截屏等）。"
-                    f"你只需要描述任务目标，节点会自动完成。"
+                    f"委托任务给 {node.display_name} ({node.node_id}) 执行。\n"
+                    f"{cap_section}。{tool_hint}\n"
+                    f"调用后 {node.display_name} 自主规划并执行多步操作，你只需描述目标。\n"
+                    f"适用场景：任何需要操作用户 Mac 本地资源的任务——"
+                    f"打开/操作应用、浏览器交互（邮箱、网页）、文件读写、"
+                    f"截图/快照、录音、摄像头、系统设置等。\n"
+                    f"注意：使用用户真实 Chrome 浏览器（保留登录态和 Cookie），非独立实例。"
                 ),
                 parameters={
                     "type": "object",
@@ -133,10 +158,18 @@ class RemoteToolProxy:
         target_node: str,
         task_description: str,
         constraints: str = "",
-        timeout: float = 300.0,
+        timeout: float = 600.0,
+        session_id: str = "",
+        source_type: str = "api",
+        source_id: str = "",
+        on_event: "Any | None" = None,
     ) -> str:
-        """Dispatch a multi-step task to an edge node via TaskAssignment."""
-        task_id = f"dispatch-{uuid.uuid4().hex[:12]}"
+        """Dispatch a task to an edge node — fire-and-forget via TaskManager.
+
+        If TaskManager is available, dispatches asynchronously and returns
+        immediately with task_id + confirmation message.
+        Falls back to synchronous RPC if no TaskManager is configured.
+        """
         constraint_dict: dict[str, Any] = {}
         if constraints:
             try:
@@ -144,6 +177,46 @@ class RemoteToolProxy:
             except _json_module.JSONDecodeError:
                 constraint_dict = {"raw": constraints}
 
+        # ── Async path (preferred): fire-and-forget via TaskManager ──
+        if self._task_manager is not None:
+            task = await self._task_manager.submit_task(
+                session_id=session_id or f"auto-{uuid.uuid4().hex[:8]}",
+                source_type=source_type,
+                source_id=source_id or "hub",
+                target_node=target_node,
+                task_description=task_description,
+                constraints=constraint_dict if constraint_dict else None,
+                timeout_seconds=timeout,
+                on_event=on_event,
+            )
+            logger.info(
+                "Task %s dispatched async to %s (fire-and-forget)",
+                task.task_id, target_node,
+            )
+            return (
+                f"任务已异步派发到 {target_node}，task_id: {task.task_id}。\n"
+                f"节点正在执行中，结果会通过消息推送自动返回给用户。\n"
+                f"你不需要等待结果，可以告诉用户任务已在执行中。"
+            )
+
+        # ── Fallback: synchronous RPC (legacy) ──
+        return await self._dispatch_sync(
+            target_node=target_node,
+            task_description=task_description,
+            constraint_dict=constraint_dict,
+            timeout=timeout,
+        )
+
+    async def _dispatch_sync(
+        self,
+        *,
+        target_node: str,
+        task_description: str,
+        constraint_dict: dict[str, Any],
+        timeout: float = 300.0,
+    ) -> str:
+        """Legacy synchronous dispatch — blocks until result arrives."""
+        task_id = f"dispatch-{uuid.uuid4().hex[:12]}"
         assignment = TaskAssignment(
             task_id=task_id,
             step_id="dispatch-step-1",
@@ -157,7 +230,6 @@ class RemoteToolProxy:
             },
         )
 
-        # Subscribe to result topic before publishing assignment
         result_topic = task_result_topic(task_id)
         result_future: "asyncio.Future[dict[str, Any]]" = asyncio.get_running_loop().create_future()
 
@@ -169,7 +241,6 @@ class RemoteToolProxy:
 
         await self._transport.subscribe(result_topic, _on_result)
         try:
-            # Publish the assignment
             assign_topic = task_assign_topic(task_id)
             msg = self._transport.make_message(
                 MessageType.TASK_ASSIGN,
@@ -178,8 +249,6 @@ class RemoteToolProxy:
                 target_node=target_node,
             )
             await self._transport.publish(assign_topic, msg)
-
-            # Wait for result
             payload = await asyncio.wait_for(result_future, timeout=timeout)
         finally:
             await self._transport.unsubscribe(result_topic)

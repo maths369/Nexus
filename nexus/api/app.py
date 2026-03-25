@@ -3,6 +3,8 @@ FastAPI Application — Nexus HTTP/WebSocket 入口
 
 路由:
   POST /feishu/webhook    — 飞书事件回调
+  POST /weixin/login/start — 微信扫码登录初始化
+  POST /weixin/login/wait  — 微信扫码登录确认轮询
   WS   /ws                — Web 前端 WebSocket
   GET  /health            — 健康检查
   GET  /health/providers  — Provider 健康状态
@@ -16,15 +18,21 @@ import json
 import logging
 import os
 import socket
+import time
 from contextlib import asynccontextmanager
+
+from pathlib import Path
+from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 from nexus.api.runtime import NexusRuntime, build_runtime, start_mesh_runtime, stop_mesh_runtime
 from nexus.channel.adapter_feishu import FeishuAdapter, FeishuLongConnectionRunner
+from nexus.channel.adapter_weixin import WeixinAdapter, WeixinLongPollRunner
 from nexus.channel.types import ChannelType, InboundMessage, OutboundMessage
 from nexus.channel.message_formatter import MessageFormatter
 from nexus.orchestrator import Orchestrator
@@ -40,13 +48,34 @@ _runtime: NexusRuntime | None = None
 _orchestrator: Orchestrator | None = None
 _feishu_adapter: FeishuAdapter | None = None
 _feishu_longconn_runner: FeishuLongConnectionRunner | None = None
+_weixin_adapter: WeixinAdapter | None = None
+_weixin_longpoll_runner: WeixinLongPollRunner | None = None
 _settings: NexusSettings | None = None
 
+# Feishu message_id 去重（防止 webhook 重复投递）
+_DEDUP_TTL_SECONDS = 300  # 5 分钟内的重复消息会被忽略
+_seen_message_ids: dict[str, float] = {}  # message_id → first_seen_timestamp
+_seen_weixin_message_ids: dict[str, float] = {}
 
-def _feishu_reply_signature() -> str:
+
+def _hub_reply_signature() -> str:
     host = socket.gethostname()
     pid = os.getpid()
     return f"[hub:{host}:{pid}]"
+
+
+def _render_outbound_for_channel(channel: ChannelType, outbound: OutboundMessage) -> str:
+    formatter = getattr(_orchestrator, "_formatter", None)
+    if isinstance(formatter, MessageFormatter):
+        return formatter.render_for_channel(channel, outbound)
+    return MessageFormatter().render_for_channel(channel, outbound)
+
+
+def _render_feishu_card(outbound: OutboundMessage) -> dict[str, Any]:
+    formatter = getattr(_orchestrator, "_formatter", None)
+    if isinstance(formatter, MessageFormatter):
+        return formatter.render_feishu_card(outbound)
+    return MessageFormatter().render_feishu_card(outbound)
 
 
 class CreatePageRequest(BaseModel):
@@ -100,6 +129,24 @@ class PageLinkRequest(BaseModel):
     heading: str | None = None
 
 
+class DesktopMessageRequest(BaseModel):
+    content: str
+    sender_id: str = "desktop_default"
+    session_id: str | None = None
+    device_id: str = "mac"
+    route_mode: str = "auto"  # "auto" | "hub" | "mac"
+
+
+class VaultWriteRequest(BaseModel):
+    path: str
+    content: str
+
+
+class VaultCreateRequest(BaseModel):
+    path: str
+    is_dir: bool = False
+
+
 class EdgeJournalSyncRequest(BaseModel):
     node_id: str
     entries: list[dict[str, object]] = Field(default_factory=list)
@@ -129,6 +176,17 @@ class BrowserScreenshotRequest(BaseModel):
 
 class BrowserFillFormRequest(BaseModel):
     fields: dict[str, str]
+
+
+class WeixinLoginStartRequest(BaseModel):
+    account_id: str | None = None
+    bot_type: str | None = None
+    base_url: str | None = None
+
+
+class WeixinLoginWaitRequest(BaseModel):
+    session_key: str
+    timeout_ms: int = 480000
 
 
 def _require_runtime() -> NexusRuntime:
@@ -170,16 +228,86 @@ def _make_feishu_reply(chat_id: str):
                 chat_id,
             )
             return
-        content = f"{_feishu_reply_signature()} {outbound.content}"
+        try:
+            card = _render_feishu_card(outbound)
+            await _feishu_adapter.send_card(chat_id, card)
+            logger.warning(
+                "Feishu card reply %s [%s] to %s",
+                _hub_reply_signature(),
+                outbound.message_type.value,
+                chat_id,
+            )
+            return
+        except Exception:
+            logger.exception(
+                "Feishu card reply failed; falling back to text type=%s chat_id=%s",
+                outbound.message_type.value,
+                chat_id,
+            )
+
+        content = _render_outbound_for_channel(ChannelType.FEISHU, outbound)
         await _feishu_adapter.send_text(chat_id, content)
         logger.warning(
-            "Feishu reply [%s] to %s: %s",
+            "Feishu text fallback %s [%s] to %s: %s",
+            _hub_reply_signature(),
             outbound.message_type.value,
             chat_id,
             content[:100],
         )
 
     return send_feishu_reply
+
+
+def _build_weixin_inbound(event: dict[str, object], *, content: str) -> InboundMessage:
+    account_id = str(event.get("account_id") or "").strip() or "default"
+    sender_user_id = str(event.get("sender_user_id") or "").strip()
+    sender_key = f"{account_id}:{sender_user_id}" if sender_user_id else account_id
+    channel_key = f"weixin:{account_id}:{sender_user_id}" if sender_user_id else f"weixin:{account_id}"
+    return InboundMessage(
+        message_id=str(event.get("message_id") or ""),
+        channel=ChannelType.WEIXIN,
+        sender_id=sender_key,
+        content=content,
+        metadata={
+            "account_id": account_id,
+            "sender_user_id": sender_user_id,
+            "message_type": str(event.get("message_type") or "text"),
+            "source": "weixin",
+            "channel_key": channel_key,
+            "context_token": str(event.get("context_token") or ""),
+            "session_id": str(event.get("session_id") or ""),
+        },
+        attachments=[],
+    )
+
+
+def _make_weixin_reply(account_id: str, to_user_id: str, context_token: str):
+    async def send_weixin_reply(outbound: OutboundMessage) -> None:
+        if not _weixin_adapter or not _weixin_adapter.configured:
+            logger.warning(
+                "Weixin adapter not configured; dropping reply type=%s account_id=%s to=%s",
+                outbound.message_type.value,
+                account_id,
+                to_user_id,
+            )
+            return
+        content = _render_outbound_for_channel(ChannelType.WEIXIN, outbound)
+        await _weixin_adapter.send_text(
+            account_id,
+            to_user_id,
+            content,
+            context_token=context_token or None,
+        )
+        logger.warning(
+            "Weixin reply %s [%s] via %s to %s: %s",
+            _hub_reply_signature(),
+            outbound.message_type.value,
+            account_id,
+            to_user_id,
+            content[:100],
+        )
+
+    return send_weixin_reply
 
 
 async def _dispatch_feishu_event(event: dict[str, object]) -> None:
@@ -193,6 +321,28 @@ async def _dispatch_feishu_event(event: dict[str, object]) -> None:
             event.get("message_id"),
         )
         return
+
+    # ── message_id 去重 ──
+    message_id = str(event.get("message_id") or "").strip()
+    if message_id:
+        now = time.monotonic()
+        # 清理过期条目（惰性清理，每次最多扫描全量）
+        expired = [
+            mid for mid, ts in _seen_message_ids.items()
+            if now - ts > _DEDUP_TTL_SECONDS
+        ]
+        for mid in expired:
+            _seen_message_ids.pop(mid, None)
+        # 检查是否重复
+        if message_id in _seen_message_ids:
+            logger.warning(
+                "Feishu message deduplicated (already processed): message_id=%s chat_id=%s",
+                message_id,
+                event.get("chat_id"),
+            )
+            return
+        _seen_message_ids[message_id] = now
+
     attachment_count = len(event.get("attachments") or []) if isinstance(event.get("attachments"), list) else 0
     content = str(event.get("text") or "").strip()
     logger.warning(
@@ -235,6 +385,74 @@ async def _dispatch_feishu_event(event: dict[str, object]) -> None:
         event.get("message_id"),
         event.get("sender_user_id"),
         event.get("chat_id"),
+    )
+
+
+async def _dispatch_weixin_event(event: dict[str, object]) -> None:
+    if not _orchestrator:
+        raise RuntimeError("Orchestrator not initialized")
+    if bool(event.get("ignored")):
+        logger.warning(
+            "Weixin message ignored: reason=%s account_id=%s sender=%s message_id=%s",
+            event.get("reason"),
+            event.get("account_id"),
+            event.get("sender_user_id"),
+            event.get("message_id"),
+        )
+        return
+
+    message_id = str(event.get("message_id") or "").strip()
+    dedup_key = f"{event.get('account_id')}:{message_id}" if message_id else ""
+    if dedup_key:
+        now = time.monotonic()
+        expired = [
+            mid for mid, ts in _seen_weixin_message_ids.items()
+            if now - ts > _DEDUP_TTL_SECONDS
+        ]
+        for mid in expired:
+            _seen_weixin_message_ids.pop(mid, None)
+        if dedup_key in _seen_weixin_message_ids:
+            logger.warning(
+                "Weixin message deduplicated: account_id=%s message_id=%s",
+                event.get("account_id"),
+                message_id,
+            )
+            return
+        _seen_weixin_message_ids[dedup_key] = now
+
+    content = str(event.get("text") or "").strip()
+    if not content:
+        logger.warning(
+            "Weixin empty text ignored: account_id=%s sender=%s message_id=%s",
+            event.get("account_id"),
+            event.get("sender_user_id"),
+            event.get("message_id"),
+        )
+        return
+
+    inbound = _build_weixin_inbound(event, content=content)
+    try:
+        await _orchestrator.handle_message(
+            inbound,
+            _make_weixin_reply(
+                str(event.get("account_id") or ""),
+                str(event.get("sender_user_id") or ""),
+                str(event.get("context_token") or ""),
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "Weixin inbound dispatch failed: account_id=%s sender=%s message_id=%s",
+            event.get("account_id"),
+            event.get("sender_user_id"),
+            event.get("message_id"),
+        )
+        raise
+    logger.warning(
+        "Weixin inbound dispatch completed: account_id=%s sender=%s message_id=%s",
+        event.get("account_id"),
+        event.get("sender_user_id"),
+        event.get("message_id"),
     )
 
 
@@ -295,7 +513,8 @@ async def _ingest_feishu_artifacts(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global _runtime, _orchestrator, _feishu_adapter, _feishu_longconn_runner, _settings
+    global _runtime, _orchestrator, _feishu_adapter, _feishu_longconn_runner
+    global _weixin_adapter, _weixin_longpoll_runner, _settings
 
     _settings = load_nexus_settings()
     _runtime = build_runtime(settings=_settings)
@@ -306,12 +525,35 @@ async def lifespan(app: FastAPI):
         logger.warning("Failed to index identity documents at startup", exc_info=True)
     await start_mesh_runtime(_runtime)
 
+    # Wire TaskManager events to SSE push
+    task_mgr = getattr(_runtime, "mesh_task_manager", None)
+    if task_mgr is not None:
+        from nexus.mesh.task_store import TaskEvent as _TaskEvent
+
+        async def _on_any_task_event(event: _TaskEvent) -> None:
+            # Find the session_id from the task
+            task = task_mgr.store.get(event.task_id)
+            if task is None:
+                return
+            await _push_task_event_to_session(task.session_id, {
+                "type": f"task_{event.event_type}",
+                "task_id": event.task_id,
+                "content": event.content,
+                "progress": event.progress,
+                "metadata": event.metadata,
+            })
+
+        task_mgr.on_any_task_event(_on_any_task_event)
+
     _orchestrator = Orchestrator(
         session_router=_runtime.session_router,
         session_store=_runtime.session_store,
         context_window=_runtime.context_window,
         run_manager=_runtime.run_manager,
         formatter=MessageFormatter(),
+        provider_gateway=_runtime.provider,
+        search_config=_runtime.search_config,
+        config_path=_runtime.settings.config_path,
         available_tools=_runtime.available_tools,
         skill_manager=_runtime.skill_manager,
         capability_manager=_runtime.capability_manager,
@@ -342,22 +584,44 @@ async def lifespan(app: FastAPI):
         )
         _feishu_longconn_runner.start(loop=asyncio.get_running_loop())
 
+    weixin_config = _settings.weixin_config()
+    _weixin_adapter = WeixinAdapter(weixin_config) if weixin_config.get("enabled") else None
+    if _weixin_adapter is not None:
+        _weixin_longpoll_runner = WeixinLongPollRunner(
+            _weixin_adapter,
+            on_message=_dispatch_weixin_event,
+            long_poll_timeout_ms=int(weixin_config.get("long_poll_timeout_ms", 35000) or 35000),
+            retry_delay_seconds=float(weixin_config.get("retry_delay_seconds", 2.0) or 2.0),
+            backoff_delay_seconds=float(weixin_config.get("backoff_delay_seconds", 30.0) or 30.0),
+            max_consecutive_failures=int(weixin_config.get("max_consecutive_failures", 3) or 3),
+            session_expired_pause_seconds=float(
+                weixin_config.get("session_expired_pause_seconds", 600.0) or 600.0
+            ),
+        )
+        _weixin_longpoll_runner.start(loop=asyncio.get_running_loop())
+
     logger.info("Nexus runtime initialized, root=%s", _settings.root_dir)
     yield
 
     logger.info("Nexus runtime shutting down")
     if _feishu_longconn_runner is not None:
         _feishu_longconn_runner.shutdown()
+    if _weixin_longpoll_runner is not None:
+        _weixin_longpoll_runner.shutdown()
     if _runtime is not None:
         await stop_mesh_runtime(_runtime)
         await _runtime.background_manager.aclose()
         await _runtime.browser_service.aclose()
     if _feishu_adapter is not None:
         await _feishu_adapter.aclose()
+    if _weixin_adapter is not None:
+        await _weixin_adapter.aclose()
     _runtime = None
     _orchestrator = None
     _feishu_adapter = None
     _feishu_longconn_runner = None
+    _weixin_adapter = None
+    _weixin_longpoll_runner = None
     _settings = None
 
 
@@ -379,6 +643,10 @@ app.add_middleware(
         "http://127.0.0.1:5174",
         "http://localhost:5175",
         "http://127.0.0.1:5175",
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+        "tauri://localhost",
+        "https://tauri.localhost",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -538,6 +806,80 @@ async def feishu_webhook(request: Request, background_tasks: BackgroundTasks):
     background_tasks.add_task(_dispatch_feishu_event, event)
 
     return {"code": 0}
+
+
+# ---------------------------------------------------------------------------
+# 微信 Long Poll / 登录
+# ---------------------------------------------------------------------------
+
+@app.get("/weixin/status")
+async def weixin_status():
+    if not _settings or not _settings.weixin_config().get("enabled"):
+        return {
+            "enabled": False,
+            "adapter": None,
+            "runner": None,
+        }
+    return {
+        "enabled": True,
+        "adapter": _weixin_adapter.status_snapshot() if _weixin_adapter is not None else None,
+        "runner": _weixin_longpoll_runner.status() if _weixin_longpoll_runner is not None else None,
+    }
+
+
+@app.post("/weixin/login/start")
+async def weixin_login_start(payload: WeixinLoginStartRequest):
+    if not _settings or not _settings.weixin_config().get("enabled"):
+        return JSONResponse(
+            status_code=503,
+            content={"code": -1, "msg": "Weixin channel disabled"},
+        )
+    if _weixin_adapter is None:
+        return JSONResponse(
+            status_code=503,
+            content={"code": -1, "msg": "Weixin adapter unavailable"},
+        )
+    try:
+        result = await _weixin_adapter.start_login(
+            account_id=payload.account_id,
+            bot_type=payload.bot_type,
+            base_url=payload.base_url,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Weixin login start failed")
+        return JSONResponse(
+            status_code=500,
+            content={"code": -1, "msg": f"Weixin login start failed: {exc}"},
+        )
+    return {"code": 0, "data": result}
+
+
+@app.post("/weixin/login/wait")
+async def weixin_login_wait(payload: WeixinLoginWaitRequest):
+    if not _settings or not _settings.weixin_config().get("enabled"):
+        return JSONResponse(
+            status_code=503,
+            content={"code": -1, "msg": "Weixin channel disabled"},
+        )
+    if _weixin_adapter is None:
+        return JSONResponse(
+            status_code=503,
+            content={"code": -1, "msg": "Weixin adapter unavailable"},
+        )
+    try:
+        result = await _weixin_adapter.wait_for_login(
+            payload.session_key,
+            timeout_ms=payload.timeout_ms,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Weixin login wait failed")
+        return JSONResponse(
+            status_code=500,
+            content={"code": -1, "msg": f"Weixin login wait failed: {exc}"},
+        )
+    if bool(result.get("connected")) and _weixin_longpoll_runner is not None:
+        _weixin_longpoll_runner.ensure_account(str(result.get("account_id") or ""))
+    return {"code": 0, "data": result}
 
 
 # ---------------------------------------------------------------------------
@@ -875,3 +1217,298 @@ async def edge_journal_list(node_id: str = "", limit: int = 50):
         )
     entries = journal_store.list_entries(node_id=node_id, limit=limit)
     return {"entries": entries, "count": len(entries)}
+
+
+# ---------------------------------------------------------------------------
+# Desktop Channel (SSE)
+# ---------------------------------------------------------------------------
+
+@app.post("/desktop/message")
+async def desktop_message(payload: DesktopMessageRequest):
+    """Desktop App 对话端点 — 返回 SSE 流."""
+    if not _orchestrator or not _runtime:
+        return JSONResponse(status_code=503, content={"error": "Runtime not ready"})
+
+    channel_key = f"desktop:{payload.device_id}"
+    seq = int(asyncio.get_event_loop().time() * 1000)
+    inbound = InboundMessage(
+        message_id=f"desktop_{payload.device_id}_{seq}",
+        channel=ChannelType.DESKTOP,
+        sender_id=payload.sender_id,
+        content=payload.content,
+        metadata={
+            "device_id": payload.device_id,
+            "channel_key": channel_key,
+            "source": "desktop",
+            "route_mode": payload.route_mode,
+        },
+    )
+
+    queue: asyncio.Queue[OutboundMessage | None] = asyncio.Queue()
+
+    async def sse_reply(outbound: OutboundMessage) -> None:
+        await queue.put(outbound)
+
+    async def run_task():
+        try:
+            await _orchestrator.handle_message(inbound, sse_reply)
+        except Exception as exc:
+            logger.exception("Desktop message failed")
+            error_msg = OutboundMessage(
+                session_id="",
+                message_type=OutboundMessageType("error"),
+                content=str(exc),
+            )
+            await queue.put(error_msg)
+        finally:
+            await queue.put(None)  # sentinel
+
+    async def event_generator():
+        task = asyncio.create_task(run_task())
+        try:
+            while True:
+                msg = await queue.get()
+                if msg is None:
+                    break
+                data = json.dumps({
+                    "type": msg.message_type.value,
+                    "session_id": msg.session_id,
+                    "content": msg.content,
+                    "metadata": msg.metadata,
+                }, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Async Task Stream (SSE) — pushes task events from mesh dispatch
+# ---------------------------------------------------------------------------
+
+# Global dict mapping session_id -> list of SSE queues for that session
+_task_event_queues: dict[str, list[asyncio.Queue]] = {}
+
+
+def _register_task_event_queue(session_id: str, queue: asyncio.Queue) -> None:
+    _task_event_queues.setdefault(session_id, []).append(queue)
+
+
+def _unregister_task_event_queue(session_id: str, queue: asyncio.Queue) -> None:
+    queues = _task_event_queues.get(session_id, [])
+    if queue in queues:
+        queues.remove(queue)
+    if not queues:
+        _task_event_queues.pop(session_id, None)
+
+
+async def _push_task_event_to_session(session_id: str, event_data: dict) -> None:
+    """Push a task event to all SSE streams listening on this session."""
+    for q in _task_event_queues.get(session_id, []):
+        try:
+            await q.put(event_data)
+        except Exception:
+            pass
+
+
+@app.get("/tasks/stream/{session_id}")
+async def task_event_stream(session_id: str):
+    """SSE stream for async task events on a session.
+
+    Desktop connects to this after receiving a 'task dispatched' response.
+    Events: task_dispatched, task_acknowledged, task_progress, task_completed, task_failed.
+    """
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+    _register_task_event_queue(session_id, queue)
+
+    async def generator():
+        try:
+            while True:
+                event = await asyncio.wait_for(queue.get(), timeout=600.0)
+                if event is None:
+                    break
+                data = json.dumps(event, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'timeout', 'content': 'Stream timeout'})}\n\n"
+        finally:
+            _unregister_task_event_queue(session_id, queue)
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    """Get current status of an async task."""
+    if not _runtime:
+        return JSONResponse(status_code=503, content={"error": "Runtime not ready"})
+    task_mgr = getattr(_runtime, "mesh_task_manager", None)
+    if task_mgr is None:
+        return JSONResponse(status_code=404, content={"error": "TaskManager not available"})
+    task = task_mgr.store.get(task_id)
+    if task is None:
+        return JSONResponse(status_code=404, content={"error": f"Task {task_id} not found"})
+    return JSONResponse(content=task.to_dict())
+
+
+class CreateTaskRequest(BaseModel):
+    task_description: str
+    target_node: str
+    session_id: str = ""
+    source_type: str = "api"
+    source_id: str = ""
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: float = 600.0
+
+
+@app.post("/tasks")
+async def create_task(req: CreateTaskRequest):
+    """Submit a new async task to a mesh node."""
+    if not _runtime:
+        return JSONResponse(status_code=503, content={"error": "Runtime not ready"})
+    task_mgr = getattr(_runtime, "mesh_task_manager", None)
+    if task_mgr is None:
+        return JSONResponse(status_code=404, content={"error": "TaskManager not available"})
+    task = await task_mgr.submit_task(
+        session_id=req.session_id,
+        source_type=req.source_type,
+        source_id=req.source_id,
+        target_node=req.target_node,
+        task_description=req.task_description,
+        constraints=req.constraints or None,
+        timeout_seconds=req.timeout_seconds,
+    )
+    return JSONResponse(
+        status_code=201,
+        content={"task_id": task.task_id, "status": task.status.value},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vault CRUD (for Desktop file tree & editor)
+# ---------------------------------------------------------------------------
+
+def _vault_root() -> Path:
+    """Return the vault root directory from runtime settings."""
+    runtime = _require_runtime()
+    return Path(runtime.settings.root_dir) / "vault"
+
+
+def _safe_vault_path(relative: str) -> Path:
+    """Resolve a relative path within vault, prevent traversal."""
+    root = _vault_root()
+    resolved = (root / relative).resolve()
+    if not str(resolved).startswith(str(root.resolve())):
+        raise ValueError(f"Path traversal detected: {relative}")
+    return resolved
+
+
+def _build_file_tree(directory: Path, base: Path, depth: int = 0, max_depth: int = 3) -> list[dict]:
+    """Recursively build file tree for a directory."""
+    if not directory.is_dir() or depth > max_depth:
+        return []
+    items = []
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        return []
+    for entry in entries:
+        if entry.name.startswith(".") or entry.name == "__pycache__":
+            continue
+        rel = str(entry.relative_to(base))
+        node = {
+            "id": rel,
+            "name": entry.name,
+            "path": rel,
+            "is_dir": entry.is_dir(),
+            "children": _build_file_tree(entry, base, depth + 1, max_depth) if entry.is_dir() else [],
+        }
+        items.append(node)
+    return items
+
+
+@app.get("/vault/tree")
+async def vault_tree(path: str = "", depth: int = 3):
+    """Return vault directory tree as JSON."""
+    root = _vault_root()
+    target = _safe_vault_path(path) if path else root
+    if not target.exists():
+        return JSONResponse(status_code=404, content={"error": f"Path not found: {path}"})
+    tree = _build_file_tree(target, root, max_depth=depth)
+    return {"tree": tree, "root": str(root)}
+
+
+@app.get("/vault/read")
+async def vault_read(path: str):
+    """Read a file from the vault."""
+    file_path = _safe_vault_path(path)
+    if not file_path.is_file():
+        return JSONResponse(status_code=404, content={"error": f"File not found: {path}"})
+    try:
+        content = file_path.read_text(encoding="utf-8")
+        return {"path": path, "content": content}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.put("/vault/write")
+async def vault_write(payload: VaultWriteRequest):
+    """Write content to a vault file."""
+    file_path = _safe_vault_path(payload.path)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(payload.content, encoding="utf-8")
+        return {"path": payload.path, "success": True}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.post("/vault/create")
+async def vault_create(payload: VaultCreateRequest):
+    """Create a file or directory in the vault."""
+    target = _safe_vault_path(payload.path)
+    try:
+        if payload.is_dir:
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_text("", encoding="utf-8")
+        return {"path": payload.path, "success": True}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.delete("/vault/delete")
+async def vault_delete(path: str):
+    """Delete a file or directory from the vault."""
+    import shutil
+    target = _safe_vault_path(path)
+    if not target.exists():
+        return JSONResponse(status_code=404, content={"error": f"Not found: {path}"})
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return {"path": path, "success": True}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})

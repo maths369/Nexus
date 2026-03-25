@@ -45,7 +45,7 @@ def test_create_skill_success(tmp_path):
     content = skill_md.read_text(encoding="utf-8")
     assert "name: Excel 处理" in content
     assert "description: 使用 pandas/openpyxl 处理 Excel 文件" in content
-    assert "tags: data, excel, pandas" in content
+    assert "data" in content and "excel" in content and "pandas" in content
     assert "background_run" in content
 
 

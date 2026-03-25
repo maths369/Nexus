@@ -1,7 +1,18 @@
 ---
-name: bmad-adversarial-review
-description: 对任何产出物执行对抗式审查。必须找出至少 10 个问题，禁止说"看起来不错"。
-tags: bmad, review, adversarial, quality
+name: BMAD Adversarial Review (通用对抗审查)
+description: 对任何产出物（PRD、架构、Story、文档、代码）执行对抗式审查。必须找出至少 10 个问题，禁止说"看起来不错"。
+tags:
+- bmad
+- review
+- adversarial
+- quality
+keywords:
+- 审查
+- 对抗审查
+- review
+- 批判
+- 找问题
+- 质量检查
 ---
 
 # BMAD Adversarial Review — 通用对抗审查

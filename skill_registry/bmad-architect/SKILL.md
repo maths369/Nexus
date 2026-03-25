@@ -1,7 +1,22 @@
 ---
-name: bmad-architect
-description: 系统架构设计、技术选型、ADR 决策记录。
-tags: bmad, architecture, design, adr
+name: BMAD Architect (Winston)
+description: 系统架构设计、技术选型、ADR 决策记录。平衡理想与现实，拥抱无聊但可靠的技术。适用于"设计架构""技术选型""架构评审"等指令。
+tags:
+- bmad
+- architecture
+- design
+- adr
+- solutioning
+keywords:
+- 架构
+- 设计
+- 技术选型
+- adr
+- architect
+- winston
+- 系统设计
+- 分布式
+- api设计
 ---
 
 # BMAD Architect — Winston

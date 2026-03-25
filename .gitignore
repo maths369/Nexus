@@ -36,6 +36,10 @@ web/dist/
 web/.npm-cache/
 web/*.tsbuildinfo
 
+# Desktop app
+apps/desktop/node_modules/
+apps/desktop/dist/
+
 # Sync archives
 .nexus_sync_*.tar.gz
 

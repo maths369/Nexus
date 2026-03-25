@@ -10,12 +10,12 @@ struct MenuBarContentView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     hero
-                    commandPanel
+                    openWorkspaceCard
+                    mlxServiceCard
                     if let snapshot = model.snapshot, !snapshot.pendingApprovals.isEmpty {
                         approvalsPreview(snapshot.pendingApprovals)
                     }
-                    conversationPreview
-                    secondaryActions
+                    quickActions
                     if let error = model.lastError, !error.isEmpty {
                         errorCard(error)
                     }
@@ -28,116 +28,188 @@ struct MenuBarContentView: View {
             }
             .scrollIndicators(.hidden)
         }
-        .frame(width: 430, height: 760)
+        .frame(width: 430, height: 400)
     }
+
+    // MARK: - Hero (status)
 
     private var hero: some View {
-        NexusCard("Command Panel", eyebrow: "Nexus") {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(model.statusLabel)
-                            .font(.system(size: 24, weight: .bold, design: .rounded))
-                            .foregroundStyle(NexusPalette.textPrimary)
-                        Text(heroSummary)
-                            .font(.system(size: 13, weight: .medium, design: .rounded))
-                            .foregroundStyle(NexusPalette.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer()
-                    heroStatusCluster
-                }
+        HStack(spacing: 0) {
+            Text("Nexus")
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(NexusPalette.textPrimary)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    NexusInlineStatusRow(
-                        label: "Local Engine",
-                        value: model.snapshot?.phase.capitalized ?? model.statusLabel,
-                        tone: model.snapshot?.phase == "running" ? NexusPalette.mint : NexusPalette.amber
-                    )
-                    NexusInlineStatusRow(
-                        label: "Ubuntu Hub",
-                        value: "\(model.primaryHubStatusLabel) · \(model.settings.resolvedHubAPIHost):\(model.settings.resolvedHubAPIPort)",
-                        tone: hubTone
-                    )
-                }
+            Spacer()
+
+            statusDot(
+                label: "Local",
+                on: model.snapshot?.phase == "running",
+                onColor: NexusPalette.mint
+            )
+
+            statusDot(
+                label: "Hub",
+                on: model.hubConnectivityState == .connected,
+                onColor: NexusPalette.cyan
+            )
+
+            statusDot(
+                label: "MLX",
+                on: model.mlxHealth != nil || model.mlxSupervisorState != .stopped,
+                onColor: model.mlxStatusTone
+            )
+
+            if model.pendingApprovalCount > 0 {
+                NexusBadge(text: "\(model.pendingApprovalCount)", tone: NexusPalette.rose)
+                    .padding(.leading, 8)
             }
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        )
     }
 
-    private var commandPanel: some View {
-        NexusCard("Ask Nexus", eyebrow: "Primary Interaction") {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(model.commandModeDescription)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(NexusPalette.textSecondary)
+    private func statusDot(label: String, on: Bool, onColor: Color) -> some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(on ? onColor : NexusPalette.steel.opacity(0.5))
+                .frame(width: 7, height: 7)
+            Text(label)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(on ? NexusPalette.textPrimary : NexusPalette.textSecondary)
+        }
+        .padding(.leading, 14)
+    }
 
-                Picker("Mode", selection: $model.settings.commandMode) {
-                    ForEach(CommandMode.allCases, id: \.self) { mode in
-                        Text(mode.label).tag(mode)
+    // MARK: - Open Workspace
+
+    private var openWorkspaceCard: some View {
+        Button {
+            windows.showWorkspace(model: model)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "macwindow.on.rectangle")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(NexusPalette.mint)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Open Workspace")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundStyle(NexusPalette.textPrimary)
+                    Text("Documents, AI Chat, and Task Progress")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(NexusPalette.textSecondary)
+                }
+
+                Spacer()
+
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(NexusPalette.textSecondary)
+            }
+            .padding(16)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                NexusPalette.mint.opacity(0.15),
+                                NexusPalette.cyan.opacity(0.08)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .stroke(NexusPalette.mint.opacity(0.25), lineWidth: 1)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - MLX Service
+
+    private var mlxServiceCard: some View {
+        NexusCard("Local MLX", eyebrow: "Inference") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(model.mlxStatusLabel)
+                            .font(.system(size: 15, weight: .bold, design: .rounded))
+                            .foregroundStyle(NexusPalette.textPrimary)
+                        Text(model.mlxStatusDetail)
+                            .font(.system(size: 12, weight: .medium, design: .rounded))
+                            .foregroundStyle(NexusPalette.textSecondary)
+                    }
+
+                    Spacer()
+
+                    NexusBadge(text: model.mlxStatusBadgeText, tone: model.mlxStatusTone)
+                }
+
+                if let health = model.mlxHealth {
+                    VStack(alignment: .leading, spacing: 8) {
+                        NexusInlineStatusRow(label: "Model", value: health.model, tone: NexusPalette.cyan)
+                        NexusInlineStatusRow(label: "Device", value: health.device, tone: NexusPalette.mint)
+                        NexusInlineStatusRow(label: "Loaded", value: health.loaded ? "Yes" : "No", tone: health.loaded ? NexusPalette.mint : NexusPalette.amber)
+                        NexusInlineStatusRow(label: "Cache", value: health.cacheDir, tone: NexusPalette.steel)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        NexusInlineStatusRow(label: "Endpoint", value: model.mlxEndpointLabel, tone: NexusPalette.steel)
+                        NexusInlineStatusRow(label: "Script", value: model.mlxServeScriptPath, tone: NexusPalette.steel)
                     }
                 }
-                .pickerStyle(.segmented)
-                .onChange(of: model.settings.commandMode) { _ in
-                    model.persistSettings()
-                }
-
-                NexusTextComposer(
-                    text: $model.commandDraft,
-                    placeholder: commandPlaceholder
-                )
 
                 HStack(spacing: 10) {
-                    Button(model.sendButtonLabel) {
-                        model.sendCommand()
+                    Button("Start MLX") {
+                        model.startMLXService()
                     }
                     .buttonStyle(NexusPrimaryButtonStyle())
-                    .disabled(!model.canSendCommand)
+                    .disabled(!model.canStartMLXService)
 
-                    Button("Clear") {
-                        model.clearConversation()
+                    Button("Stop MLX") {
+                        model.stopMLXService()
                     }
-                    .buttonStyle(NexusSecondaryButtonStyle(tone: NexusPalette.steel))
+                    .buttonStyle(NexusSecondaryButtonStyle(tone: NexusPalette.rose))
+                    .disabled(!model.canStopMLXService)
+
+                    Button("Refresh") {
+                        Task { await model.refreshMLXServiceStatus() }
+                    }
+                    .buttonStyle(NexusSecondaryButtonStyle(tone: NexusPalette.amber))
+                }
+
+                if let error = model.mlxLastError, !error.isEmpty {
+                    Text(error)
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(NexusPalette.rose)
                 }
             }
         }
     }
 
-    private var commandPlaceholder: String {
-        switch model.settings.commandMode {
-        case .hub:
-            return "Describe what you want. The Hub will plan and coordinate across nodes."
-        case .local:
-            return "Describe what you want. This Mac will execute using its local tools and API LLM."
-        case .auto:
-            return "Describe what you want. Nexus will try the Hub first, then fall back to this Mac."
-        }
-    }
+    // MARK: - Quick Actions
 
-    private var conversationPreview: some View {
-        NexusCard("Recent Conversation", eyebrow: "Replies") {
-            if model.conversation.isEmpty {
-                Text("Your message flow will appear here. This is now the main entry point; Dashboard and Settings are secondary.")
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundStyle(NexusPalette.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(model.conversation.suffix(6)) { entry in
-                        NexusConversationBubble(entry: entry)
-                    }
-                }
-            }
-        }
-    }
-
-    private var secondaryActions: some View {
-        NexusCard("Secondary Views", eyebrow: "Support Surfaces") {
+    private var quickActions: some View {
+        NexusCard("Quick Actions") {
             VStack(spacing: 10) {
                 HStack(spacing: 10) {
-                    Button("Open Dashboard") { windows.showDashboard(model: model) }
+                    Button("Dashboard") { windows.showDashboard(model: model) }
                         .buttonStyle(NexusSecondaryButtonStyle(tone: NexusPalette.mint))
-                    Button("Open Mesh Trace") { windows.showMeshTrace(model: model) }
+                    Button("Mesh Trace") { windows.showMeshTrace(model: model) }
                         .buttonStyle(NexusSecondaryButtonStyle(tone: NexusPalette.ocean))
+                    Button("Task Log") { windows.showTaskLog(model: model) }
+                        .buttonStyle(NexusSecondaryButtonStyle(tone: NexusPalette.purple))
                 }
                 HStack(spacing: 10) {
                     Button("Settings") { windows.showSettings(model: model) }
@@ -149,7 +221,7 @@ struct MenuBarContentView: View {
                         }
                     }
                     .buttonStyle(NexusSecondaryButtonStyle(tone: NexusPalette.amber))
-                    Button("Restart Engine") {
+                    Button("Restart") {
                         model.restartSidecar()
                     }
                     .buttonStyle(NexusSecondaryButtonStyle(tone: NexusPalette.ocean))
@@ -157,6 +229,8 @@ struct MenuBarContentView: View {
             }
         }
     }
+
+    // MARK: - Approvals
 
     private func approvalsPreview(_ approvals: [PendingApprovalSnapshot]) -> some View {
         NexusCard("Waiting For You", eyebrow: "Approval Queue") {
@@ -202,50 +276,6 @@ struct MenuBarContentView: View {
             Text(error)
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundStyle(NexusPalette.rose)
-        }
-    }
-
-    private var heroStatusCluster: some View {
-        VStack(alignment: .trailing, spacing: 8) {
-            if model.pendingApprovalCount > 0 {
-                NexusBadge(text: "\(model.pendingApprovalCount) approvals", tone: NexusPalette.rose)
-            }
-            if model.snapshot?.transportConnected == true {
-                NexusBadge(text: "Mac node online", tone: NexusPalette.mint)
-            } else {
-                NexusBadge(text: "Mac local only", tone: NexusPalette.amber)
-            }
-            NexusBadge(text: hubBadgeText, tone: hubTone)
-        }
-    }
-
-    private var heroSummary: String {
-        switch model.hubConnectivityState {
-        case .connected:
-            return "Use this panel to talk to Nexus. Ubuntu Hub will plan the task, and this Mac will execute the steps that need local browser, file, screen, or automation access."
-        case .brokerOnly:
-            return "This Mac still has mesh transport, but Ubuntu Hub itself is not fully ready. Local commands can still run here."
-        case .reconnecting:
-            return "This Mac is reconnecting to Ubuntu Hub. Local work can continue, and Hub work will resume when the control plane returns."
-        case .localOnly, .none:
-            return "The local engine is running on this Mac, but Ubuntu Hub is unavailable. This Mac can still do local work and will wait for Hub to come back for shared tasks."
-        }
-    }
-
-    private var hubBadgeText: String {
-        model.hubConnectivityState?.label ?? "Hub unknown"
-    }
-
-    private var hubTone: Color {
-        switch model.hubConnectivityState {
-        case .connected:
-            return NexusPalette.cyan
-        case .brokerOnly:
-            return NexusPalette.amber
-        case .reconnecting:
-            return NexusPalette.ocean
-        case .localOnly, .none:
-            return NexusPalette.steel
         }
     }
 }

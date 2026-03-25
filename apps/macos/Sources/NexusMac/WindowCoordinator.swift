@@ -4,7 +4,9 @@ import SwiftUI
 enum NexusWindowKind {
     case dashboard
     case meshTrace
+    case taskLog
     case settings
+    case workspace
 
     var title: String {
         switch self {
@@ -12,8 +14,12 @@ enum NexusWindowKind {
             return "Nexus"
         case .meshTrace:
             return "Nexus Mesh Trace"
+        case .taskLog:
+            return "Nexus Task Log"
         case .settings:
             return "Nexus Settings"
+        case .workspace:
+            return "Nexus Workspace"
         }
     }
 
@@ -23,8 +29,12 @@ enum NexusWindowKind {
             return "NexusDashboardWindow.v2"
         case .meshTrace:
             return "NexusMeshTraceWindow.v1"
+        case .taskLog:
+            return "NexusTaskLogWindow.v1"
         case .settings:
             return "NexusSettingsWindow.v2"
+        case .workspace:
+            return "NexusWorkspaceWindow.v1"
         }
     }
 
@@ -34,8 +44,12 @@ enum NexusWindowKind {
             return NSSize(width: 860, height: 700)
         case .meshTrace:
             return NSSize(width: 1180, height: 820)
+        case .taskLog:
+            return NSSize(width: 1100, height: 750)
         case .settings:
             return NSSize(width: 960, height: 860)
+        case .workspace:
+            return NSSize(width: 1400, height: 900)
         }
     }
 
@@ -45,8 +59,12 @@ enum NexusWindowKind {
             return NSSize(width: 760, height: 640)
         case .meshTrace:
             return NSSize(width: 980, height: 720)
+        case .taskLog:
+            return NSSize(width: 900, height: 600)
         case .settings:
             return NSSize(width: 900, height: 780)
+        case .workspace:
+            return NSSize(width: 1000, height: 600)
         }
     }
 }
@@ -77,7 +95,9 @@ enum WindowLayoutPlan {
 final class WindowCoordinator: ObservableObject {
     private var dashboardController: NSWindowController?
     private var meshTraceController: NSWindowController?
+    private var taskLogController: NSWindowController?
     private var settingsController: NSWindowController?
+    private var workspaceController: NSWindowController?
 
     func showDashboard(model: AppModel) {
         let kind = NexusWindowKind.dashboard
@@ -105,11 +125,30 @@ final class WindowCoordinator: ObservableObject {
         present(controller, kind: kind)
     }
 
+    func showWorkspace(model: AppModel) {
+        let kind = NexusWindowKind.workspace
+        let controller = workspaceController ?? makeController(kind: kind)
+        controller.contentViewController = NSHostingController(
+            rootView: WorkspaceView()
+                .ignoresSafeArea()
+        )
+        workspaceController = controller
+        present(controller, kind: kind)
+    }
+
     func showMeshTrace(model: AppModel) {
         let kind = NexusWindowKind.meshTrace
         let controller = meshTraceController ?? makeController(kind: kind)
         controller.contentViewController = NSHostingController(rootView: MeshTraceView(model: model))
         meshTraceController = controller
+        present(controller, kind: kind)
+    }
+
+    func showTaskLog(model: AppModel) {
+        let kind = NexusWindowKind.taskLog
+        let controller = taskLogController ?? makeController(kind: kind)
+        controller.contentViewController = NSHostingController(rootView: TaskLogView(model: model))
+        taskLogController = controller
         present(controller, kind: kind)
     }
 

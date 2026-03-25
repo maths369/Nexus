@@ -4,9 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/USER/nexus
+WorkingDirectory=/home/surgery/Workspace/Nexus
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/USER/miniconda3/envs/nexus/bin/python -m nexus serve --host 0.0.0.0 --port 8000
+Environment=HTTP_PROXY=http://127.0.0.1:10809
+Environment=HTTPS_PROXY=http://127.0.0.1:10809
+Environment=NO_PROXY=127.0.0.1,localhost,::1,100.121.67.94,100.87.152.11
+ExecStart=/home/surgery/miniconda3/envs/ai_assist/bin/python -m nexus serve --host 100.121.67.94 --port 18100
 Restart=always
 RestartSec=3
 

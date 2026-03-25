@@ -14,9 +14,11 @@ OpenClaw alignment:
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 import importlib.util
 import logging
+import platform
 import re
 import shutil
 import sys
@@ -50,6 +52,10 @@ class InstallableSkillSpec:
     verify_commands: tuple[str, ...]
     manifest_path: Path
     skill_dir: Path
+    # OpenClaw eligibility — requires block
+    requires_bins: tuple[str, ...] = ()
+    requires_env: tuple[str, ...] = ()
+    requires_os: tuple[str, ...] = ()
 
 
 class SkillManager:
@@ -299,42 +305,132 @@ class SkillManager:
         if self._catalog_dir is None or not self._catalog_dir.exists():
             return []
         specs: list[InstallableSkillSpec] = []
-        for manifest_path in sorted(self._catalog_dir.glob("*/skill.yaml")):
+        for skill_md_path in sorted(self._catalog_dir.glob("*/SKILL.md")):
             try:
-                specs.append(self._load_installable_manifest(manifest_path))
+                specs.append(self._load_installable_manifest(skill_md_path))
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("failed to load installable skill manifest %s: %s", manifest_path, exc)
+                logger.warning("failed to load installable skill %s: %s", skill_md_path, exc)
         return specs
 
     def _get_installable_spec(self, skill_id: str) -> InstallableSkillSpec | None:
         if self._catalog_dir is None:
             return None
-        manifest_path = self._catalog_dir / skill_id / "skill.yaml"
-        if not manifest_path.exists():
+        skill_md_path = self._catalog_dir / skill_id / "SKILL.md"
+        if not skill_md_path.exists():
             return None
-        return self._load_installable_manifest(manifest_path)
+        return self._load_installable_manifest(skill_md_path)
 
-    def _load_installable_manifest(self, manifest_path: Path) -> InstallableSkillSpec:
-        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-        skill_id = str(data.get("id") or manifest_path.parent.name).strip()
-        tags = tuple(str(item).strip() for item in data.get("tags", []) or [] if str(item).strip())
-        keywords = tuple(str(item).strip().lower() for item in data.get("keywords", []) or [] if str(item).strip())
-        packages = tuple(str(item).strip() for item in data.get("packages", []) or [] if str(item).strip())
-        install_commands = tuple(str(item).strip() for item in data.get("install_commands", []) or [] if str(item).strip())
-        verify_imports = tuple(str(item).strip() for item in data.get("verify_imports", []) or [] if str(item).strip())
-        verify_commands = tuple(str(item).strip() for item in data.get("verify_commands", []) or [] if str(item).strip())
+    def _load_installable_manifest(self, skill_md_path: Path) -> InstallableSkillSpec:
+        """从 SKILL.md frontmatter 加载可安装技能元数据。
+
+        支持两种格式：
+        1. OpenClaw 格式 — metadata.openclaw 块（可直接从 OpenClaw 导入）
+        2. Nexus 原生格式 — 顶层 packages/verify_imports 等字段
+        """
+        text = skill_md_path.read_text(encoding="utf-8")
+        data, _ = self._parse_frontmatter(text)
+        skill_id = str(data.get("id") or skill_md_path.parent.name).strip()
+
+        def _to_str_tuple(val: Any) -> tuple[str, ...]:
+            if isinstance(val, list):
+                return tuple(str(item).strip() for item in val if str(item).strip())
+            if isinstance(val, str) and val.strip():
+                return tuple(item.strip() for item in val.split(",") if item.strip())
+            return ()
+
+        # 检测 OpenClaw 格式：metadata.openclaw 块
+        metadata_raw = data.get("metadata")
+        openclaw: dict[str, Any] | None = None
+        if isinstance(metadata_raw, dict):
+            openclaw = metadata_raw.get("openclaw")
+        elif isinstance(metadata_raw, str):
+            # metadata 可能是 JSON 字符串（OpenClaw 的某些变体）
+            try:
+                import json
+                parsed = json.loads(metadata_raw)
+                if isinstance(parsed, dict):
+                    openclaw = parsed.get("openclaw")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if isinstance(openclaw, dict):
+            # --- OpenClaw 格式 ---
+            oc_tags = _to_str_tuple(openclaw.get("tags"))
+            oc_requires = openclaw.get("requires") or {}
+            oc_install = openclaw.get("install") or []
+
+            # 从 install 列表提取 packages 和 install_commands
+            packages: list[str] = []
+            install_commands: list[str] = []
+            verify_bins: list[str] = []
+
+            # 提取 eligibility 字段
+            requires_bins: tuple[str, ...] = ()
+            requires_env: tuple[str, ...] = ()
+            requires_os: tuple[str, ...] = ()
+
+            if isinstance(oc_requires, dict):
+                verify_bins.extend(_to_str_tuple(oc_requires.get("bins")))
+                requires_bins = _to_str_tuple(oc_requires.get("bins"))
+                requires_env = _to_str_tuple(oc_requires.get("env"))
+                requires_os = _to_str_tuple(oc_requires.get("os"))
+
+            for spec in (oc_install if isinstance(oc_install, list) else []):
+                if not isinstance(spec, dict):
+                    continue
+                kind = str(spec.get("kind") or spec.get("type") or "").strip().lower()
+                if kind == "uv" and spec.get("package"):
+                    packages.append(str(spec["package"]).strip())
+                elif kind == "brew" and spec.get("formula"):
+                    install_commands.append(f"brew install {spec['formula']}")
+                elif kind == "node" and spec.get("package"):
+                    install_commands.append(f"npm install -g {spec['package']}")
+                elif kind == "go" and spec.get("module"):
+                    install_commands.append(f"go install {spec['module']}")
+
+            # verify_commands：用 which 检测 bins
+            verify_commands = [f"which {b}" for b in verify_bins]
+
+            # 合并顶层 tags 和 openclaw tags 作为 keywords
+            top_tags = _to_str_tuple(data.get("tags"))
+            all_tags = oc_tags or top_tags
+
+            return InstallableSkillSpec(
+                skill_id=skill_id,
+                name=str(data.get("name") or skill_id).strip(),
+                description=str(data.get("description") or "").strip(),
+                tags=all_tags,
+                keywords=tuple(s.lower() for s in all_tags),
+                packages=tuple(packages),
+                install_commands=tuple(install_commands),
+                verify_imports=(),
+                verify_commands=tuple(verify_commands),
+                manifest_path=skill_md_path,
+                skill_dir=skill_md_path.parent,
+                requires_bins=requires_bins,
+                requires_env=requires_env,
+                requires_os=requires_os,
+            )
+
+        # --- Nexus 原生格式 ---
+        tags = _to_str_tuple(data.get("tags"))
+        keywords = tuple(s.lower() for s in _to_str_tuple(data.get("keywords")))
+        packages_t = _to_str_tuple(data.get("packages"))
+        install_cmds = _to_str_tuple(data.get("install_commands"))
+        verify_imports = _to_str_tuple(data.get("verify_imports"))
+        verify_cmds = _to_str_tuple(data.get("verify_commands"))
         return InstallableSkillSpec(
             skill_id=skill_id,
             name=str(data.get("name") or skill_id).strip(),
             description=str(data.get("description") or "").strip(),
             tags=tags,
-            keywords=keywords,
-            packages=packages,
-            install_commands=install_commands,
+            keywords=keywords or tuple(s.lower() for s in tags),
+            packages=packages_t,
+            install_commands=install_cmds,
             verify_imports=verify_imports,
-            verify_commands=verify_commands,
-            manifest_path=manifest_path,
-            skill_dir=manifest_path.parent,
+            verify_commands=verify_cmds,
+            manifest_path=skill_md_path,
+            skill_dir=skill_md_path.parent,
         )
 
     def _score_installable(self, spec: InstallableSkillSpec, query: str) -> float:
@@ -375,13 +471,7 @@ class SkillManager:
                 message="" if skill_md.exists() else "Installable skill bundle must contain SKILL.md",
             )
         )
-        checks.append(
-            CheckResult(
-                name="manifest",
-                passed=(skill_dir / "skill.yaml").exists(),
-                message="" if (skill_dir / "skill.yaml").exists() else "Installable skill bundle must contain skill.yaml",
-            )
-        )
+        # skill.yaml 已废弃，元数据统一在 SKILL.md frontmatter 中
         if skill_md.exists():
             meta, body = self._parse_frontmatter(skill_md.read_text(encoding="utf-8"))
             checks.append(
@@ -430,12 +520,16 @@ class SkillManager:
 
     async def _install_bundle_dependencies(self, spec: InstallableSkillSpec, *, actor: str) -> dict[str, Any]:
         if spec.packages:
+            # 优先使用 uv（对标 OpenClaw），回退到 pip
+            if shutil.which("uv"):
+                cmd = ["uv", "pip", "install", *spec.packages]
+                installer = "uv"
+            else:
+                cmd = [self._python, "-m", "pip", "install", *spec.packages]
+                installer = "pip"
+
             proc = await asyncio.create_subprocess_exec(
-                self._python,
-                "-m",
-                "pip",
-                "install",
-                *spec.packages,
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -446,11 +540,11 @@ class SkillManager:
                     action="skill_install_failed",
                     target=spec.skill_id,
                     actor=actor,
-                    details={"phase": "pip_install", "packages": list(spec.packages), "returncode": proc.returncode},
+                    details={"phase": f"{installer}_install", "packages": list(spec.packages), "returncode": proc.returncode},
                     success=False,
                     error=reason,
                 )
-                return {"success": False, "reason": reason or f"pip install failed ({proc.returncode})"}
+                return {"success": False, "reason": reason or f"{installer} install failed ({proc.returncode})"}
 
         if spec.install_commands:
             if self._system_runner is None:
@@ -642,6 +736,12 @@ class SkillManager:
         description: str,
         body: str,
         tags: str = "",
+        *,
+        keywords: list[str] | None = None,
+        packages: list[str] | None = None,
+        verify_imports: list[str] | None = None,
+        verify_commands: list[str] | None = None,
+        install_commands: list[str] | None = None,
     ) -> ChangeResult:
         if not _SKILL_ID_RE.match(skill_id):
             return ChangeResult(
@@ -656,10 +756,21 @@ class SkillManager:
         if skill_dir.exists():
             return ChangeResult(success=False, reason=f"Skill '{skill_id}' 已存在。如需更新请使用 update_skill。")
 
-        frontmatter = f"---\nname: {name}\ndescription: {description}\n"
+        fm: dict[str, Any] = {"name": name, "description": description}
         if tags:
-            frontmatter += f"tags: {tags}\n"
-        frontmatter += "---\n"
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+            fm["tags"] = tag_list if len(tag_list) > 1 else tags
+        if keywords:
+            fm["keywords"] = keywords
+        if packages:
+            fm["packages"] = packages
+        if verify_imports:
+            fm["verify_imports"] = verify_imports
+        if verify_commands:
+            fm["verify_commands"] = verify_commands
+        if install_commands:
+            fm["install_commands"] = install_commands
+        frontmatter = "---\n" + yaml.dump(fm, allow_unicode=True, default_flow_style=False, sort_keys=False).rstrip() + "\n---\n"
         skill_md_content = frontmatter + "\n" + body.strip() + "\n"
 
         try:
@@ -706,19 +817,23 @@ class SkillManager:
 
         old_text = skill_md.read_text(encoding="utf-8")
         old_meta, old_body = self._parse_frontmatter(old_text)
-        new_name = old_meta.get("name", skill_id)
-        new_desc = description if description is not None else old_meta.get("description", "")
-        new_tags = tags if tags is not None else old_meta.get("tags", "")
         new_body = body if body is not None else old_body
+
+        # 保留旧 frontmatter 中的所有字段，仅覆盖指定字段
+        fm: dict[str, Any] = dict(old_meta)
+        if description is not None:
+            fm["description"] = description
+        if tags is not None:
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+            fm["tags"] = tag_list if len(tag_list) > 1 else tags
+        if not fm.get("name"):
+            fm["name"] = skill_id
 
         backup_id = str(uuid.uuid4())[:8]
         backup_path = skill_dir / f"SKILL.md.bak.{backup_id}"
         backup_path.write_text(old_text, encoding="utf-8")
 
-        frontmatter = f"---\nname: {new_name}\ndescription: {new_desc}\n"
-        if new_tags:
-            frontmatter += f"tags: {new_tags}\n"
-        frontmatter += "---\n"
+        frontmatter = "---\n" + yaml.dump(fm, allow_unicode=True, default_flow_style=False, sort_keys=False).rstrip() + "\n---\n"
         skill_md.write_text(frontmatter + "\n" + new_body.strip() + "\n", encoding="utf-8")
 
         self._audit.record(
@@ -777,6 +892,155 @@ class SkillManager:
         return f"<skill name=\"{skill_id}\">\n{body}\n</skill>"
 
     # ------------------------------------------------------------------
+    # OpenClaw eligibility (Step 5)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def check_eligibility(spec: InstallableSkillSpec) -> tuple[bool, list[str]]:
+        """检查 skill 是否满足当前环境的运行条件。
+
+        返回 (eligible, reasons)。eligible=False 时 reasons 列出不满足的条件。
+        对标 OpenClaw：检查 requires.bins / requires.env / requires.os。
+        """
+        reasons: list[str] = []
+
+        # requires.os — 检查操作系统
+        if spec.requires_os:
+            current_os = platform.system().lower()  # "darwin", "linux", "windows"
+            os_aliases = {
+                "macos": "darwin", "mac": "darwin", "osx": "darwin",
+                "linux": "linux", "windows": "windows", "win": "windows",
+            }
+            normalized = {os_aliases.get(o.lower(), o.lower()) for o in spec.requires_os}
+            if current_os not in normalized:
+                reasons.append(f"需要 OS: {', '.join(spec.requires_os)}，当前: {platform.system()}")
+
+        # requires.bins — 检查可执行文件
+        for bin_name in spec.requires_bins:
+            if shutil.which(bin_name) is None:
+                reasons.append(f"缺少命令: {bin_name}")
+
+        # requires.env — 检查环境变量
+        for env_name in spec.requires_env:
+            if not os.environ.get(env_name):
+                reasons.append(f"缺少环境变量: {env_name}")
+
+        return (len(reasons) == 0, reasons)
+
+    def check_installed_skill_eligibility(self, skill_id: str) -> tuple[bool, list[str]]:
+        """检查已安装 skill 的 eligibility。解析 SKILL.md frontmatter 中的 requires。"""
+        skill_md = self._skills_dir / skill_id / "SKILL.md"
+        if not skill_md.exists():
+            return (True, [])  # 没有 SKILL.md 的 skill 默认 eligible
+        text = skill_md.read_text(encoding="utf-8")
+        meta, _ = self._parse_frontmatter(text)
+
+        def _to_str_tuple(val: Any) -> tuple[str, ...]:
+            if isinstance(val, list):
+                return tuple(str(item).strip() for item in val if str(item).strip())
+            if isinstance(val, str) and val.strip():
+                return tuple(item.strip() for item in val.split(",") if item.strip())
+            return ()
+
+        # 从 metadata.openclaw.requires 或顶层 requires 提取
+        requires: dict[str, Any] = {}
+        metadata_raw = meta.get("metadata")
+        if isinstance(metadata_raw, dict):
+            openclaw = metadata_raw.get("openclaw")
+            if isinstance(openclaw, dict):
+                requires = openclaw.get("requires") or {}
+        if not requires and isinstance(meta.get("requires"), dict):
+            requires = meta["requires"]
+
+        if not requires:
+            return (True, [])
+
+        dummy_spec = InstallableSkillSpec(
+            skill_id=skill_id, name="", description="", tags=(), keywords=(),
+            packages=(), install_commands=(), verify_imports=(), verify_commands=(),
+            manifest_path=skill_md, skill_dir=skill_md.parent,
+            requires_bins=_to_str_tuple(requires.get("bins")),
+            requires_env=_to_str_tuple(requires.get("env")),
+            requires_os=_to_str_tuple(requires.get("os")),
+        )
+        return self.check_eligibility(dummy_spec)
+
+    # ------------------------------------------------------------------
+    # OpenClaw prompt injection (Step 7)
+    # ------------------------------------------------------------------
+
+    # 对标 OpenClaw：所有 eligible skill 注入 system prompt，LLM 自行决定使用
+    MAX_SKILLS_IN_PROMPT = 150
+    MAX_PROMPT_CHARS = 30_000
+    MAX_SKILL_FILE_SIZE = 256 * 1024  # 256KB
+
+    def format_skills_for_prompt(self) -> str:
+        """将所有 eligible 的已安装 skill 内容注入到 system prompt 中。
+
+        对标 OpenClaw：
+        - 所有 eligible skills 全部注入，LLM 决定使用哪些
+        - 上限 150 个 skill 或 30,000 字符
+        - 单个 SKILL.md > 256KB 的跳过
+        """
+        skills = self.list_skills()
+        if not skills:
+            return ""
+
+        sections: list[str] = []
+        total_chars = 0
+        skill_count = 0
+
+        for skill_info in skills:
+            if skill_count >= self.MAX_SKILLS_IN_PROMPT:
+                break
+
+            skill_id = skill_info["skill_id"]
+
+            # eligibility 检查
+            eligible, reasons = self.check_installed_skill_eligibility(skill_id)
+            if not eligible:
+                logger.debug("Skill %s 不符合 eligibility: %s", skill_id, reasons)
+                continue
+
+            # 读取 SKILL.md 内容
+            skill_md = self._skills_dir / skill_id / "SKILL.md"
+            if not skill_md.exists():
+                continue
+
+            try:
+                file_size = skill_md.stat().st_size
+                if file_size > self.MAX_SKILL_FILE_SIZE:
+                    logger.debug("Skill %s 文件过大 (%d bytes)，跳过", skill_id, file_size)
+                    continue
+                text = skill_md.read_text(encoding="utf-8")
+            except Exception:
+                logger.warning("读取 skill %s 失败", skill_id, exc_info=True)
+                continue
+
+            _, body = self._parse_frontmatter(text)
+            if not body.strip():
+                continue
+
+            section = f"<skill name=\"{skill_id}\">\n{body.strip()}\n</skill>"
+
+            if total_chars + len(section) > self.MAX_PROMPT_CHARS:
+                break
+
+            sections.append(section)
+            total_chars += len(section)
+            skill_count += 1
+
+        if not sections:
+            return ""
+
+        header = (
+            "# 已安装的 Skills\n\n"
+            "以下是你可以使用的技能指令。根据用户的任务，选择合适的 skill 来指导你的执行。\n"
+            "你不需要全部使用——根据任务需求选择最相关的。\n\n"
+        )
+        return header + "\n\n".join(sections)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -822,26 +1086,16 @@ class SkillManager:
         skill_md = skill_path / "SKILL.md"
         if skill_md.exists():
             text = skill_md.read_text(encoding="utf-8")
-            meta, _ = self._parse_frontmatter(text)
+            raw_meta, _ = self._parse_frontmatter(text)
+            meta: dict[str, str] = {}
+            for key, val in raw_meta.items():
+                if isinstance(val, list):
+                    meta[key] = ", ".join(str(item) for item in val if str(item).strip())
+                else:
+                    meta[key] = str(val) if val is not None else ""
             if not meta.get("name"):
                 meta["name"] = skill_path.name
-            if (skill_path / "skill.yaml").exists():
-                try:
-                    yaml_meta = yaml.safe_load((skill_path / "skill.yaml").read_text(encoding="utf-8")) or {}
-                    meta.setdefault("install_source", str(yaml_meta.get("install_source") or ""))
-                except Exception:
-                    pass
             return meta
-
-        skill_yaml = skill_path / "skill.yaml"
-        if skill_yaml.exists():
-            data = yaml.safe_load(skill_yaml.read_text(encoding="utf-8")) or {}
-            return {
-                "name": str(data.get("name", skill_path.name)),
-                "description": str(data.get("description", "")),
-                "tags": ", ".join(str(item) for item in data.get("tags", []) or [] if str(item).strip()),
-                "install_source": str(data.get("install_source") or ""),
-            }
 
         skill_json = skill_path / "skill.json"
         if skill_json.exists():
@@ -858,14 +1112,21 @@ class SkillManager:
         return {"name": skill_path.name}
 
     @staticmethod
-    def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
         match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
         if not match:
             return {}, text
 
-        meta: dict[str, str] = {}
-        for line in match.group(1).strip().splitlines():
-            if ":" in line:
-                key, val = line.split(":", 1)
-                meta[key.strip()] = val.strip()
+        raw = match.group(1).strip()
+        try:
+            meta = yaml.safe_load(raw) or {}
+        except yaml.YAMLError:
+            # 降级：手工解析
+            meta = {}
+            for line in raw.splitlines():
+                if ":" in line:
+                    key, val = line.split(":", 1)
+                    meta[key.strip()] = val.strip()
+        if not isinstance(meta, dict):
+            meta = {}
         return meta, match.group(2).strip()

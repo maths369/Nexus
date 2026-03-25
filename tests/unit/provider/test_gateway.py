@@ -152,6 +152,19 @@ class _AlwaysUsageLimitedChatCompletions:
         raise RuntimeError("usage limitation reached for current tenant")
 
 
+class _AlwaysHardQuotaChatCompletions:
+    def __init__(self):
+        self.calls = 0
+
+    async def create(self, **kwargs):
+        self.calls += 1
+        raise RuntimeError(
+            "Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing details. "
+            "Quota exceeded for metric: generativelanguage.googleapis.com/generatecontentfreetierrequests, limit: 0, model: gemini-2.5-pro', "
+            "'status': 'RESOURCEEXHAUSTED'}}"
+        )
+
+
 def test_gateway_falls_back_to_next_provider_when_primary_is_unhealthy():
     gateway = ProviderGateway(
         primary=ProviderConfig(name="primary", model="qwen-max", max_retries=0),
@@ -194,6 +207,27 @@ def test_gateway_falls_back_when_primary_hits_usage_limitation():
     result = asyncio.run(gateway.chat_completion(messages=[{"role": "user", "content": "ping"}]))
 
     assert result["provider"] == "qwen"
+
+
+def test_gateway_does_not_retry_hard_quota_and_falls_back_immediately():
+    hard_quota = _AlwaysHardQuotaChatCompletions()
+
+    def _factory(cfg: ProviderConfig):
+        if cfg.name == "gemini-2.5-pro":
+            return _FakeClient(completions=hard_quota)
+        return _FakeClient()
+
+    gateway = ProviderGateway(
+        primary=ProviderConfig(name="gemini-2.5-pro", model="gemini-2.5-pro", max_retries=2),
+        fallbacks=[ProviderConfig(name="qwen", model="qwen-plus", max_retries=0)],
+        client_factory=_factory,
+    )
+
+    result = asyncio.run(gateway.chat_completion(messages=[{"role": "user", "content": "ping"}]))
+
+    assert hard_quota.calls == 1
+    assert result["provider"] == "qwen"
+    assert result["model"] == "qwen-plus"
 
 
 def test_gateway_temporarily_deprioritizes_recently_unhealthy_provider():

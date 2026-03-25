@@ -18,7 +18,10 @@ from typing import Any
 
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from nexus.agent.tools_policy import ToolsPolicy
@@ -104,6 +107,65 @@ class SidecarEvent:
         }
 
 
+@dataclass
+class TaskLogEntry:
+    """Structured task log entry for the Task Log window."""
+    task_id: str
+    timestamp: float
+    phase: str               # received | planned | dispatched | executing | tool_call | tool_result | completed | failed
+    source: str              # feishu | desktop | hub | local
+    node: str                # which node (hub, macbook-pro-yanglei, etc.)
+    message: str             # human-readable description
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "timestamp": self.timestamp,
+            "phase": self.phase,
+            "source": self.source,
+            "node": self.node,
+            "message": self.message,
+            "details": self.details,
+        }
+
+
+class TaskLog:
+    """In-memory task log with deque for recent entries."""
+    def __init__(self, maxlen: int = 500) -> None:
+        self._entries: deque[TaskLogEntry] = deque(maxlen=maxlen)
+
+    def append(
+        self,
+        task_id: str,
+        phase: str,
+        source: str,
+        node: str,
+        message: str,
+        **details: Any,
+    ) -> TaskLogEntry:
+        entry = TaskLogEntry(
+            task_id=task_id,
+            timestamp=time.time(),
+            phase=phase,
+            source=source,
+            node=node,
+            message=message,
+            details=details,
+        )
+        self._entries.appendleft(entry)
+        return entry
+
+    def recent(self, limit: int = 100) -> list[dict[str, Any]]:
+        return [e.to_dict() for e in list(self._entries)[:limit]]
+
+    def by_task(self, task_id: str) -> list[dict[str, Any]]:
+        return [e.to_dict() for e in self._entries if e.task_id == task_id]
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
 @dataclass(slots=True)
 class PendingApproval:
     approval_id: str
@@ -143,23 +205,54 @@ class ApprovalActionRequest(BaseModel):
 class LocalCommandRequest(BaseModel):
     task: str
     system_prompt: str | None = None
+    provider_name: str | None = None  # e.g. "minimax", "kimi", "mlx-local-api"
+
+
+class EditorCompleteRequest(BaseModel):
+    context_before: str = ""
+    context_after: str = ""
+    doc_path: str = ""
+    max_tokens: int = 200
+    language_hint: str = "auto"
+
+
+class EditorTransformRequest(BaseModel):
+    action: str  # translate | polish | expand | condense | rewrite
+    selected_text: str
+    context_before: str = ""
+    context_after: str = ""
+    doc_path: str = ""
+    target_language: str = ""  # zh | en (for translate)
 
 
 def _provider_configs_from_node_card(card: NodeCard) -> list[dict[str, Any]]:
     """Extract provider connection details from a NodeCard's ProviderSpec list."""
     configs: list[dict[str, Any]] = []
     for provider in card.providers:
-        if provider.via != "api":
+        if provider.via not in ("api", "local"):
             continue
         props = dict(provider.properties or {})
-        configs.append({
-            "name": provider.name,
-            "model": provider.model,
-            "provider": props.get("provider_type", provider.name),
-            "base_url": props.get("base_url", ""),
-            "api_key": props.get("api_key", ""),
-            "api_key_env": props.get("api_key_env", ""),
-        })
+        if provider.via == "local":
+            # Local providers are exposed through an OpenAI-compatible endpoint.
+            # Default to the lightweight MLX local API, while still allowing older
+            # Ollama-style node cards to override the URL explicitly.
+            configs.append({
+                "name": provider.name,
+                "model": provider.model,
+                "provider": props.get("provider_type", "openai-compatible"),
+                "base_url": props.get("base_url", "http://localhost:8008/v1"),
+                "api_key": props.get("api_key", "mlx-local-api"),
+                "api_key_env": props.get("api_key_env", ""),
+            })
+        else:
+            configs.append({
+                "name": provider.name,
+                "model": provider.model,
+                "provider": props.get("provider_type", provider.name),
+                "base_url": props.get("base_url", ""),
+                "api_key": props.get("api_key", ""),
+                "api_key_env": props.get("api_key_env", ""),
+            })
     return configs
 
 
@@ -188,6 +281,7 @@ class SidecarState:
     last_error: str | None = None
     recent_events: deque[SidecarEvent] = field(default_factory=lambda: deque(maxlen=50))
     pending_approvals: dict[str, PendingApproval] = field(default_factory=dict)
+    task_log: TaskLog = field(default_factory=TaskLog)
 
     def set_phase(self, phase: str, *, error: str | None = None) -> None:
         self.phase = phase
@@ -419,6 +513,17 @@ class ObservableEdgeNodeAgent(EdgeNodeAgent):
             tool_name=assignment.tool_name,
             error=error,
         )
+        # Task Log
+        self._sidecar_state.task_log.append(
+            task_id=assignment.task_id,
+            phase="executing" if state == TaskStepState.RUNNING else state.value,
+            source="mqtt",
+            node=self._node_card.node_id if self._node_card else "unknown",
+            message=f"状态变更: {state.value}",
+            step_id=assignment.step_id,
+            tool_name=assignment.tool_name,
+            error=error,
+        )
 
     async def _publish_task_result(self, assignment: TaskAssignment, result: ToolResult) -> None:
         await super()._publish_task_result(assignment, result)
@@ -434,6 +539,17 @@ class ObservableEdgeNodeAgent(EdgeNodeAgent):
             error=result.error,
             duration_ms=result.duration_ms,
         )
+        # Task Log
+        self._sidecar_state.task_log.append(
+            task_id=assignment.task_id,
+            phase="completed" if result.success else "failed",
+            source="mqtt",
+            node=self._node_card.node_id if self._node_card else "unknown",
+            message=f"{'✅ 完成' if result.success else '❌ 失败'}: {assignment.tool_name}",
+            output_preview=result.output[:300] if result.output else "",
+            error=result.error,
+            duration_ms=result.duration_ms,
+        )
 
     async def _execute_agent_loop(self, assignment: TaskAssignment) -> None:
         self._sidecar_state.add_event(
@@ -442,9 +558,39 @@ class ObservableEdgeNodeAgent(EdgeNodeAgent):
             task_id=assignment.task_id,
             step_id=assignment.step_id,
         )
+        # Task Log — record task received from Hub
+        task_desc = str(assignment.metadata.get("task_description") or assignment.tool_name)
+        self._sidecar_state.task_log.append(
+            task_id=assignment.task_id,
+            phase="received",
+            source="hub",
+            node=self._node_card.node_id if self._node_card else "unknown",
+            message=f"📥 收到任务: {task_desc[:200]}",
+            step_id=assignment.step_id,
+            tool_name=assignment.tool_name,
+        )
         if self._delegated_executor is not None:
             await self._publish_task_status(assignment, TaskStepState.RUNNING)
             self._active_executions += 1
+
+            # Background heartbeat: send periodic progress so Hub knows we're alive
+            heartbeat_done = asyncio.Event()
+
+            async def _heartbeat():
+                elapsed = 0
+                while not heartbeat_done.is_set():
+                    await asyncio.sleep(15.0)
+                    if heartbeat_done.is_set():
+                        break
+                    elapsed += 15
+                    try:
+                        await self._publish_task_status(assignment, TaskStepState.RUNNING)
+                        logger.debug("Task %s heartbeat (elapsed=%ds)", assignment.task_id, elapsed)
+                    except Exception:
+                        pass
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
+
             try:
                 task_description = str(assignment.metadata.get("task_description") or assignment.tool_name)
                 constraints = dict(assignment.metadata.get("constraints") or {})
@@ -469,6 +615,12 @@ class ObservableEdgeNodeAgent(EdgeNodeAgent):
                     error=str(exc),
                 )
             finally:
+                heartbeat_done.set()
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
                 self._active_executions = max(0, self._active_executions - 1)
 
             await self._publish_task_status(
@@ -508,14 +660,120 @@ class ObservableEdgeNodeAgent(EdgeNodeAgent):
         )
 
 
+async def _check_sidecar_permissions() -> list[dict[str, Any]]:
+    """Check macOS permissions for this Python sidecar process.
+
+    This is the process that actually runs AppleScript, screen capture, etc.
+    The Swift app should call this endpoint to get the real permission status
+    instead of checking its own process (which is a different executable).
+    """
+    import platform
+    if platform.system() != "Darwin":
+        return []
+
+    checks: list[dict[str, Any]] = []
+
+    # 1. Accessibility — run a harmless AX check via osascript
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "-c",
+            "import ctypes; lib = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices'); "
+            "print(lib.AXIsProcessTrusted())",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        ax_trusted = stdout.decode().strip() == "1"
+        checks.append({
+            "id": "accessibility",
+            "title": "Accessibility",
+            "state": "granted" if ax_trusted else "needsPrompt",
+            "detail": "Sidecar process has Accessibility access." if ax_trusted
+                else "Sidecar process needs Accessibility permission.",
+        })
+    except Exception as exc:
+        checks.append({
+            "id": "accessibility",
+            "title": "Accessibility",
+            "state": "unavailable",
+            "detail": f"Could not check: {exc}",
+        })
+
+    # 2. Screen Recording — try a minimal screen capture
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "-c",
+            "import ctypes; cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics'); "
+            "print(cg.CGPreflightScreenCaptureAccess())",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        sc_granted = stdout.decode().strip() == "1"
+        checks.append({
+            "id": "screen_recording",
+            "title": "Screen Recording",
+            "state": "granted" if sc_granted else "needsPrompt",
+            "detail": "Sidecar process has Screen Recording access." if sc_granted
+                else "Sidecar process needs Screen Recording permission.",
+        })
+    except Exception as exc:
+        checks.append({
+            "id": "screen_recording",
+            "title": "Screen Recording",
+            "state": "unavailable",
+            "detail": f"Could not check: {exc}",
+        })
+
+    # 3. Automation — test AppleScript for common targets
+    for app_name, bundle_id in [("System Events", "com.apple.systemevents"), ("Google Chrome", "com.google.Chrome")]:
+        try:
+            # Simple AppleScript that returns immediately if permission is granted
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", f'tell application "System Events" to return name of first process whose bundle identifier is "{bundle_id}"',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+            stderr_text = stderr.decode().strip()
+            if proc.returncode == 0:
+                state = "granted"
+                detail = f"Sidecar can send Apple Events to {app_name}."
+            elif "not allowed" in stderr_text.lower() or "not permitted" in stderr_text.lower():
+                state = "denied"
+                detail = f"Sidecar denied Apple Events to {app_name}."
+            else:
+                state = "needsPrompt"
+                detail = f"Sidecar needs Automation permission for {app_name}."
+        except asyncio.TimeoutError:
+            state = "needsPrompt"
+            detail = f"Permission check timed out — likely waiting for user prompt for {app_name}."
+        except Exception as exc:
+            state = "unavailable"
+            detail = f"Could not check: {exc}"
+
+        checks.append({
+            "id": f"automation.{app_name.lower().replace(' ', '_')}",
+            "title": f"Automation · {app_name}",
+            "state": state,
+            "detail": detail,
+        })
+
+    return checks
+
+
 def _clone_node_card(card: NodeCard) -> NodeCard:
     return NodeCard.from_dict(card.to_dict())
 
 
 def _reconcile_node_card(card: NodeCard, tools: list[ToolDefinition], state: SidecarState) -> NodeCard:
     supported = {tool.name for tool in tools}
+    tools_by_name = {tool.name: tool for tool in tools}
     adjusted = _clone_node_card(card)
     kept_capabilities = []
+
+    # Track which tools are covered by existing capabilities
+    covered_tools: set[str] = set()
 
     for capability in adjusted.capabilities:
         original = list(capability.tools)
@@ -530,11 +788,55 @@ def _reconcile_node_card(card: NodeCard, tools: list[ToolDefinition], state: Sid
             )
         if capability.tools:
             kept_capabilities.append(capability)
+            covered_tools.update(capability.tools)
         else:
             state.add_event(
                 "capability",
                 f"Dropped empty capability {capability.capability_id}",
                 level="warning",
+            )
+
+    # Auto-discover: tools that exist but aren't covered by any capability
+    # Group uncovered tools by tag prefix to create capability entries
+    uncovered = supported - covered_tools
+    if uncovered:
+        # Group by first tag or tool name prefix
+        groups: dict[str, list[str]] = {}
+        for tool_name in sorted(uncovered):
+            tool_def = tools_by_name.get(tool_name)
+            tags = list(tool_def.tags) if tool_def and tool_def.tags else []
+            # Use first meaningful tag as group key, or "general"
+            group_key = "general"
+            for tag in tags:
+                if tag not in ("edge", "local", "mesh"):
+                    group_key = tag
+                    break
+            if group_key == "general":
+                # Try prefix-based grouping: "chrome_navigate" → "chrome"
+                prefix = tool_name.split("_")[0] if "_" in tool_name else "general"
+                group_key = prefix
+            groups.setdefault(group_key, []).append(tool_name)
+
+        from nexus.mesh.node_card import CapabilitySpec
+
+        for group_key, tool_names in groups.items():
+            cap_id = f"auto_{group_key}"
+            descriptions = []
+            for tn in tool_names:
+                td = tools_by_name.get(tn)
+                if td and td.description:
+                    descriptions.append(f"{tn}: {td.description[:80]}")
+            desc = f"自动发现的工具组 ({group_key}): " + "; ".join(descriptions[:5])
+            kept_capabilities.append(CapabilitySpec(
+                capability_id=cap_id,
+                description=desc,
+                tools=tool_names,
+            ))
+            state.add_event(
+                "capability",
+                f"Auto-discovered capability {cap_id} with {len(tool_names)} tools",
+                level="info",
+                tools=tool_names,
             )
 
     adjusted.capabilities = kept_capabilities
@@ -700,7 +1002,8 @@ class MacOSSidecarRuntime:
         self._state.node_card = reconciled.to_dict()
 
         # --- Edge Agent Runtime (local LLM-driven execution) ---
-        journal_dir = settings.root_dir / "data" / "edge_journal"
+        data_root = Path(os.environ.get("NEXUS_DATA_ROOT", "")) if os.environ.get("NEXUS_DATA_ROOT") else settings.root_dir / "data"
+        journal_dir = data_root / "edge_journal"
         self._journal = TaskJournal(journal_dir=journal_dir)
         provider_configs = _provider_configs_from_node_card(reconciled)
         self._edge_provider = build_edge_provider(provider_configs)
@@ -758,6 +1061,10 @@ class MacOSSidecarRuntime:
     @property
     def edge_runtime(self) -> EdgeAgentRuntime | None:
         return self._edge_runtime
+
+    @property
+    def edge_provider(self) -> "ProviderGateway | None":
+        return self._edge_provider
 
     @property
     def journal(self) -> TaskJournal:
@@ -948,7 +1255,13 @@ class MacOSSidecarRuntime:
             tags=list(tool.tags),
         )
 
-    async def execute_local_command(self, task: str, *, system_prompt: str | None = None) -> LocalRunResult:
+    async def execute_local_command(
+        self,
+        task: str,
+        *,
+        system_prompt: str | None = None,
+        provider_name: str | None = None,
+    ) -> LocalRunResult:
         fast_path = await self._maybe_execute_local_fast_path(task)
         if fast_path is not None:
             return fast_path
@@ -957,6 +1270,7 @@ class MacOSSidecarRuntime:
         return await self._edge_runtime.run_local(
             task,
             system_prompt=system_prompt,
+            provider_name=provider_name,
         )
 
     async def execute_delegated_command(
@@ -974,6 +1288,14 @@ class MacOSSidecarRuntime:
             constraints=constraints if constraints else None,
         )
 
+    # Keywords indicating the task requires page interaction, not just opening a URL.
+    _INTERACTION_KEYWORDS = re.compile(
+        r"(?:查看|阅读|读取|读|看|浏览|点击|搜索|获取|提取|下载|列出|显示|操作|进入|打开.*并|"
+        r"收件箱|邮件列表|邮件内容|最新|内容|正文|标题|发件人|"
+        r"read|view|check|click|search|list|browse|extract|get|fetch|inbox|content)",
+        re.IGNORECASE,
+    )
+
     async def _maybe_execute_local_fast_path(self, task: str) -> LocalRunResult | None:
         tool = self._runtime_tools_by_name.get("run_applescript")
         if tool is None:
@@ -981,13 +1303,17 @@ class MacOSSidecarRuntime:
 
         browser_target = self._match_browser_target_task(task)
         if browser_target is not None:
-            browser_app, target_url = browser_target
-            return await self._run_browser_handoff_fast_path(
-                task=task,
-                tool=tool,
-                browser_app=browser_app,
-                target_url=target_url,
-            )
+            # Only use fast-path for simple "open X" tasks.
+            # If the task requires page interaction (reading emails, clicking, etc.),
+            # let the full agent loop handle it with chrome_* tools.
+            if not self._INTERACTION_KEYWORDS.search(task):
+                browser_app, target_url = browser_target
+                return await self._run_browser_handoff_fast_path(
+                    task=task,
+                    tool=tool,
+                    browser_app=browser_app,
+                    target_url=target_url,
+                )
 
         app_name = self._match_open_app_task(task)
         if not app_name:
@@ -1355,6 +1681,17 @@ class MacOSSidecarRuntime:
 
         app = FastAPI(title="Nexus macOS Sidecar", version="0.1.0", lifespan=lifespan)
 
+        # Allow Desktop WKWebView (file://) cross-origin requests
+        # file:// origins send "null" as Origin header, must use allow_origin_regex
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_origin_regex=r".*",
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
         @app.get("/health")
         async def health() -> dict[str, Any]:
             status = "ok" if runtime.state.phase == "running" else "degraded"
@@ -1381,6 +1718,27 @@ class MacOSSidecarRuntime:
         @app.get("/node-card")
         async def node_card() -> dict[str, Any]:
             return {"node_card": runtime.node_card}
+
+        @app.get("/providers")
+        async def providers() -> dict[str, Any]:
+            """List all configured LLM providers with health status."""
+            if runtime.edge_provider is None:
+                return {"providers": []}
+            result = []
+            for p in runtime.edge_provider.list_providers():
+                health = runtime.edge_provider.get_health_snapshot(p.name)
+                result.append({
+                    "name": p.name,
+                    "model": p.model,
+                    "provider_type": p.provider or p.name,
+                    "status": health.get("status", "unknown"),
+                })
+            return {"providers": result}
+
+        @app.get("/permissions")
+        async def permissions() -> dict[str, Any]:
+            """Check macOS permissions for the sidecar process (the one that actually runs automation)."""
+            return {"permissions": await _check_sidecar_permissions()}
 
         @app.get("/approvals")
         async def approvals() -> dict[str, Any]:
@@ -1411,24 +1769,98 @@ class MacOSSidecarRuntime:
             return {"approval": approval.to_dict()}
 
         @app.post("/local-command")
-        async def local_command(request: LocalCommandRequest) -> dict[str, Any]:
+        async def local_command(request: LocalCommandRequest):
             if runtime.edge_runtime is None:
                 raise HTTPException(
                     status_code=503,
                     detail="No LLM provider configured — local command execution is unavailable",
                 )
-            result = await runtime.execute_local_command(
-                request.task,
-                system_prompt=request.system_prompt,
-            )
-            runtime.state.add_event(
-                "local_command",
-                f"Local command {'succeeded' if result.success else 'failed'}: {request.task[:80]}",
-                level="info" if result.success else "error",
-                run_id=result.run_id,
-                duration_ms=result.duration_ms,
-            )
-            return {"result": result.to_dict()}
+
+            # Use SSE to avoid WKWebView fetch timeout on long-running tasks.
+            # Send periodic keep-alive while the agent loop runs, then the result.
+            from fastapi.responses import StreamingResponse
+            import json as _json
+
+            async def sse_stream():
+                # Ack
+                yield f"data: {_json.dumps({'type': 'status', 'content': 'Sidecar executing...'})}\n\n"
+
+                task_done = asyncio.Event()
+                result_holder: list[Any] = []
+
+                local_task_id = f"local-{uuid.uuid4().hex[:8]}"
+
+                # Task Log — record local command received
+                runtime.state.task_log.append(
+                    task_id=local_task_id,
+                    phase="received",
+                    source="desktop",
+                    node=state.mesh_summary.get("node_id", "mac"),
+                    message=f"📥 本地任务: {request.task[:200]}",
+                )
+
+                async def run_task():
+                    try:
+                        r = await runtime.execute_local_command(
+                            request.task,
+                            system_prompt=request.system_prompt,
+                            provider_name=request.provider_name,
+                        )
+                        result_holder.append(r)
+                    except Exception as exc:
+                        result_holder.append(exc)
+                    finally:
+                        task_done.set()
+
+                task = asyncio.create_task(run_task())
+
+                # Task Log — record executing
+                runtime.state.task_log.append(
+                    task_id=local_task_id,
+                    phase="executing",
+                    source="desktop",
+                    node=state.mesh_summary.get("node_id", "mac"),
+                    message="⚙️ 开始执行...",
+                )
+
+                # Send keep-alive every 10s while task is running
+                while not task_done.is_set():
+                    try:
+                        await asyncio.wait_for(task_done.wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        yield f"data: {_json.dumps({'type': 'status', 'content': 'Still working...'})}\n\n"
+
+                if not result_holder or isinstance(result_holder[0], Exception):
+                    err_msg = str(result_holder[0]) if result_holder else "Unknown error"
+                    runtime.state.task_log.append(
+                        task_id=local_task_id,
+                        phase="failed",
+                        source="desktop",
+                        node=state.mesh_summary.get("node_id", "mac"),
+                        message=f"❌ 失败: {err_msg[:200]}",
+                    )
+                    yield f"data: {_json.dumps({'type': 'error', 'content': err_msg})}\n\n"
+                else:
+                    result = result_holder[0]
+                    runtime.state.add_event(
+                        "local_command",
+                        f"Local command {'succeeded' if result.success else 'failed'}: {request.task[:80]}",
+                        level="info" if result.success else "error",
+                        run_id=result.run_id,
+                        duration_ms=result.duration_ms,
+                    )
+                    runtime.state.task_log.append(
+                        task_id=local_task_id,
+                        phase="completed" if result.success else "failed",
+                        source="desktop",
+                        node=state.mesh_summary.get("node_id", "mac"),
+                        message=f"{'✅ 完成' if result.success else '❌ 失败'}: {request.task[:100]}",
+                        duration_ms=result.duration_ms,
+                        output_preview=result.output[:300] if result.output else "",
+                    )
+                    yield f"data: {_json.dumps({'type': 'result', 'result': result.to_dict()})}\n\n"
+
+            return StreamingResponse(sse_stream(), media_type="text/event-stream")
 
         @app.get("/journal")
         async def journal_status() -> dict[str, Any]:
@@ -1438,7 +1870,279 @@ class MacOSSidecarRuntime:
                 "entries": [e.to_dict() for e in unsynced[:20]],
             }
 
+        @app.get("/task-log")
+        async def task_log_api(request: Request):
+            """Return recent task log entries for the Task Log window."""
+            try:
+                task_id = request.query_params.get("task_id")
+                limit = int(request.query_params.get("limit", "100"))
+                if task_id:
+                    entries = runtime.state.task_log.by_task(task_id)
+                else:
+                    entries = runtime.state.task_log.recent(limit=limit)
+                return {"entries": entries, "count": len(entries)}
+            except Exception as e:
+                logger.exception("task-log endpoint error")
+                return {"entries": [], "count": 0, "error": str(e)}
+
+        # --- Editor AI endpoints (inline completion + transform) ---
+
+        @app.post("/editor/complete")
+        async def editor_complete(req: EditorCompleteRequest):
+            """Inline completion: return a short continuation suggestion via SSE."""
+            from fastapi.responses import StreamingResponse
+            import json as _json
+
+            if runtime.edge_provider is None:
+                raise HTTPException(status_code=503, detail="No LLM provider configured")
+
+            context_before = req.context_before[-2000:] if req.context_before else ""
+            context_after = req.context_after[:500] if req.context_after else ""
+
+            if len(context_before.strip()) < 5:
+                # 上下文太短，不值得补全
+                async def empty():
+                    yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+                return StreamingResponse(empty(), media_type="text/event-stream")
+
+            system_prompt = (
+                "You are a writing assistant. Complete the user's text naturally.\n"
+                "Rules:\n"
+                "- Continue in the same language as the user's text\n"
+                "- Match the user's writing style and tone\n"
+                "- Keep the completion concise (1-2 sentences max)\n"
+                "- Do NOT repeat what the user has already written\n"
+                "- Output ONLY the continuation text, no explanations, no quotes\n"
+                "- If the text appears complete, output nothing"
+            )
+
+            user_text = context_before
+            if context_after.strip():
+                user_text += f"\n[CURSOR_HERE — complete the text between what's before and after]\n{context_after}"
+            else:
+                user_text += "\n[CURSOR_HERE — continue from here]"
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ]
+
+            async def stream():
+                try:
+                    result = await runtime.edge_provider.chat_completion(
+                        messages=messages,
+                        temperature=0.3,
+                        max_tokens=min(req.max_tokens, 300),
+                        extra_body={"thinking": {"type": "disabled"}},
+                    )
+                    text = result.get("message", {}).get("content", "").strip()
+                    fallback = "模型返回空内容，请重试或切换模型。"
+                    if text and text != fallback:
+                        # 去掉模型可能添加的引号或前缀
+                        for prefix in ["[CURSOR_HERE]", "[CURSOR_HERE —", "继续：", "Continuation:"]:
+                            if text.startswith(prefix):
+                                text = text[len(prefix):].strip()
+                        if text:
+                            yield f"data: {_json.dumps({'type': 'suggestion', 'text': text})}\n\n"
+                    yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+                except Exception as exc:
+                    logger.warning("Editor completion failed: %s", exc)
+                    yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+            return StreamingResponse(stream(), media_type="text/event-stream")
+
+        @app.post("/editor/transform")
+        async def editor_transform(req: EditorTransformRequest):
+            """Transform selected text (translate, polish, expand, etc.) via SSE."""
+            from fastapi.responses import StreamingResponse
+            import json as _json
+
+            if runtime.edge_provider is None:
+                raise HTTPException(status_code=503, detail="No LLM provider configured")
+
+            if not req.selected_text.strip():
+                raise HTTPException(status_code=400, detail="No text selected")
+
+            # 构建 system prompt
+            prompts = {
+                "translate": (
+                    "You are a professional translator.\n"
+                    "Translate the given text between Chinese and English.\n"
+                    f"Target language: {req.target_language or 'auto-detect and translate to the other language'}.\n"
+                    "Rules:\n"
+                    "- Preserve formatting (markdown, line breaks)\n"
+                    "- Preserve technical terms appropriately\n"
+                    "- Output ONLY the translated text, no explanations"
+                ),
+                "polish": (
+                    "You are a professional editor.\n"
+                    "Polish the given text to improve clarity, grammar, and readability.\n"
+                    "Rules:\n"
+                    "- Maintain the original language\n"
+                    "- Preserve the original meaning\n"
+                    "- Fix grammar and punctuation\n"
+                    "- Improve sentence flow\n"
+                    "- Output ONLY the polished text, no explanations"
+                ),
+                "expand": (
+                    "You are a writing assistant.\n"
+                    "Expand the given text with more detail and elaboration.\n"
+                    "Rules:\n"
+                    "- Maintain the original language and style\n"
+                    "- Add relevant details, examples, or explanations\n"
+                    "- Keep the expansion natural and coherent\n"
+                    "- Output ONLY the expanded text, no explanations"
+                ),
+                "condense": (
+                    "You are a professional editor.\n"
+                    "Condense the given text to be more concise while preserving key information.\n"
+                    "Rules:\n"
+                    "- Maintain the original language\n"
+                    "- Remove redundancy and filler\n"
+                    "- Keep essential meaning intact\n"
+                    "- Output ONLY the condensed text, no explanations"
+                ),
+                "rewrite": (
+                    "You are a writing assistant.\n"
+                    "Rewrite the given text in a different style while preserving the meaning.\n"
+                    "Rules:\n"
+                    "- Maintain the original language\n"
+                    "- Use a fresh perspective or phrasing\n"
+                    "- Output ONLY the rewritten text, no explanations"
+                ),
+            }
+
+            system = prompts.get(req.action)
+            if not system:
+                raise HTTPException(status_code=400, detail=f"Unknown action: {req.action}")
+
+            # 添加上下文
+            user_content = req.selected_text
+            if req.context_before or req.context_after:
+                surrounding = ""
+                if req.context_before:
+                    surrounding += f"[Context before]: {req.context_before[-500:]}\n\n"
+                if req.context_after:
+                    surrounding += f"[Context after]: {req.context_after[:500]}\n\n"
+                user_content = f"{surrounding}[Text to {req.action}]:\n{req.selected_text}"
+
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ]
+
+            selected_length = max(len(req.selected_text.strip()), 1)
+            max_tokens_by_action = {
+                "translate": min(max(selected_length * 4, 64), 192),
+                "polish": min(max(selected_length * 3, 96), 320),
+                "expand": min(max(selected_length * 4, 160), 512),
+                "condense": min(max(selected_length * 2, 96), 256),
+                "rewrite": min(max(selected_length * 3, 128), 384),
+            }
+            max_tokens = max_tokens_by_action.get(req.action, 256)
+
+            async def stream():
+                try:
+                    result = await runtime.edge_provider.chat_completion(
+                        messages=messages,
+                        temperature=0.3,
+                        max_tokens=max_tokens,
+                        extra_body={"thinking": {"type": "disabled"}},
+                    )
+                    text = result.get("message", {}).get("content", "").strip()
+                    if text:
+                        yield f"data: {_json.dumps({'type': 'transform', 'text': text})}\n\n"
+                    yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+                except Exception as exc:
+                    logger.warning("Editor transform failed: %s", exc)
+                    yield f"data: {_json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+            return StreamingResponse(stream(), media_type="text/event-stream")
+
+        # --- Hub Vault proxy (avoids CORS issues for WebView) ---
+        hub_base = f"http://{runtime._hub_api_host}:{runtime._hub_api_port}"
+
+        @app.api_route("/vault/{rest_of_path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+        async def vault_proxy(rest_of_path: str, request: Request):
+            """Proxy vault requests to Hub so WebView stays same-origin."""
+            target = f"{hub_base}/vault/{rest_of_path}"
+            if request.url.query:
+                target += f"?{request.url.query}"
+            timeout_cfg = aiohttp.ClientTimeout(total=10)
+            try:
+                body = await request.body()
+                headers = {"Content-Type": request.headers.get("content-type", "application/json")}
+                async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+                    async with session.request(
+                        request.method, target, data=body if body else None, headers=headers
+                    ) as resp:
+                        data = await resp.read()
+                        from fastapi.responses import Response
+                        return Response(
+                            content=data,
+                            status_code=resp.status,
+                            media_type=resp.content_type,
+                        )
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Hub unreachable: {e}")
+
+        # --- Hub SSE proxy for /desktop/message (chat via Hub) ---
+        @app.post("/hub/desktop/message")
+        async def hub_message_proxy(request: Request):
+            """Proxy desktop message SSE to Hub, avoiding CORS."""
+            from fastapi.responses import StreamingResponse
+            target = f"{hub_base}/desktop/message"
+            body = await request.body()
+            timeout_cfg = aiohttp.ClientTimeout(total=300)
+            try:
+                session = aiohttp.ClientSession(timeout=timeout_cfg)
+                resp = await session.post(
+                    target,
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                )
+
+                async def stream():
+                    try:
+                        async for chunk in resp.content.iter_any():
+                            yield chunk
+                    finally:
+                        resp.close()
+                        await session.close()
+
+                return StreamingResponse(
+                    stream(),
+                    status_code=resp.status,
+                    media_type=resp.content_type,
+                )
+            except Exception as e:
+                await session.close()
+                raise HTTPException(status_code=502, detail=f"Hub unreachable: {e}")
+
+        # --- Serve Desktop web UI from bundled dist or adjacent project ---
+        web_ui_dir = _find_web_ui_dir(runtime._settings.root_dir)
+        if web_ui_dir:
+            logger.info("Serving Desktop web UI from %s", web_ui_dir)
+            # Mount static files at root so relative paths (./assets/...) work
+            # regardless of whether the page is loaded from /ui or /ui/
+            app.mount("/", StaticFiles(directory=str(web_ui_dir), html=True), name="web-ui")
+        else:
+            logger.info("No Desktop web UI dist found — static UI disabled")
+
         return app
+
+
+def _find_web_ui_dir(root_dir: Path) -> Path | None:
+    """Locate the Desktop web UI dist directory."""
+    candidates = [
+        root_dir.parent / "web-ui",              # Bundled app: Resources/web-ui/
+        root_dir / "apps" / "desktop" / "dist",   # Dev: Nexus/apps/desktop/dist/
+        root_dir / "web-ui",                       # Alt layout
+    ]
+    for d in candidates:
+        if (d / "index.html").is_file():
+            return d
+    return None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

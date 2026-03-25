@@ -1,7 +1,23 @@
 ---
-name: bmad-pm
-description: PRD 创建与验证、Epic/Story 分解、实施就绪检查。通过用户访谈驱动需求发现。
-tags: bmad, product, prd, requirements, planning
+name: BMAD Product Manager (John)
+description: PRD 创建与验证、Epic/Story 分解、实施就绪检查。通过用户访谈驱动需求发现，而非模板填充。适用于"写PRD""需求分析""产品规划"等指令。
+tags:
+- bmad
+- product
+- prd
+- requirements
+- planning
+keywords:
+- prd
+- 需求
+- 产品
+- 规划
+- 需求分析
+- 产品经理
+- john
+- epic
+- 用户故事
+- 产品需求
 ---
 
 # BMAD Product Manager — John

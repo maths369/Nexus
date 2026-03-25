@@ -16,7 +16,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin, urlparse
 
 from nexus.agent.types import ToolDefinition, ToolRiskLevel
 from nexus.knowledge import EpisodicMemory, KnowledgeIngestService, VaultContentStore
@@ -51,6 +51,196 @@ _VAULT_SECTION_ALIASES = {
     "rnd",
     "life",
 }
+_GOOGLE_GROUNDING_REDIRECT_CACHE: dict[str, str] = {}
+
+
+async def _perform_google_grounded_search(
+    *,
+    query: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout_seconds: float = 20.0,
+    max_output_tokens: int = 768,
+) -> dict[str, Any]:
+    import aiohttp
+
+    endpoint = f"{base_url.rstrip('/')}/models/{model}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": query,
+                    }
+                ]
+            }
+        ],
+        "tools": [
+            {
+                "google_search": {},
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": int(max(128, max_output_tokens)),
+        },
+    }
+
+    async with aiohttp.ClientSession(trust_env=True) as session:
+        async with session.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+        ) as resp:
+            payload = await resp.json(content_type=None)
+            if resp.status >= 400:
+                error = payload.get("error") if isinstance(payload, dict) else None
+                status = str((error or {}).get("status") or "")
+                message = str((error or {}).get("message") or payload)
+                raise RuntimeError(f"Google grounded search error {resp.status} [{status}]: {message}")
+            return payload
+
+
+def _extract_domain(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _looks_like_google_grounding_redirect(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    return (
+        parsed.netloc.lower() == "vertexaisearch.cloud.google.com"
+        and "/grounding-api-redirect/" in parsed.path
+    )
+
+
+async def _resolve_google_grounding_redirect_url(
+    url: str,
+    *,
+    timeout_seconds: float = 10.0,
+) -> str:
+    import aiohttp
+
+    candidate = str(url or "").strip()
+    if not candidate or not _looks_like_google_grounding_redirect(candidate):
+        return candidate
+    cached = _GOOGLE_GROUNDING_REDIRECT_CACHE.get(candidate)
+    if cached:
+        return cached
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession(trust_env=True, headers=headers) as session:
+        for method in ("HEAD", "GET"):
+            try:
+                request = session.head if method == "HEAD" else session.get
+                async with request(
+                    candidate,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                ) as resp:
+                    location = str(resp.headers.get("Location") or "").strip()
+                    if location:
+                        resolved = urljoin(candidate, location)
+                        _GOOGLE_GROUNDING_REDIRECT_CACHE[candidate] = resolved
+                        return resolved
+            except Exception:
+                continue
+    return candidate
+
+
+def _build_google_grounded_prompt(query: str) -> str:
+    prompt = str(query or "").strip()
+    return (
+        "Use Google Search to answer with current web information and sources. "
+        "Prefer fresh, factual results. "
+        f"Question: {prompt}"
+    )
+
+
+def _is_google_quota_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return (
+        "resource_exhausted" in message
+        or "quota" in message
+        or "rate limit" in message
+        or "429" in message
+    )
+
+
+def _extract_google_text(payload: dict[str, Any]) -> str:
+    candidates = list(payload.get("candidates") or [])
+    if not candidates:
+        return ""
+    content = dict((candidates[0] or {}).get("content") or {})
+    parts = list(content.get("parts") or [])
+    texts = [str(part.get("text") or "").strip() for part in parts if isinstance(part, dict)]
+    return "\n".join(text for text in texts if text).strip()
+
+
+async def _format_google_grounded_payload(
+    *,
+    query: str,
+    payload: dict[str, Any],
+    max_chars: int,
+) -> dict[str, Any]:
+    candidates = list(payload.get("candidates") or [])
+    metadata = dict((candidates[0] or {}).get("groundingMetadata") or {})
+    raw_results = list(metadata.get("groundingChunks") or [])
+    formatted_results: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for item in raw_results:
+        web = dict((item or {}).get("web") or {})
+        raw_url = str(web.get("uri") or "").strip()
+        url = await _resolve_google_grounding_redirect_url(raw_url)
+        title = str(web.get("title") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        formatted_results.append(
+            {
+                "rank": len(formatted_results) + 1,
+                "title": title,
+                "url": url,
+                "raw_url": raw_url,
+                "domain": _extract_domain(url),
+                "snippet": "",
+                "extra_snippets": [],
+            }
+        )
+
+    answer = _extract_google_text(payload)
+    text_lines = [answer] if answer else []
+    if formatted_results:
+        text_lines.append("")
+        text_lines.append("Sources:")
+        for item in formatted_results[:8]:
+            text_lines.append(f"{item['rank']}. {item['title']} — {item['url']}")
+    text = "\n".join(line for line in text_lines if line is not None).strip()
+    if max_chars > 0:
+        text = text[:max_chars]
+
+    return {
+        "provider": "google_grounded",
+        "query": query,
+        "answer": answer,
+        "text": text,
+        "results": formatted_results,
+        "search_queries": [
+            str(item).strip()
+            for item in (metadata.get("webSearchQueries") or [])
+            if str(item).strip()
+        ],
+        "total_results": len(formatted_results),
+        "grounded": True,
+    }
 
 
 def build_tool_registry(
@@ -73,10 +263,23 @@ def build_tool_registry(
     system_runner: SystemRunner | None = None,
     memory_manager: MemoryManager | None = None,
     audit_log: AuditLog | None = None,
+    search_config: dict[str, Any] | None = None,
     allowlist: set[str] | None = None,
 ) -> list[ToolDefinition]:
+    search_settings = search_config if isinstance(search_config, dict) else {}
+    search_provider_settings = search_settings.setdefault("provider", {})
+    google_grounded_settings = search_settings.setdefault("google_grounded", {})
+
     async def read_vault(relative_path: str) -> str:
-        return content_store.read(relative_path.strip())
+        path = relative_path.strip()
+        try:
+            return content_store.read(path)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"文件 '{path}' 不存在。"
+                "不要猜测文件名——请先使用 find_vault_pages(query=关键词) "
+                "或 list_vault_pages(section=目录名) 获取真实的文件路径。"
+            ) from None
 
     async def search_vault(query: str, top_k: int = 5) -> str:
         return _json(await document_service.search(query, top_k=top_k))
@@ -472,31 +675,184 @@ def build_tool_registry(
         result = await browser_service.fill_form(fields)
         return _json(result)
 
-    async def search_web(
-        query: str,
-        engine: str = "bing",
-        max_chars: int = 3000,
-    ) -> str:
-        normalized_engine = engine.strip().lower() or "bing"
+    def _search_default_provider() -> str:
+        provider = str(search_provider_settings.get("primary") or "google_grounded").strip().lower()
+        return provider if provider in {"google_grounded", "bing", "duckduckgo"} else "google_grounded"
+
+    def _search_fallback_providers() -> list[str]:
+        raw_fallbacks = search_provider_settings.get("fallbacks") or []
+        candidates = [
+            str(item).strip().lower()
+            for item in raw_fallbacks
+            if str(item).strip().lower() in {"bing", "duckduckgo"}
+        ]
+        if not candidates:
+            fallback = str(search_provider_settings.get("fallback") or "bing").strip().lower()
+            candidates = [fallback] if fallback in {"bing", "duckduckgo"} else ["bing", "duckduckgo"]
+        deduped: list[str] = []
+        for item in candidates:
+            if item not in deduped:
+                deduped.append(item)
+        if "duckduckgo" not in deduped:
+            deduped.append("duckduckgo")
+        return deduped
+
+    def _google_grounded_runtime_config() -> dict[str, Any]:
+        return {
+            "enabled": bool(google_grounded_settings.get("enabled", True)),
+            "api_key": str(google_grounded_settings.get("api_key") or ""),
+            "base_url": str(
+                google_grounded_settings.get("base_url")
+                or "https://generativelanguage.googleapis.com/v1beta"
+            ),
+            "model": str(google_grounded_settings.get("model") or "gemini-2.5-flash"),
+            "timeout_seconds": float(google_grounded_settings.get("timeout_seconds", 20) or 20),
+            "max_output_tokens": int(google_grounded_settings.get("max_output_tokens", 768) or 768),
+        }
+
+    async def _browser_search(query: str, engine: str, max_chars: int) -> dict[str, Any]:
+        normalized_engine = engine if engine in {"bing", "duckduckgo"} else "bing"
         if normalized_engine == "duckduckgo":
             url = f"https://duckduckgo.com/?q={quote_plus(query)}&ia=web"
         else:
-            normalized_engine = "bing"
             url = f"https://www.bing.com/search?q={quote_plus(query)}"
         page = await browser_service.navigate(url)
         extracted = await browser_service.extract_text()
         text = str(extracted.get("text") or "").strip()
         if max_chars > 0:
             text = text[:max_chars]
-        return _json(
-            {
-                "engine": normalized_engine,
-                "query": query,
-                "url": page.get("url"),
-                "title": page.get("title"),
-                "text": text,
-            }
+        return {
+            "provider": normalized_engine,
+            "query": query,
+            "url": page.get("url"),
+            "title": page.get("title"),
+            "text": text,
+            "results": [
+                {
+                    "rank": 1,
+                    "title": str(page.get("title") or "").strip(),
+                    "url": str(page.get("url") or "").strip(),
+                    "domain": _extract_domain(str(page.get("url") or "")),
+                    "snippet": text,
+                    "extra_snippets": [],
+                }
+            ],
+            "fallback_used": True,
+        }
+
+    async def _browser_search_with_fallbacks(
+        *,
+        query: str,
+        engines: list[str],
+        max_chars: int,
+        fallback_reason: str,
+        google_error: str | None = None,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for engine in engines:
+            try:
+                result = await _browser_search(query=query, engine=engine, max_chars=max_chars)
+                result["fallback_reason"] = fallback_reason
+                if google_error:
+                    result["google_error"] = google_error
+                return result
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return await _browser_search(query=query, engine="bing", max_chars=max_chars)
+
+    async def _structured_search(
+        *,
+        query: str,
+        provider: str = "auto",
+        count: int | None = None,
+        freshness: str = "",
+        country: str = "",
+        search_lang: str = "",
+        max_chars: int = 5000,
+    ) -> dict[str, Any]:
+        requested_provider = (provider or "auto").strip().lower()
+        google_runtime = _google_grounded_runtime_config()
+        selected_provider = requested_provider if requested_provider not in {"", "auto"} else _search_default_provider()
+
+        if selected_provider == "google_grounded":
+            google_key = google_runtime.get("api_key") or ""
+            if google_runtime.get("enabled") and google_key:
+                try:
+                    payload = await _perform_google_grounded_search(
+                        query=_build_google_grounded_prompt(query),
+                        api_key=str(google_key),
+                        base_url=str(google_runtime["base_url"]),
+                        model=str(google_runtime["model"]),
+                        timeout_seconds=float(google_runtime["timeout_seconds"]),
+                        max_output_tokens=int(google_runtime["max_output_tokens"]),
+                    )
+                    result = await _format_google_grounded_payload(
+                        query=query,
+                        payload=payload,
+                        max_chars=max_chars,
+                    )
+                    result["fallback_used"] = False
+                    return result
+                except Exception as exc:
+                    fallback_reason = "google_quota_exhausted" if _is_google_quota_error(exc) else "google_grounded_failed"
+                    return await _browser_search_with_fallbacks(
+                        query=query,
+                        engines=_search_fallback_providers(),
+                        max_chars=max_chars,
+                        fallback_reason=fallback_reason,
+                        google_error=str(exc),
+                    )
+            selected_provider = _search_fallback_providers()[0]
+
+        if selected_provider in {"bing", "duckduckgo"}:
+            return await _browser_search(query=query, engine=selected_provider, max_chars=max_chars)
+
+        result = await _browser_search_with_fallbacks(
+            query=query,
+            engines=_search_fallback_providers(),
+            max_chars=max_chars,
+            fallback_reason=(
+            "google_grounded_not_configured"
+            if requested_provider in {"auto", "google_grounded"}
+            else "requested_browser_provider"
+            ),
         )
+        return result
+
+    async def search_web(
+        query: str,
+        engine: str = "auto",
+        max_chars: int = 3000,
+    ) -> str:
+        result = await _structured_search(
+            query=query,
+            provider=engine,
+            max_chars=max_chars,
+        )
+        result["engine"] = result.get("provider")
+        return _json(result)
+
+    async def search_web_structured(
+        query: str,
+        provider: str = "auto",
+        count: int = 8,
+        freshness: str = "",
+        country: str = "",
+        search_lang: str = "",
+        max_chars: int = 5000,
+    ) -> str:
+        result = await _structured_search(
+            query=query,
+            provider=provider,
+            count=count,
+            freshness=freshness,
+            country=country,
+            search_lang=search_lang,
+            max_chars=max_chars,
+        )
+        return _json(result)
 
     tools = [
         ToolDefinition(
@@ -949,15 +1305,15 @@ def build_tool_registry(
             ),
             ToolDefinition(
                 name="search_web",
-                description="通过浏览器访问搜索引擎进行联网查询，并返回页面标题、URL 和正文摘要。",
+                description="联网搜索工具。优先使用 Google grounded search；配额耗尽、未配置或失败时自动降级到 Bing 或 DuckDuckGo 网页搜索。",
                 parameters={
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
                         "engine": {
                             "type": "string",
-                            "enum": ["bing", "duckduckgo"],
-                            "default": "bing",
+                            "enum": ["auto", "google_grounded", "bing", "duckduckgo"],
+                            "default": "auto",
                         },
                         "max_chars": {"type": "integer", "default": 3000},
                     },
@@ -966,6 +1322,30 @@ def build_tool_registry(
                 handler=search_web,
                 risk_level=ToolRiskLevel.LOW,
                 tags=["browser", "web", "search"],
+            ),
+            ToolDefinition(
+                name="search_web_structured",
+                description="结构化联网搜索。优先走 Google grounded search，返回答案、搜索查询和来源 URL；若达到免费上限或失败则降级到浏览器搜索。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "provider": {
+                            "type": "string",
+                            "enum": ["auto", "google_grounded", "bing", "duckduckgo"],
+                            "default": "auto",
+                        },
+                        "count": {"type": "integer", "default": 8},
+                        "freshness": {"type": "string", "default": ""},
+                        "country": {"type": "string", "default": ""},
+                        "search_lang": {"type": "string", "default": ""},
+                        "max_chars": {"type": "integer", "default": 5000},
+                    },
+                    "required": ["query"],
+                },
+                handler=search_web_structured,
+                risk_level=ToolRiskLevel.LOW,
+                tags=["web", "search", "structured"],
             ),
         ])
 
@@ -2125,6 +2505,191 @@ def build_tool_registry(
         ),
     ])
 
+    # ── Coding Agent 基础工具 ──
+
+    async def file_edit(
+        path: str,
+        old_text: str,
+        new_text: str,
+    ) -> str:
+        """对文件进行精确的局部编辑（search-and-replace 语义）。"""
+        resolved = workspace_service.resolve(path)
+        if not resolved.is_file():
+            raise FileNotFoundError(f"文件不存在: {path}")
+
+        content = resolved.read_text(encoding="utf-8")
+        count = content.count(old_text)
+        if count == 0:
+            # 返回匹配失败的上下文信息帮助 LLM 调试
+            lines = content.splitlines()
+            preview = "\n".join(lines[:30]) if len(lines) > 30 else content
+            return _json({
+                "success": False,
+                "error": "old_text 在文件中未找到，请检查空格、缩进和换行是否完全匹配",
+                "file_lines": len(lines),
+                "file_preview_first_30_lines": preview,
+            })
+        if count > 1:
+            return _json({
+                "success": False,
+                "error": f"old_text 在文件中出现了 {count} 次，请提供更长的上下文使其唯一",
+                "match_count": count,
+            })
+
+        new_content = content.replace(old_text, new_text, 1)
+        workspace_service.write_text(path, new_content)
+        return _json({
+            "success": True,
+            "path": str(resolved),
+            "chars_removed": len(old_text),
+            "chars_added": len(new_text),
+        })
+
+    tools.append(ToolDefinition(
+        name="file_edit",
+        description=(
+            "对文件进行精确的局部编辑。使用 search-and-replace 语义：提供要替换的原始文本和新文本。"
+            "old_text 必须在文件中唯一匹配（包括空格和换行）。"
+            "比整文件重写更高效、更安全。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要编辑的文件路径",
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "要被替换的原始文本（必须完全匹配，包括空格和换行）",
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "替换后的新文本",
+                },
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+        handler=file_edit,
+        risk_level=ToolRiskLevel.MEDIUM,
+        tags=["workspace", "coding", "write"],
+    ))
+
+    async def file_write(
+        path: str,
+        content: str,
+    ) -> str:
+        """创建或覆盖文件。"""
+        resolved = workspace_service.write_text(path, content)
+        return _json({
+            "success": True,
+            "path": str(resolved),
+            "chars": len(content),
+        })
+
+    tools.append(ToolDefinition(
+        name="file_write",
+        description=(
+            "创建新文件或完整覆盖已有文件。"
+            "对于已有文件的局部修改，优先使用 file_edit。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "文件路径（相对路径基于工作区根目录）",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "文件的完整内容",
+                },
+            },
+            "required": ["path", "content"],
+        },
+        handler=file_write,
+        risk_level=ToolRiskLevel.MEDIUM,
+        tags=["workspace", "coding", "write"],
+    ))
+
+    if system_runner is not None:
+        async def file_search(
+            pattern: str,
+            path: str = ".",
+            include: str = "",
+            max_results: int = 30,
+        ) -> str:
+            """在工作区中搜索文件内容或文件名。"""
+            # 判断是内容搜索还是文件名搜索
+            cmds = []
+            if any(c in pattern for c in ["*", "?", "**/"]):
+                # glob 模式 → find 文件名
+                cmd = f"find {_shell_escape(path)} -name {_shell_escape(pattern)} -type f 2>/dev/null | head -n {max_results}"
+                cmds.append(cmd)
+            else:
+                # 文本内容搜索 → grep
+                include_flag = f"--include={_shell_escape(include)}" if include else ""
+                cmd = (
+                    f"grep -rn {include_flag} --color=never "
+                    f"-m {max_results} {_shell_escape(pattern)} {_shell_escape(path)} 2>/dev/null "
+                    f"| head -n {max_results}"
+                )
+                cmds.append(cmd)
+
+            result = await system_runner.run(
+                cmds[0],
+                actor="agent",
+                timeout=30,
+            )
+            return _json({
+                "matches": result["stdout"].strip() if result["stdout"] else "(无匹配)",
+                "exit_code": result["exit_code"],
+            })
+
+        tools.append(ToolDefinition(
+            name="file_search",
+            description=(
+                "在工作区中搜索。支持两种模式：\n"
+                "1. 内容搜索：pattern 为文本/正则，在文件内容中搜索（等同 grep -rn）\n"
+                "2. 文件名搜索：pattern 包含 * 或 ? 时，按文件名 glob 搜索（等同 find）\n"
+                "可通过 include 参数限制文件类型，如 '*.py'。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "搜索模式（文本/正则 或 glob 文件名模式）",
+                    },
+                    "path": {
+                        "type": "string",
+                        "default": ".",
+                        "description": "搜索起始路径（默认工作区根目录）",
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "限制文件类型，如 '*.py'、'*.ts'",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "default": 30,
+                        "description": "最大返回结果数",
+                    },
+                },
+                "required": ["pattern"],
+            },
+            handler=file_search,
+            risk_level=ToolRiskLevel.LOW,
+            tags=["workspace", "coding", "search"],
+        ))
+
     if allowlist is None:
         return tools
     return [tool for tool in tools if tool.name in allowlist]
+
+
+def _shell_escape(s: str) -> str:
+    """安全转义 shell 参数"""
+    if not s:
+        return "''"
+    return "'" + s.replace("'", "'\"'\"'") + "'"

@@ -20,7 +20,7 @@ class RemoteAudioWorkerClient:
             "audio_path": str(audio_path),
             "language": language,
         }
-        with httpx.Client(timeout=self._timeout_seconds) as client:
+        with httpx.Client(timeout=self._timeout_seconds, trust_env=True) as client:
             response = client.post(f"{self._base_url}/audio/transcribe-path", json=payload)
             response.raise_for_status()
             data = response.json()

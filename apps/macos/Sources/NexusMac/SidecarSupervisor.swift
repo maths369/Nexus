@@ -112,11 +112,33 @@ struct SidecarSettings: Codable, Equatable {
     }
 
     static func defaultNexusRoot() -> String {
+        // 1) Explicit environment variable override
         let env = ProcessInfo.processInfo.environment["NEXUS_ROOT"] ?? ""
         if !env.isEmpty {
             return env
         }
-        return "~/Workspace/Nexus"
+        // 2) Bundled backend inside Nexus.app/Contents/Resources/nexus-backend/
+        if let resourcePath = Bundle.main.resourcePath {
+            let bundledPath = (resourcePath as NSString).appendingPathComponent("nexus-backend")
+            if FileManager.default.fileExists(atPath: (bundledPath as NSString).appendingPathComponent("nexus")) {
+                return bundledPath
+            }
+        }
+        // 3) Fallback to development workspace
+        return "/Users/yanglei/Workspace/Nexus"
+    }
+
+    /// Data directory for writable state (edge journal, etc.)
+    /// Uses ~/Library/Application Support/Nexus/ to keep app bundle read-only.
+    static func defaultDataRoot() -> String {
+        let env = ProcessInfo.processInfo.environment["NEXUS_DATA_ROOT"] ?? ""
+        if !env.isEmpty {
+            return env
+        }
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let nexusData = appSupport.appendingPathComponent("Nexus").path
+        try? FileManager.default.createDirectory(atPath: nexusData, withIntermediateDirectories: true)
+        return nexusData
     }
 
     static func defaultCondaExecutable() -> String {
@@ -141,7 +163,7 @@ struct SidecarSettings: Codable, Equatable {
         if !env.isEmpty {
             return env
         }
-        return "YOUR_HUB_IP"
+        return "100.121.67.94"
     }
 
     static func defaultHubAPIHost() -> String {
@@ -206,6 +228,25 @@ struct SidecarSettings: Codable, Equatable {
             sidecarArgs += ["--mesh-transport", trimmedTransport]
         }
 
+        let apiHost = resolvedHubAPIHost
+        if !apiHost.isEmpty {
+            sidecarArgs += ["--hub-api-host", apiHost]
+        }
+        let apiPort = resolvedHubAPIPort
+        if apiPort > 0 {
+            sidecarArgs += ["--hub-api-port", String(apiPort)]
+        }
+
+        // Priority 1: Bundled venv Python inside app bundle
+        if let bundledPython = resolvedBundledPython() {
+            return SidecarLaunchCommand(
+                executable: bundledPython,
+                arguments: sidecarArgs,
+                currentDirectory: nexusRoot
+            )
+        }
+
+        // Priority 2: Conda env Python (direct path)
         if let directPython = resolvedEnvPythonExecutable() {
             return SidecarLaunchCommand(
                 executable: directPython,
@@ -214,6 +255,7 @@ struct SidecarSettings: Codable, Equatable {
             )
         }
 
+        // Priority 3: Conda wrapper
         let condaArgs = [
             "run",
             "--no-capture-output",
@@ -235,6 +277,15 @@ struct SidecarSettings: Codable, Equatable {
             arguments: [condaExecutable] + condaArgs,
             currentDirectory: nexusRoot
         )
+    }
+
+    /// Returns the Python executable inside the bundled venv
+    /// (nexus-backend/venv/bin/python) if it exists.
+    func resolvedBundledPython() -> String? {
+        let venvPython = (nexusRoot as NSString)
+            .appendingPathComponent("venv")
+            .appending("/bin/python")
+        return FileManager.default.isExecutableFile(atPath: venvPython) ? venvPython : nil
     }
 
     func resolvedEnvPythonExecutable() -> String? {
@@ -289,12 +340,26 @@ final class SidecarSupervisor {
     func start(settings: SidecarSettings) throws {
         terminateMatchingSidecars(settings: settings)
         let command = settings.makeLaunchCommand()
-        try start(
-            command: command,
-            environment: ProcessInfo.processInfo.environment.merging([
+        var extraEnv: [String: String] = [
             "NEXUS_ROOT": settings.nexusRoot,
             "PYTHONUNBUFFERED": "1",
-            ]) { _, new in new }
+        ]
+        // When running from the bundled backend, set PYTHONPATH so Python
+        // can find the nexus package inside the app bundle.
+        let bundledNexusPkg = (settings.nexusRoot as NSString).appendingPathComponent("nexus")
+        if FileManager.default.fileExists(atPath: bundledNexusPkg) {
+            let existingPythonPath = ProcessInfo.processInfo.environment["PYTHONPATH"] ?? ""
+            extraEnv["PYTHONPATH"] = existingPythonPath.isEmpty
+                ? settings.nexusRoot
+                : "\(settings.nexusRoot):\(existingPythonPath)"
+        }
+        // Writable data directory (edge journal, etc.)
+        let dataRoot = SidecarSettings.defaultDataRoot()
+        extraEnv["NEXUS_DATA_ROOT"] = dataRoot
+
+        try start(
+            command: command,
+            environment: ProcessInfo.processInfo.environment.merging(extraEnv) { _, new in new }
         )
         activeSettings = settings
     }

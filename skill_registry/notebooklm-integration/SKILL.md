@@ -1,7 +1,28 @@
 ---
 name: NotebookLM Integration
 description: 连接并操作 Google NotebookLM，用于上传文档、创建 notebook、提问和整理研究结果。
-tags: notebooklm, google, integration, browser, research
+tags:
+- notebooklm
+- google
+- integration
+- browser
+- research
+keywords:
+- notebooklm
+- google
+- 连接
+- 集成
+- 上传
+- 文档
+- 问答
+- 研究
+- 播客
+packages:
+- httpx>=0.27.0
+- pydantic>=2.8.0
+verify_imports:
+- httpx
+- pydantic
 ---
 
 # NotebookLM Integration

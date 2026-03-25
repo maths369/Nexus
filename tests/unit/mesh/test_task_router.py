@@ -1,4 +1,4 @@
-"""Tests for mesh-aware task routing."""
+"""Tests for mesh-aware task routing (LLM-driven routing)."""
 
 from __future__ import annotations
 
@@ -17,51 +17,6 @@ from nexus.mesh import (
     StepState,
     TaskRouter,
 )
-
-
-class _FakePlannerProvider:
-    def __init__(self, response: str) -> None:
-        self._response = response
-
-    async def generate(self, **_: object) -> str:
-        return self._response
-
-
-class _FakeChangeResult:
-    def __init__(self, success: bool, reason: str):
-        self.success = success
-        self.reason = reason
-
-
-class _FakeCapabilityManager:
-    def __init__(self, items: list[dict[str, object]]) -> None:
-        self._items = {str(item["capability_id"]): dict(item) for item in items}
-        self.enable_calls: list[str] = []
-
-    def list_capabilities(self) -> list[dict[str, object]]:
-        return [dict(item) for item in self._items.values()]
-
-    def get_status(self, capability_id: str) -> dict[str, object]:
-        item = self._items.get(capability_id)
-        if item is None:
-            return {
-                "capability_id": capability_id,
-                "known": False,
-                "enabled": False,
-                "tools": [],
-                "skill_hint": "",
-            }
-        payload = dict(item)
-        payload["known"] = True
-        return payload
-
-    async def enable(self, capability_id: str, *, actor: str = "system") -> _FakeChangeResult:
-        self.enable_calls.append(capability_id)
-        item = self._items.get(capability_id)
-        if item is None:
-            return _FakeChangeResult(False, f"Unknown capability: {capability_id}")
-        item["enabled"] = True
-        return _FakeChangeResult(True, "Capability enabled")
 
 
 def _hub_card() -> NodeCard:
@@ -128,9 +83,36 @@ def _edge_card(node_id: str = "macbook-pro", *, load_capable: bool = True) -> No
     )
 
 
+# ── Deleted tests (heuristic / provider planner functionality removed) ──
+#
+# - test_task_router_plans_browser_then_analysis_across_nodes
+#     Relied on heuristic multi-step planning (browser_automation → analysis).
+#
+# - test_task_router_waits_for_missing_browser_node_and_recovers_when_online
+#     Relied on heuristic routing detecting browser keywords and creating
+#     WAITING_FOR_NODE steps.
+#
+# - test_task_router_routes_open_chrome_to_edge_agent_loop
+#     Relied on heuristic keyword detection ("打开 Chrome") to route to edge.
+#
+# - test_task_router_requires_notifications_for_explicit_feishu_delivery
+#     Relied on heuristic feishu/notification capability detection.
+#
+# - test_task_router_falls_back_when_provider_planner_refuses_local_task
+#     Relied on provider planner + heuristic fallback.
+#
+# - test_task_router_accepts_provider_plan_when_it_keeps_required_capability
+#     Relied on provider planner generating plans with capabilities.
+#
+# - test_task_router_auto_enables_local_runtime_capability_when_mesh_lacks_it
+#     Relied on provider planner generating steps with required_capabilities
+#     that triggered auto-enable via capability_manager.
+
+
 @pytest.mark.asyncio
-async def test_task_router_plans_browser_then_analysis_across_nodes():
-    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-plan")
+async def test_prepare_run_creates_single_step_local_plan():
+    """LLM-driven routing: prepare_run always creates a single-step plan assigned to hub."""
+    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-single-step")
     await transport.connect()
     registry = MeshRegistry()
     await registry.register_node(_hub_card())
@@ -140,98 +122,31 @@ async def test_task_router_plans_browser_then_analysis_across_nodes():
         registry=registry,
         local_node_id="ubuntu-server-5090",
         transport=transport,
-        local_tool_names={
-            "read_vault",
-            "write_vault",
-            "search_vault",
-            "background_run",
-            "browser_navigate",
-            "browser_extract_text",
-        },
-        planner_mode="heuristic",
+        local_tool_names={"read_vault", "write_vault", "background_run"},
     )
 
     routing = await router.prepare_run(
-        session_id="session-1",
+        session_id="session-single",
         task="打开浏览器登录网站抓取内容，然后长时间分析整理并入库",
         context_messages=[],
     )
 
+    # Single step, assigned to local hub
+    assert len(routing.plan.steps) == 1
+    assert routing.plan.steps[0].assigned_node == "ubuntu-server-5090"
     assert routing.plan.state.value == "ready"
-    assert [step.assigned_node for step in routing.plan.steps] == ["macbook-pro", "ubuntu-server-5090"]
+    assert routing.blocked_reason is None
+    # Dispatch tools for online edge nodes should be injected
     assert routing.extra_tools
-    extra_names = {tool.name for tool in routing.extra_tools}
-    # Browser step on edge node now uses dispatch tool (agent_loop) instead of individual mesh__ tools
     dispatch_alias = RemoteToolProxy.dispatch_alias_for("macbook-pro")
-    assert dispatch_alias in extra_names
-    # Individual mesh__ browser tools should NOT be present (they're replaced by dispatch)
-    assert RemoteToolProxy.alias_for("macbook-pro", "browser_navigate") not in extra_names
-    assert "Mesh 执行上下文" in routing.effective_task
-
-
-@pytest.mark.asyncio
-async def test_task_router_waits_for_missing_browser_node_and_recovers_when_online():
-    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-wait")
-    await transport.connect()
-    registry = MeshRegistry()
-    await registry.register_node(_hub_card())
-
-    router = TaskRouter(
-        registry=registry,
-        local_node_id="ubuntu-server-5090",
-        transport=transport,
-        local_tool_names={"read_vault", "background_run", "system_run"},
-        planner_mode="heuristic",
-    )
-
-    routing = await router.prepare_run(
-        session_id="session-2",
-        task="打开浏览器抓取网页内容",
-        context_messages=[],
-    )
-
-    assert routing.blocked_reason is not None
-    assert routing.plan.steps[0].state == StepState.WAITING_FOR_NODE
-
-    await registry.register_node(_edge_card())
-    await router.handle_node_online("macbook-pro")
-    plan = router.get_session_plan("session-2")
-    assert plan is not None
-    assert plan.steps[0].assigned_node == "macbook-pro"
-    assert plan.steps[0].state == StepState.ASSIGNED
-
-
-@pytest.mark.asyncio
-async def test_task_router_routes_open_chrome_to_edge_agent_loop():
-    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-open-chrome")
-    await transport.connect()
-    registry = MeshRegistry()
-    await registry.register_node(_hub_card())
-    await registry.register_node(_edge_card())
-
-    router = TaskRouter(
-        registry=registry,
-        local_node_id="ubuntu-server-5090",
-        transport=transport,
-        local_tool_names={"read_vault", "background_run", "system_run"},
-        planner_mode="heuristic",
-    )
-
-    routing = await router.prepare_run(
-        session_id="session-open-chrome",
-        task="打开Chrome",
-        context_messages=[],
-    )
-
-    assert routing.plan.steps
-    assert routing.plan.steps[0].assigned_node == "macbook-pro"
-    assert routing.plan.steps[0].metadata.get("execution_mode") == "agent_loop"
-    assert RemoteToolProxy.dispatch_alias_for("macbook-pro") in {tool.name for tool in routing.extra_tools}
-    assert "system_run" in routing.disabled_local_tools
+    assert dispatch_alias in {tool.name for tool in routing.extra_tools}
+    # No local tools disabled in LLM-driven mode
+    assert routing.disabled_local_tools == []
 
 
 @pytest.mark.asyncio
 async def test_task_router_augmented_task_includes_live_mesh_context():
+    """effective_task should include edge node info for LLM decision-making."""
     transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-mesh-context")
     await transport.connect()
     registry = MeshRegistry()
@@ -243,7 +158,6 @@ async def test_task_router_augmented_task_includes_live_mesh_context():
         local_node_id="ubuntu-server-5090",
         transport=transport,
         local_tool_names={"read_vault", "background_run", "system_run"},
-        planner_mode="heuristic",
     )
 
     routing = await router.prepare_run(
@@ -252,14 +166,16 @@ async def test_task_router_augmented_task_includes_live_mesh_context():
         context_messages=[],
     )
 
-    assert "## 当前网络节点" in routing.effective_task
+    # _augment_task adds mesh context sections
+    assert "Mesh 执行上下文" in routing.effective_task or "可用的边缘节点" in routing.effective_task
     assert "MacBook macbook-pro" in routing.effective_task
     assert "browser_automation" in routing.effective_task
     assert "local_filesystem" in routing.effective_task
 
 
 @pytest.mark.asyncio
-async def test_task_router_does_not_require_notifications_for_general_feishu_question():
+async def test_task_router_does_not_block_for_general_feishu_question():
+    """General questions should never be blocked — LLM handles routing."""
     transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-feishu-general")
     await transport.connect()
     registry = MeshRegistry()
@@ -271,7 +187,6 @@ async def test_task_router_does_not_require_notifications_for_general_feishu_que
         local_node_id="ubuntu-server-5090",
         transport=transport,
         local_tool_names={"read_vault", "background_run", "system_run"},
-        planner_mode="heuristic",
     )
 
     routing = await router.prepare_run(
@@ -281,119 +196,13 @@ async def test_task_router_does_not_require_notifications_for_general_feishu_que
     )
 
     assert routing.blocked_reason is None
-    assert all("notifications" not in step.required_capabilities for step in routing.plan.steps)
-
-
-@pytest.mark.asyncio
-async def test_task_router_requires_notifications_for_explicit_feishu_delivery():
-    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-feishu-delivery")
-    await transport.connect()
-    registry = MeshRegistry()
-    await registry.register_node(_hub_card())
-    await registry.register_node(_edge_card())
-
-    router = TaskRouter(
-        registry=registry,
-        local_node_id="ubuntu-server-5090",
-        transport=transport,
-        local_tool_names={"read_vault", "background_run", "system_run"},
-        planner_mode="heuristic",
-    )
-
-    routing = await router.prepare_run(
-        session_id="session-feishu-delivery",
-        task="把结果发到飞书通知我",
-        context_messages=[],
-    )
-
-    assert routing.blocked_reason is not None
-    assert any("notifications" in step.required_capabilities for step in routing.plan.steps)
-
-
-@pytest.mark.asyncio
-async def test_task_router_falls_back_when_provider_planner_refuses_local_task():
-    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-provider-fallback")
-    await transport.connect()
-    registry = MeshRegistry()
-    await registry.register_node(_hub_card())
-    await registry.register_node(_edge_card())
-
-    provider = _FakePlannerProvider(
-        """{
-          "steps": [
-            {
-              "description": "当前网络中不存在MacBook节点或具备macOS远程控制能力的节点，无法执行打开MacBook Chrome的操作。",
-              "required_capabilities": [],
-              "preferred_tools": [],
-              "metadata": {}
-            }
-          ]
-        }"""
-    )
-
-    router = TaskRouter(
-        registry=registry,
-        local_node_id="ubuntu-server-5090",
-        transport=transport,
-        local_tool_names={"read_vault", "background_run"},
-        provider=provider,  # type: ignore[arg-type]
-        planner_mode="auto",
-    )
-
-    routing = await router.prepare_run(
-        session_id="session-provider-fallback",
-        task="你现在试试打开MacBook上的Chrome",
-        context_messages=[],
-    )
-
-    assert routing.plan.steps
-    assert routing.plan.steps[0].assigned_node == "macbook-pro"
-    assert routing.plan.steps[0].metadata.get("execution_mode") == "agent_loop"
-
-
-@pytest.mark.asyncio
-async def test_task_router_accepts_provider_plan_when_it_keeps_required_capability():
-    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-provider-accept")
-    await transport.connect()
-    registry = MeshRegistry()
-    await registry.register_node(_hub_card())
-    await registry.register_node(_edge_card())
-
-    provider = _FakePlannerProvider(
-        """{
-          "steps": [
-            {
-              "description": "在MacBook上启动Chrome浏览器，如已运行则激活窗口。",
-              "required_capabilities": ["browser_automation"],
-              "preferred_tools": ["browser_navigate"],
-              "metadata": {"requires_user_interaction": true}
-            }
-          ]
-        }"""
-    )
-
-    router = TaskRouter(
-        registry=registry,
-        local_node_id="ubuntu-server-5090",
-        transport=transport,
-        local_tool_names={"read_vault", "background_run"},
-        provider=provider,  # type: ignore[arg-type]
-        planner_mode="auto",
-    )
-
-    routing = await router.prepare_run(
-        session_id="session-provider-accept",
-        task="打开Chrome",
-        context_messages=[],
-    )
-
-    assert routing.plan.steps
-    assert routing.plan.steps[0].description == "在MacBook上启动Chrome浏览器，如已运行则激活窗口。"
-    assert routing.plan.steps[0].assigned_node == "macbook-pro"
+    assert len(routing.plan.steps) == 1
+    assert routing.plan.steps[0].assigned_node == "ubuntu-server-5090"
 
 
 @pytest.mark.asyncio
 async def test_task_router_reroutes_when_primary_edge_goes_offline():
+    """handle_node_offline should reroute steps assigned to the offline node."""
     transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-reroute")
     await transport.connect()
     registry = MeshRegistry()
@@ -408,75 +217,90 @@ async def test_task_router_reroutes_when_primary_edge_goes_offline():
         local_node_id="ubuntu-server-5090",
         transport=transport,
         local_tool_names={"read_vault", "background_run"},
-        planner_mode="heuristic",
     )
 
-    routing = await router.prepare_run(
+    # Use plan_task + assign_step to create a plan with an edge-assigned step,
+    # since prepare_run now always assigns to local hub.
+    from nexus.mesh.task_router import TaskStep, StepState as SS
+
+    plan = await router.plan_task(
         session_id="session-3",
         task="打开浏览器抓取网页内容",
-        context_messages=[],
+        context=[],
     )
-    assert routing.plan.steps[0].assigned_node == "macbook-pro-a"
+    # Manually add a step with required capabilities to force edge assignment
+    edge_step = TaskStep(
+        step_id="step-edge",
+        description="浏览器抓取",
+        required_capabilities=["browser_automation"],
+    )
+    plan.steps = [edge_step]
+    await router.assign_step(edge_step)
+    assert edge_step.assigned_node == "macbook-pro-a"
 
+    # Take macbook-pro-a offline
     status = registry.get_node_status("macbook-pro-a")
     assert status is not None
     status.online = False
     updated = await router.handle_node_offline("macbook-pro-a")
 
     assert updated == ["session-3"]
-    plan = router.get_session_plan("session-3")
-    assert plan is not None
-    assert plan.steps[0].assigned_node == "macbook-pro-b"
-    assert plan.steps[0].metadata["rerouted_from"] == "macbook-pro-a"
+    rerouted_plan = router.get_session_plan("session-3")
+    assert rerouted_plan is not None
+    assert rerouted_plan.steps[0].assigned_node == "macbook-pro-b"
+    assert rerouted_plan.steps[0].metadata["rerouted_from"] == "macbook-pro-a"
 
 
 @pytest.mark.asyncio
-async def test_task_router_auto_enables_local_runtime_capability_when_mesh_lacks_it():
-    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-local-capability")
+async def test_prepare_run_no_extra_tools_without_edge_nodes():
+    """When no edge nodes are online, no dispatch tools should be injected."""
+    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-no-edge")
     await transport.connect()
     registry = MeshRegistry()
     await registry.register_node(_hub_card())
-
-    provider = _FakePlannerProvider(
-        """{
-          "steps": [
-            {
-              "description": "将 Excel 文件转换为 CSV。",
-              "required_capabilities": ["excel_processing"],
-              "preferred_tools": [],
-              "metadata": {}
-            }
-          ]
-        }"""
-    )
-    capability_manager = _FakeCapabilityManager([
-        {
-            "capability_id": "excel_processing",
-            "name": "Excel Processing",
-            "description": "支持读取 Excel 工作簿并转换为 CSV。",
-            "enabled": False,
-            "tools": ["excel_list_sheets", "excel_to_csv"],
-            "skill_hint": "excel-processing",
-        }
-    ])
 
     router = TaskRouter(
         registry=registry,
         local_node_id="ubuntu-server-5090",
         transport=transport,
-        local_tool_names={"read_vault", "background_run", "excel_list_sheets", "excel_to_csv"},
-        capability_manager=capability_manager,
-        provider=provider,  # type: ignore[arg-type]
-        planner_mode="auto",
+        local_tool_names={"read_vault", "background_run"},
     )
 
     routing = await router.prepare_run(
-        session_id="session-local-capability",
-        task="把 Excel 转成 CSV",
+        session_id="session-no-edge",
+        task="分析一下数据",
         context_messages=[],
     )
 
     assert routing.blocked_reason is None
-    assert routing.plan.steps[0].assigned_node == "ubuntu-server-5090"
-    assert "excel_processing" in routing.plan.steps[0].metadata.get("auto_local_capabilities", [])
-    assert capability_manager.enable_calls == ["excel_processing"]
+    assert len(routing.plan.steps) == 1
+    assert routing.extra_tools == []
+
+
+@pytest.mark.asyncio
+async def test_assign_step_routes_capability_to_edge():
+    """assign_step should route steps with edge capabilities to edge nodes."""
+    transport = InMemoryTransport("ubuntu-server-5090", hub_name="task-router-assign")
+    await transport.connect()
+    registry = MeshRegistry()
+    await registry.register_node(_hub_card())
+    await registry.register_node(_edge_card())
+
+    router = TaskRouter(
+        registry=registry,
+        local_node_id="ubuntu-server-5090",
+        transport=transport,
+        local_tool_names={"read_vault", "background_run"},
+    )
+
+    from nexus.mesh.task_router import TaskStep
+
+    step = TaskStep(
+        step_id="step-browser",
+        description="Browser task",
+        required_capabilities=["browser_automation"],
+    )
+    node_id = await router.assign_step(step)
+    assert node_id == "macbook-pro"
+    assert step.state == StepState.ASSIGNED
+    assert step.metadata.get("execution_mode") == "agent_loop"

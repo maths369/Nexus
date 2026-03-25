@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from nexus.evolution.audit import AuditLog
+from nexus.agent.sandbox import SandboxManager, SandboxType
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +84,23 @@ class SystemRunner:
         allowed_workdirs: list[Path],
         audit: AuditLog,
         default_timeout: int = 600,
-        shell: str = "/bin/zsh",
+        shell: str | None = None,
+        sandbox_manager: SandboxManager | None = None,
     ) -> None:
         self._allowed_workdirs = allowed_workdirs
         self._audit = audit
         self._default_timeout = default_timeout
-        self._shell = shell
+        self._shell = shell or self._detect_shell()
+        self._sandbox = sandbox_manager
+
+    @staticmethod
+    def _detect_shell() -> str:
+        """自动检测可用的 shell"""
+        import shutil
+        for candidate in ("/bin/zsh", "/bin/bash", "/bin/sh"):
+            if shutil.which(candidate) or Path(candidate).exists():
+                return candidate
+        return "/bin/sh"
 
     def _resolve_workdir(self, workdir: str | None) -> Path:
         """解析并验证工作目录。默认使用第一个 allowed_workdir。"""
@@ -175,49 +187,81 @@ class SystemRunner:
             },
         )
 
-        logger.info("system_run: %s (cwd=%s, timeout=%ds)", command[:100], cwd, effective_timeout)
+        logger.info(
+            "system_run: %s (cwd=%s, timeout=%ds, sandbox=%s)",
+            command[:100], cwd, effective_timeout,
+            self._sandbox.sandbox_type.value if self._sandbox else "none",
+        )
 
-        # 执行
-        timed_out = False
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(cwd),
-                env=_sanitized_env(),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                executable=self._shell,
-            )
+        # 执行 — 沙箱路径 vs 直接路径
+        if self._sandbox and self._sandbox.sandbox_type != SandboxType.HOST:
+            # Docker 沙箱执行
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=effective_timeout if effective_timeout > 0 else None,
+                sr = await self._sandbox.execute(
+                    command,
+                    workdir=str(cwd),
+                    timeout=effective_timeout,
                 )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                timed_out = True
-                stdout_bytes = b""
-                stderr_bytes = f"命令超时 ({effective_timeout}s)".encode()
+                stdout = sr.stdout
+                stderr = sr.stderr
+                exit_code = sr.exit_code
+                timed_out = sr.timed_out
+            except Exception as e:
+                self._audit.record(
+                    action="system_run_error",
+                    target=command[:200],
+                    actor=actor,
+                    success=False,
+                    error=str(e),
+                )
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"沙箱执行失败: {e}",
+                    "timed_out": False,
+                }
+        else:
+            # 直接 Host 执行
+            timed_out = False
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    cwd=str(cwd),
+                    env=_sanitized_env(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    executable=self._shell,
+                )
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=effective_timeout if effective_timeout > 0 else None,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    timed_out = True
+                    stdout_bytes = b""
+                    stderr_bytes = f"命令超时 ({effective_timeout}s)".encode()
 
-        except Exception as e:
-            self._audit.record(
-                action="system_run_error",
-                target=command[:200],
-                actor=actor,
-                success=False,
-                error=str(e),
-            )
-            return {
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"执行失败: {e}",
-                "timed_out": False,
-            }
+            except Exception as e:
+                self._audit.record(
+                    action="system_run_error",
+                    target=command[:200],
+                    actor=actor,
+                    success=False,
+                    error=str(e),
+                )
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"执行失败: {e}",
+                    "timed_out": False,
+                }
 
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
-        exit_code = proc.returncode or 0
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            exit_code = proc.returncode or 0
 
         # 审计记录（执行后）
         self._audit.record(

@@ -147,8 +147,10 @@ def test_tool_loop_executes_tool_and_continues():
     assert events[0].event_type == "llm_response"
     assert events[1].event_type == "tool_call"
     assert events[1].data["tool"] == "echo"
+    assert events[1].data["call_id"]
     assert events[2].event_type == "tool_result"
     assert events[2].data["tool"] == "echo"
+    assert events[2].data["call_id"] == events[1].data["call_id"]
     assert events[2].data["success"] is True
     assert events[3].event_type == "llm_response"
 
