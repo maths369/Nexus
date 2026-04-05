@@ -235,13 +235,44 @@ class WeixinAdapter:
     def parse_update_message(self, account_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(payload, dict):
             return None
-        if "account_id" in payload and "text" in payload:
-            sender_user_id = str(payload.get("sender_user_id") or "").strip()
-            context_token = str(payload.get("context_token") or "").strip()
-            if sender_user_id and context_token:
-                self.set_context_token(account_id, sender_user_id, context_token)
-            return dict(payload)
-        return None
+        # 接受含 text 或 attachments 的事件（媒体消息可能无 text）
+        has_text = bool(str(payload.get("text") or "").strip())
+        has_attachments = bool(payload.get("attachments"))
+        if "account_id" not in payload or (not has_text and not has_attachments):
+            return None
+        sender_user_id = str(payload.get("sender_user_id") or "").strip()
+        context_token = str(payload.get("context_token") or "").strip()
+        if sender_user_id and context_token:
+            self.set_context_token(account_id, sender_user_id, context_token)
+        return dict(payload)
+
+    async def download_attachment(self, file_id: str) -> dict[str, Any]:
+        """从 Node 插件宿主下载附件文件字节。
+
+        Node 端的 GET /files/:file_id 返回原始二进制数据，
+        Content-Type 头包含 MIME 类型，
+        Content-Disposition 头包含文件名。
+        """
+        url = f"{self._plugin_host_base_url}/files/{file_id}"
+        response = await self._client.get(url, timeout=120.0)
+        response.raise_for_status()
+        # 从 Content-Disposition 中提取文件名
+        file_name = file_id
+        cd = response.headers.get("content-disposition") or ""
+        if "filename=" in cd:
+            # filename="xxx.png" 或 filename=xxx.png
+            part = cd.split("filename=", 1)[1].strip()
+            if part.startswith('"') and '"' in part[1:]:
+                file_name = part[1:part.index('"', 1)]
+            elif part:
+                file_name = part.split(";")[0].strip()
+        mime_type = response.headers.get("content-type") or "application/octet-stream"
+        return {
+            "bytes": response.content,
+            "file_name": file_name,
+            "mime_type": mime_type,
+            "size": len(response.content),
+        }
 
     async def send_text(
         self,

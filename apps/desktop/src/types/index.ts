@@ -13,6 +13,8 @@ export interface Document {
   path: string;
   content: string;
   modified: boolean;
+  kind?: "text" | "image";
+  previewUrl?: string;
 }
 
 export interface ChatMessage {

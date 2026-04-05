@@ -227,3 +227,46 @@ def test_switch_search_provider_updates_primary_search_engine(tmp_path):
     assert raw["search"]["provider"]["primary"] == "duckduckgo"
     persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert persisted["search"]["provider"]["primary"] == "duckduckgo"
+
+
+def test_load_nexus_settings_matches_model_and_channel_policies(tmp_path):
+    root = tmp_path
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "app.yaml").write_text(
+        "\n".join(
+            [
+                "model_policies:",
+                "  qwen3.5-plus:",
+                "    max_risk_level: high",
+                "  ollama-*:",
+                "    max_tools_count: 12",
+                "channel_policies:",
+                "  feishu:",
+                "    deny:",
+                "    - system_run",
+                "    groups:",
+                "      default:",
+                "        also_allow:",
+                "        - dispatch_subagent",
+                "subagent_policy:",
+                "  deny:",
+                "  - capability_promote",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_nexus_settings(root_dir=root)
+
+    assert settings.model_policy("qwen3.5-plus") == {"max_risk_level": "high"}
+    assert settings.model_policy("ollama-qwen") == {"max_tools_count": 12}
+    assert settings.channel_policy("feishu") == {
+        "deny": ["system_run"],
+        "also_allow": ["dispatch_subagent"],
+    }
+    assert settings.channel_policy("feishu", "default") == {
+        "deny": ["system_run"],
+        "also_allow": ["dispatch_subagent"],
+    }
+    assert settings.subagent_policy() == {"deny": ["capability_promote"]}

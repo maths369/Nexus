@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -27,8 +29,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # 默认参数
-DEFAULT_TOKEN_THRESHOLD = 80_000  # 超过此值触发 auto_compact
+DEFAULT_TOKEN_THRESHOLD = 80_000  # 超过此值触发 auto_compact（后备固定值）
 KEEP_RECENT_TOOL_RESULTS = 3     # micro_compact 保留最近 N 个 tool_result
+
+# 百分比阈值（借鉴 Claude Code autoCompact 策略）
+AUTO_COMPACT_RATIO = 0.80        # 上下文占 80% 时触发压缩
+BUFFER_TOKENS = 13_000           # 为 LLM 输出预留的 token 余量
+
+# 断路器: 连续压缩失败 N 次后跳过，防止 API 死循环
+MAX_CONSECUTIVE_COMPACT_FAILURES = 3
 
 
 class ContextCompressor:
@@ -42,26 +51,36 @@ class ContextCompressor:
         self,
         provider: ProviderGateway | None = None,
         transcript_dir: Path | None = None,
+        transcript_store: Any | None = None,
         token_threshold: int = DEFAULT_TOKEN_THRESHOLD,
         keep_recent: int = KEEP_RECENT_TOOL_RESULTS,
         summarization_model: str | None = None,
         memory_flush_callback: Any | None = None,
+        context_window_tokens: int = 0,
     ):
         self._provider = provider
         self._transcript_dir = transcript_dir
-        self._token_threshold = token_threshold
+        self._transcript_store = transcript_store
         self._keep_recent = keep_recent
         self._summarization_model = summarization_model
         self._memory_flush_callback = memory_flush_callback
+        # 根据模型上下文窗口计算压缩阈值（百分比策略）
+        if context_window_tokens > 0:
+            self._token_threshold = int(context_window_tokens * AUTO_COMPACT_RATIO) - BUFFER_TOKENS
+        else:
+            self._token_threshold = token_threshold
         # 统计
         self._micro_compact_count = 0
         self._auto_compact_count = 0
+        # 断路器状态
+        self._consecutive_compact_failures = 0
 
     @property
     def stats(self) -> dict[str, int]:
         return {
             "micro_compact_count": self._micro_compact_count,
             "auto_compact_count": self._auto_compact_count,
+            "consecutive_compact_failures": self._consecutive_compact_failures,
         }
 
     def describe(self) -> dict[str, Any]:
@@ -76,7 +95,11 @@ class ContextCompressor:
                     "enabled": True,
                     "token_threshold": self._token_threshold,
                     "summarization_model": self._summarization_model or "qwen-max",
-                    "transcript_dir": str(self._transcript_dir) if self._transcript_dir else None,
+                    "transcript_dir": (
+                        str(self._transcript_dir)
+                        if self._transcript_dir
+                        else str(getattr(self._transcript_store, "base_dir", "")) or None
+                    ),
                 },
                 "manual_compact": {
                     "enabled": True,
@@ -91,7 +114,11 @@ class ContextCompressor:
     # ------------------------------------------------------------------
 
     async def compress_before_call(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        run_id: str | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         在每轮 LLM 调用前执行压缩管线。
@@ -101,21 +128,45 @@ class ContextCompressor:
         # Layer 1: micro_compact（每轮静默执行）
         self._micro_compact(messages)
 
-        # Layer 2: auto_compact（超阈值时触发）
+        # Layer 2: auto_compact（超阈值时触发，含断路器保护）
         token_est = estimate_messages_tokens(messages)
         if token_est > self._token_threshold:
-            logger.info(
-                "Auto-compact triggered: ~%d tokens > threshold %d",
-                token_est, self._token_threshold,
-            )
-            # 压缩前记忆 flush — 避免"压缩即遗忘"
-            if self._memory_flush_callback is not None:
+            if self._consecutive_compact_failures >= MAX_CONSECUTIVE_COMPACT_FAILURES:
+                logger.warning(
+                    "Auto-compact skipped: circuit breaker open "
+                    "(%d consecutive failures, threshold %d)",
+                    self._consecutive_compact_failures,
+                    MAX_CONSECUTIVE_COMPACT_FAILURES,
+                )
+            else:
+                logger.info(
+                    "Auto-compact triggered: ~%d tokens > threshold %d (%.0f%%)",
+                    token_est, self._token_threshold,
+                    token_est / max(self._token_threshold, 1) * 100,
+                )
+                # 压缩前记忆 flush — 避免"压缩即遗忘"
+                if self._memory_flush_callback is not None:
+                    try:
+                        flush_result = await self._memory_flush_callback(messages)
+                        logger.info("Memory flush before compact: %s", flush_result)
+                    except Exception as e:
+                        logger.warning("Memory flush failed: %s", e)
                 try:
-                    flush_result = await self._memory_flush_callback(messages)
-                    logger.info("Memory flush before compact: %s", flush_result)
+                    messages = await self._auto_compact(
+                        messages,
+                        run_id=run_id,
+                        session_id=session_id,
+                    )
+                    # 压缩成功，重置断路器
+                    self._consecutive_compact_failures = 0
                 except Exception as e:
-                    logger.warning("Memory flush failed: %s", e)
-            messages = await self._auto_compact(messages)
+                    self._consecutive_compact_failures += 1
+                    logger.error(
+                        "Auto-compact failed (%d/%d): %s",
+                        self._consecutive_compact_failures,
+                        MAX_CONSECUTIVE_COMPACT_FAILURES,
+                        e,
+                    )
 
         return messages
 
@@ -124,13 +175,23 @@ class ContextCompressor:
     # ------------------------------------------------------------------
 
     async def manual_compact(
-        self, messages: list[dict[str, Any]], focus: str = "",
+        self,
+        messages: list[dict[str, Any]],
+        focus: str = "",
+        *,
+        run_id: str | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         手动触发压缩，与 auto_compact 相同逻辑，但可指定保留重点。
         """
         logger.info("Manual compact triggered, focus=%s", focus[:80])
-        return await self._auto_compact(messages, focus=focus)
+        return await self._auto_compact(
+            messages,
+            focus=focus,
+            run_id=run_id,
+            session_id=session_id,
+        )
 
     # ------------------------------------------------------------------
     # Layer 1: micro_compact
@@ -192,7 +253,12 @@ class ContextCompressor:
     # ------------------------------------------------------------------
 
     async def _auto_compact(
-        self, messages: list[dict[str, Any]], focus: str = "",
+        self,
+        messages: list[dict[str, Any]],
+        focus: str = "",
+        *,
+        run_id: str | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         保存完整 transcript → LLM 总结 → 替换为 [summary]。
@@ -200,7 +266,11 @@ class ContextCompressor:
         返回新的 messages 列表（2 条: compressed summary + ack）。
         """
         # 保存 transcript
-        transcript_path = self._save_transcript(messages)
+        transcript_path = self._save_transcript(
+            messages,
+            run_id=run_id,
+            session_id=session_id,
+        )
 
         # 提取 system message（总是保留）
         system_msg = None
@@ -244,7 +314,7 @@ class ContextCompressor:
         """用 LLM 生成对话摘要"""
         # 如果没有 provider，用规则摘要
         if not self._provider:
-            return self._rule_based_summary(messages)
+            return self._append_missing_identifiers(messages, self._rule_based_summary(messages))
 
         # 构建总结请求
         conversation_text = self._messages_to_text(messages)
@@ -266,6 +336,7 @@ class ContextCompressor:
                         "2) 当前状态和进展\n"
                         "3) 关键决策和结论\n"
                         "4) 待处理的事项\n"
+                        "5) 必须保留所有关键标识符：文件路径、函数名、变量名、task id、run id、session id。\n"
                         "简洁但保留关键细节。"
                         f"{focus_instruction}\n\n"
                         f"{conversation_text}"
@@ -275,23 +346,48 @@ class ContextCompressor:
                 temperature=0.3,
             )
             assistant_msg = response.get("message", {})
-            return assistant_msg.get("content", "") or self._rule_based_summary(messages)
+            summary = assistant_msg.get("content", "") or self._rule_based_summary(messages)
+            return self._append_missing_identifiers(messages, summary)
         except Exception as e:
             logger.warning("LLM summarization failed: %s, using rule-based", e)
-            return self._rule_based_summary(messages)
+            return self._append_missing_identifiers(messages, self._rule_based_summary(messages))
 
-    def _save_transcript(self, messages: list[dict[str, Any]]) -> str | None:
+    def _save_transcript(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        run_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str | None:
         """保存完整 transcript 到磁盘"""
+        transcript_id = session_id or run_id or f"transcript_{int(time.time() * 1000)}"
+        if self._transcript_store is not None:
+            try:
+                return self._transcript_store.append_snapshot(
+                    transcript_id,
+                    messages,
+                    trigger="compact",
+                    metadata={"run_id": run_id, "session_id": session_id},
+                )
+            except Exception as e:
+                logger.warning("Failed to save transcript via TranscriptStore: %s", e)
         if not self._transcript_dir:
             return None
 
         self._transcript_dir.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time() * 1000)
-        path = self._transcript_dir / f"transcript_{ts}.jsonl"
+        safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in transcript_id)
+        path = self._transcript_dir / f"{safe_id}.jsonl"
         try:
-            with path.open("w", encoding="utf-8") as f:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "kind": "snapshot",
+                    "timestamp": datetime.now().isoformat(),
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "message_count": len(messages),
+                }, ensure_ascii=False, default=str) + "\n")
                 for msg in messages:
-                    f.write(json.dumps(msg, ensure_ascii=False, default=str) + "\n")
+                    f.write(json.dumps({"kind": "message", "message": msg}, ensure_ascii=False, default=str) + "\n")
             return str(path)
         except Exception as e:
             logger.warning("Failed to save transcript: %s", e)
@@ -341,3 +437,46 @@ class ContextCompressor:
         if tool_count:
             lines.append(f"共执行了 {tool_count} 次工具调用")
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_identifiers(messages: list[dict[str, Any]]) -> list[str]:
+        text = ContextCompressor._messages_to_text(messages)
+        patterns = [
+            r"`([^`]{2,120})`",
+            r"\b(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+\b",
+            r"\b(?:task|run|session|sub)-[A-Za-z0-9_-]+\b",
+            r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b",
+        ]
+        candidates: list[str] = []
+        for pattern in patterns:
+            for match in re.findall(pattern, text):
+                identifier = match if isinstance(match, str) else ""
+                if not identifier:
+                    continue
+                if identifier.lower() in {"assistant", "system", "user", "tool", "called", "tools"}:
+                    continue
+                if len(identifier) > 120:
+                    continue
+                candidates.append(identifier)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            if item in seen:
+                continue
+            seen.add(item)
+            ordered.append(item)
+        return ordered[:40]
+
+    @classmethod
+    def _append_missing_identifiers(
+        cls,
+        messages: list[dict[str, Any]],
+        summary: str,
+    ) -> str:
+        identifiers = cls._extract_identifiers(messages)
+        if not identifiers:
+            return summary
+        missing = [identifier for identifier in identifiers if identifier not in summary]
+        if not missing:
+            return summary
+        return summary.rstrip() + "\n\n关键标识符:\n- " + "\n- ".join(missing[:20])

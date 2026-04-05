@@ -13,7 +13,14 @@ def test_remote_audio_worker_client_parses_transcription_payload(monkeypatch):
         "language": "zh",
         "duration": 12.5,
         "segments": [
-            {"start": 0.0, "end": 12.5, "text": "今天确认先做接入层。", "confidence": 0.98}
+            {
+                "start": 0.0,
+                "end": 12.5,
+                "text": "今天确认先做接入层。",
+                "confidence": 0.98,
+                "speaker_id": "speaker_0",
+                "speaker_name": "杨磊",
+            }
         ],
     }
 
@@ -24,9 +31,11 @@ def test_remote_audio_worker_client_parses_transcription_payload(monkeypatch):
     monkeypatch.setattr(httpx.Client, "post", fake_post)
 
     client = RemoteAudioWorkerClient("http://audio-worker:8010")
-    result = client.transcribe(Path("/tmp/demo.wav"), language="zh")
+    result = client.transcribe(Path("/tmp/demo.wav"), language="zh", diarize=True)
 
     assert result.text == "今天确认先做接入层。"
     assert result.language == "zh"
     assert result.duration == 12.5
     assert result.segments[0].text == "今天确认先做接入层。"
+    assert result.segments[0].speaker_id == "speaker_0"
+    assert result.segments[0].speaker_name == "杨磊"

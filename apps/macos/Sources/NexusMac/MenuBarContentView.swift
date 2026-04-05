@@ -159,9 +159,13 @@ struct MenuBarContentView: View {
                 if let health = model.mlxHealth {
                     VStack(alignment: .leading, spacing: 8) {
                         NexusInlineStatusRow(label: "Model", value: health.model, tone: NexusPalette.cyan)
-                        NexusInlineStatusRow(label: "Device", value: health.device, tone: NexusPalette.mint)
                         NexusInlineStatusRow(label: "Loaded", value: health.loaded ? "Yes" : "No", tone: health.loaded ? NexusPalette.mint : NexusPalette.amber)
-                        NexusInlineStatusRow(label: "Cache", value: health.cacheDir, tone: NexusPalette.steel)
+                        if let device = health.device {
+                            NexusInlineStatusRow(label: "Device", value: device, tone: NexusPalette.mint)
+                        }
+                        if let cacheDir = health.cacheDir {
+                            NexusInlineStatusRow(label: "Cache", value: cacheDir, tone: NexusPalette.steel)
+                        }
                     }
                 } else {
                     VStack(alignment: .leading, spacing: 8) {

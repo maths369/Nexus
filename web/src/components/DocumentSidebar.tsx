@@ -14,9 +14,10 @@ const SECTION_META: Record<string, { label: string; icon: string; order: number 
   inbox:    { label: "收件箱", icon: "📥", order: 1 },
   journals: { label: "日志",   icon: "📔", order: 2 },
   meetings: { label: "会议",   icon: "🤝", order: 3 },
-  strategy: { label: "策略",   icon: "🎯", order: 4 },
-  rnd:      { label: "研发",   icon: "🔬", order: 5 },
-  life:     { label: "生活",   icon: "🌿", order: 6 },
+  knowledge:{ label: "知识库", icon: "🧠", order: 4 },
+  strategy: { label: "策略",   icon: "🎯", order: 5 },
+  rnd:      { label: "研发",   icon: "🔬", order: 6 },
+  life:     { label: "生活",   icon: "🌿", order: 7 },
 };
 
 type SectionNode = {
@@ -139,6 +140,7 @@ interface DocumentSidebarProps {
   newPageTitle: string;
   onNewPageTitleChange: (v: string) => void;
   onCreatePage: (e: FormEvent) => void;
+  mobile?: boolean;
 }
 
 export default function DocumentSidebar({
@@ -151,11 +153,12 @@ export default function DocumentSidebar({
   newPageTitle,
   onNewPageTitleChange,
   onCreatePage,
+  mobile = false,
 }: DocumentSidebarProps) {
   const tree = useMemo(() => buildTree(pages), [pages]);
 
   return (
-    <div className="sidebar-inner">
+    <div className={`sidebar-inner ${mobile ? "sidebar-inner-mobile" : ""}`}>
       <div className="sidebar-header">
         <h2>文档</h2>
         <button className="ghost-button" onClick={onRefresh}>刷新</button>
@@ -168,7 +171,7 @@ export default function DocumentSidebar({
           <input
             value={newPageTitle}
             onChange={(e) => onNewPageTitleChange(e.target.value)}
-            placeholder="新页面标题"
+            placeholder={mobile ? "新建移动笔记" : "新页面标题"}
           />
           <button type="submit" className="create-page-btn" title="创建">+</button>
         </div>

@@ -28,6 +28,8 @@ from .types import (
 )
 from .core import execute_tool_loop
 from .tool_profiles import ToolProfile
+from .tools_policy import PolicyLayer
+from .types import ToolRiskLevel
 
 if TYPE_CHECKING:
     from .attempt import AttemptBuilder
@@ -35,10 +37,13 @@ if TYPE_CHECKING:
     from .background import BackgroundTaskManager
     from .compressor import ContextCompressor
     from .run_store import RunStore
+    from .transcript import TranscriptWriter
     from .todo import TodoManager
     from .tools_policy import ToolsPolicy
     from nexus.evolution import CapabilityManager, CapabilityPromotionAdvisor
     from nexus.evolution.skill_manager import SkillManager
+    from nexus.knowledge.memory_manager import MemoryManager
+    from nexus.shared.config import NexusSettings
 
 from nexus.provider.gateway import ProviderGateway, ProviderGatewayError
 
@@ -68,7 +73,10 @@ class RunManager:
         capability_promotion_advisor: CapabilityPromotionAdvisor | None = None,
         capability_manager: CapabilityManager | None = None,
         skill_manager: SkillManager | None = None,
+        memory_manager: MemoryManager | None = None,
         approval_engine: ApprovalEngine | None = None,
+        transcript_writer: TranscriptWriter | None = None,
+        settings: NexusSettings | None = None,
     ):
         self._store = run_store
         self._attempt = attempt_builder
@@ -81,7 +89,10 @@ class RunManager:
         self._capability_promotion_advisor = capability_promotion_advisor
         self._capability_manager = capability_manager
         self._skill_manager = skill_manager
+        self._memory_manager = memory_manager
         self._approval_engine = approval_engine
+        self._transcript_writer = transcript_writer
+        self._settings = settings
 
     async def execute(
         self,
@@ -93,6 +104,8 @@ class RunManager:
         extra_tools=None,
         disabled_tool_names=None,
         tool_profile: ToolProfile | None = None,
+        channel: str | None = None,
+        group_id: str | None = None,
     ) -> Run:
         """
         执行一个新的 Run。
@@ -130,6 +143,8 @@ class RunManager:
 
             try:
                 await self._transition(run, RunStatus.RUNNING)
+                events: list[RunEvent] = []
+                result_text = ""
 
                 preflight_events = await self._maybe_prepare_extensions_for_task(run)
                 for event in preflight_events:
@@ -138,6 +153,19 @@ class RunManager:
                     await self._store.save_run(run)
 
                 # 构建 AttemptConfig
+                run_tools_policy = self._build_run_tools_policy(
+                    model=current_model,
+                    tool_profile=tool_profile,
+                    channel=channel,
+                    group_id=group_id,
+                )
+                run.metadata["tool_policy_layers"] = [
+                    layer.name for layer in getattr(run_tools_policy, "_layers", [])
+                ]
+                if channel:
+                    run.metadata["channel"] = channel
+                if group_id:
+                    run.metadata["group_id"] = group_id
                 config = await self._attempt.build(
                     run=run,
                     context_messages=context_messages,
@@ -145,20 +173,21 @@ class RunManager:
                     stream_callback=stream_callback,
                     extra_tools=extra_tools,
                     disabled_tool_names=set(disabled_tool_names or []),
-                    tool_profile=tool_profile,
+                    tool_pipeline=run_tools_policy,
                 )
 
                 # 执行工具调用循环
                 result_text, events = await execute_tool_loop(
                     config=config,
                     provider=self._provider,
-                    tools_policy=self._policy,
+                    tools_policy=run_tools_policy,
                     run_id=run.run_id,
                     compressor=self._compressor,
                     todo_manager=self._todo_manager,
                     background_manager=self._background_manager,
                     approval_engine=self._approval_engine,
                     session_id=session_id,
+                    channel=channel,
                 )
 
                 self._record_successful_mesh_dispatches(run, events)
@@ -190,15 +219,33 @@ class RunManager:
                         events.append(suggestion_event)
                         await self._store.save_event(suggestion_event)
 
+                await self._record_run_memory(
+                    run,
+                    events=events,
+                    success=True,
+                    outcome_text=result_text,
+                )
+
                 # 成功
                 run.result = result_text
                 await self._transition(run, RunStatus.SUCCEEDED)
+                await self._maybe_write_run_snapshot(
+                    run=run,
+                    attempt_config=config,
+                    tool_profile=tool_profile,
+                )
 
             except ContextOverflowError:
                 logger.warning(f"[{run.run_id}] Context overflow, will retry with truncation")
                 # TODO: 上下文截断后重试
                 run.error = "context_overflow"
                 if not run.can_retry:
+                    await self._record_run_memory(
+                        run,
+                        events=[],
+                        success=False,
+                        outcome_text="context_overflow",
+                    )
                     await self._transition(run, RunStatus.FAILED)
 
             except (ProviderError, ProviderGatewayError) as e:
@@ -207,11 +254,23 @@ class RunManager:
                 if run.can_retry:
                     logger.info(f"[{run.run_id}] Will retry with fallback model")
                 else:
+                    await self._record_run_memory(
+                        run,
+                        events=[],
+                        success=False,
+                        outcome_text=run.error or "",
+                    )
                     await self._transition(run, RunStatus.FAILED)
 
             except Exception as e:
                 logger.error(f"[{run.run_id}] Unexpected error: {e}", exc_info=True)
                 run.error = str(e)
+                await self._record_run_memory(
+                    run,
+                    events=events if "events" in locals() else [],
+                    success=False,
+                    outcome_text=run.error or "",
+                )
                 await self._transition(run, RunStatus.FAILED)
 
         return run
@@ -739,6 +798,135 @@ class RunManager:
             seen.add(record["relative_path"])
             existing.append(record)
 
+    async def _record_run_memory(
+        self,
+        run: Run,
+        *,
+        events: list[RunEvent],
+        success: bool,
+        outcome_text: str,
+    ) -> None:
+        if self._memory_manager is None:
+            return
+        if run.metadata.get("workflow_memory_recorded") is True:
+            return
+
+        payload = await self._memory_manager.capture_workflow_outcome(
+            task=run.task,
+            result=outcome_text,
+            events=events,
+            success=success,
+            session_id=run.session_id,
+            run_id=run.run_id,
+        )
+        if payload.get("saved"):
+            run.metadata["workflow_memory_recorded"] = True
+            run.metadata["workflow_memory"] = payload
+            await self._store.save_event(RunEvent(
+                event_id=str(uuid.uuid4()),
+                run_id=run.run_id,
+                event_type="workflow_memory_saved",
+                data=payload,
+            ))
+
+        if not success:
+            return
+
+        suggestion = self._memory_manager.suggest_evolution_opportunity(task=run.task)
+        if suggestion is None:
+            return
+        run.metadata["memory_evolution_suggestion"] = suggestion
+        await self._store.save_event(RunEvent(
+            event_id=str(uuid.uuid4()),
+            run_id=run.run_id,
+            event_type="memory_evolution_suggested",
+            data=suggestion,
+        ))
+
+    def _build_run_tools_policy(
+        self,
+        *,
+        model: str,
+        tool_profile: ToolProfile | None,
+        channel: str | None,
+        group_id: str | None,
+    ):
+        layers: list[PolicyLayer] = []
+        if tool_profile is not None and tool_profile.name != "full":
+            layers.append(
+                PolicyLayer(
+                    name=f"profile:{tool_profile.name}",
+                    allow=sorted(tool_profile.include) if tool_profile.include is not None else None,
+                    deny=sorted(tool_profile.exclude),
+                    also_allow=sorted(tool_profile.also_allow),
+                    max_risk_level=tool_profile.max_risk_level,
+                )
+            )
+
+        if self._settings is not None:
+            model_cfg = self._settings.model_policy(model)
+            if model_cfg:
+                layers.append(
+                    PolicyLayer(
+                        name=f"model:{model}",
+                        allow=_normalize_patterns(model_cfg.get("allow")),
+                        deny=_normalize_patterns(model_cfg.get("deny")),
+                        also_allow=_normalize_patterns(model_cfg.get("also_allow")),
+                        max_risk_level=_parse_risk_level(model_cfg.get("max_risk_level")),
+                        max_tools_count=_coerce_int(model_cfg.get("max_tools_count")),
+                    )
+                )
+
+            if channel:
+                channel_cfg = self._settings.channel_policy(channel, group_id)
+                if channel_cfg:
+                    layers.append(
+                        PolicyLayer(
+                            name=f"channel:{channel}",
+                            allow=_normalize_patterns(channel_cfg.get("allow")),
+                            deny=_normalize_patterns(channel_cfg.get("deny")),
+                            also_allow=_normalize_patterns(channel_cfg.get("also_allow")),
+                            max_risk_level=_parse_risk_level(channel_cfg.get("max_risk_level")),
+                            max_tools_count=_coerce_int(channel_cfg.get("max_tools_count")),
+                        )
+                    )
+
+            if str(channel or "").strip().lower() == "subagent":
+                subagent_cfg = self._settings.subagent_policy()
+                if subagent_cfg:
+                    layers.append(
+                        PolicyLayer(
+                            name="subagent",
+                            allow=_normalize_patterns(subagent_cfg.get("allow")),
+                            deny=_normalize_patterns(subagent_cfg.get("deny")),
+                            also_allow=_normalize_patterns(subagent_cfg.get("also_allow")),
+                            max_risk_level=_parse_risk_level(subagent_cfg.get("max_risk_level")),
+                            max_tools_count=_coerce_int(subagent_cfg.get("max_tools_count")),
+                        )
+                    )
+
+        return self._policy.with_layers(*layers)
+
+    async def _maybe_write_run_snapshot(
+        self,
+        *,
+        run: Run,
+        attempt_config: AttemptConfig,
+        tool_profile: ToolProfile | None,
+    ) -> None:
+        if self._transcript_writer is None:
+            return
+        try:
+            events = await self._store.get_events(run.run_id)
+            self._transcript_writer.write_run_snapshot(
+                run=run,
+                attempt=attempt_config,
+                events=events,
+                tool_profile=tool_profile.name if tool_profile else None,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to write run transcript snapshot: %s", run.run_id, exc)
+
     # ------------------------------------------------------------------
     # 状态转换
     # ------------------------------------------------------------------
@@ -779,3 +967,33 @@ class RunManager:
         if idx < len(self._fallback_models):
             return self._fallback_models[idx]
         return run.model
+
+
+def _normalize_patterns(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        patterns = [str(item).strip() for item in value if str(item).strip()]
+        return patterns
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_risk_level(value: Any) -> ToolRiskLevel | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, ToolRiskLevel):
+        return value
+    try:
+        return ToolRiskLevel(str(value).strip().lower())
+    except ValueError:
+        return None

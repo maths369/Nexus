@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import socket
 import time
@@ -26,10 +27,15 @@ from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
+from nexus.api.auth_middleware import (
+    AuthConfig,
+    NexusAuthMiddleware,
+    resolve_websocket_token,
+)
 from nexus.api.runtime import NexusRuntime, build_runtime, start_mesh_runtime, stop_mesh_runtime
 from nexus.channel.adapter_feishu import FeishuAdapter, FeishuLongConnectionRunner
 from nexus.channel.adapter_weixin import WeixinAdapter, WeixinLongPollRunner
@@ -56,6 +62,8 @@ _settings: NexusSettings | None = None
 _DEDUP_TTL_SECONDS = 300  # 5 分钟内的重复消息会被忽略
 _seen_message_ids: dict[str, float] = {}  # message_id → first_seen_timestamp
 _seen_weixin_message_ids: dict[str, float] = {}
+_boot_settings = load_nexus_settings()
+_boot_auth_config = AuthConfig.from_mapping(_boot_settings.auth_config())
 
 
 def _hub_reply_signature() -> str:
@@ -258,7 +266,12 @@ def _make_feishu_reply(chat_id: str):
     return send_feishu_reply
 
 
-def _build_weixin_inbound(event: dict[str, object], *, content: str) -> InboundMessage:
+def _build_weixin_inbound(
+    event: dict[str, object],
+    *,
+    content: str,
+    attachments: list[dict[str, object]] | None = None,
+) -> InboundMessage:
     account_id = str(event.get("account_id") or "").strip() or "default"
     sender_user_id = str(event.get("sender_user_id") or "").strip()
     sender_key = f"{account_id}:{sender_user_id}" if sender_user_id else account_id
@@ -277,7 +290,7 @@ def _build_weixin_inbound(event: dict[str, object], *, content: str) -> InboundM
             "context_token": str(event.get("context_token") or ""),
             "session_id": str(event.get("session_id") or ""),
         },
-        attachments=[],
+        attachments=attachments or [],
     )
 
 
@@ -420,17 +433,30 @@ async def _dispatch_weixin_event(event: dict[str, object]) -> None:
             return
         _seen_weixin_message_ids[dedup_key] = now
 
+    attachment_count = len(event.get("attachments") or []) if isinstance(event.get("attachments"), list) else 0
     content = str(event.get("text") or "").strip()
-    if not content:
-        logger.warning(
-            "Weixin empty text ignored: account_id=%s sender=%s message_id=%s",
-            event.get("account_id"),
-            event.get("sender_user_id"),
-            event.get("message_id"),
-        )
-        return
+    logger.warning(
+        "Weixin inbound dispatch start: message_id=%s sender=%s account_id=%s type=%s attachments=%s text=%s",
+        event.get("message_id"),
+        event.get("sender_user_id"),
+        event.get("account_id"),
+        event.get("message_type"),
+        attachment_count,
+        content[:200],
+    )
 
-    inbound = _build_weixin_inbound(event, content=content)
+    # 附件摄取
+    artifact_attachments: list[dict[str, object]] = []
+    artifact_summary = ""
+    attachments = event.get("attachments")
+    if isinstance(attachments, list) and attachments:
+        artifact_attachments, artifact_summary = await _ingest_weixin_artifacts(event, attachments)
+
+    combined_content = "\n\n".join(part for part in [content, artifact_summary] if part).strip()
+    if not combined_content:
+        combined_content = "用户发送了附件，请基于附件摘要继续处理。"
+
+    inbound = _build_weixin_inbound(event, content=combined_content, attachments=artifact_attachments)
     try:
         await _orchestrator.handle_message(
             inbound,
@@ -454,6 +480,61 @@ async def _dispatch_weixin_event(event: dict[str, object]) -> None:
         event.get("sender_user_id"),
         event.get("message_id"),
     )
+
+
+async def _ingest_weixin_artifacts(
+    event: dict[str, object],
+    attachments: list[object],
+) -> tuple[list[dict[str, object]], str]:
+    """下载微信附件并通过 ArtifactService 摄取，返回 (附件负载列表, 摘要文本)。"""
+    runtime = _require_runtime()
+    if _weixin_adapter is None:
+        return [], ""
+
+    payloads: list[dict[str, object]] = []
+    results = []
+    lines = ["[附加资产摘要]"]
+    for raw in attachments:
+        if not isinstance(raw, dict):
+            continue
+        file_id = str(raw.get("file_id") or "").strip()
+        if not file_id:
+            continue
+        try:
+            downloaded = await _weixin_adapter.download_attachment(file_id)
+            result = await runtime.artifact_service.ingest_bytes(
+                artifact_type=str(raw.get("attachment_type") or "file"),
+                source="weixin",
+                data=bytes(downloaded.get("bytes") or b""),
+                filename=str(downloaded.get("file_name") or raw.get("file_name") or ""),
+                mime_type=str(downloaded.get("mime_type") or raw.get("mime_type") or ""),
+                metadata={
+                    "account_id": str(event.get("account_id") or ""),
+                    "message_id": str(event.get("message_id") or ""),
+                    "sender_user_id": str(event.get("sender_user_id") or ""),
+                    "attachment_type": str(raw.get("attachment_type") or "file"),
+                },
+            )
+            results.append(result)
+            payloads.append(result.attachment_payload())
+            lines.append(f"- {result.summary_line()}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("微信附件摄取失败: file_id=%s err=%s", file_id, exc, exc_info=True)
+            name = str(raw.get("file_name") or file_id)
+            lines.append(f"- 资产 `{name}` 下载/物化失败：{exc}")
+    if len(results) > 1:
+        manifest = await runtime.artifact_service.create_batch_manifest(
+            results,
+            source="weixin",
+            metadata={
+                "account_id": str(event.get("account_id") or ""),
+                "message_id": str(event.get("message_id") or ""),
+                "sender_user_id": str(event.get("sender_user_id") or ""),
+            },
+        )
+        if manifest.page_relative_path:
+            lines.append(f"- 批量导入清单：`{manifest.page_relative_path}`")
+    return payloads, "\n".join(lines) if len(lines) > 1 else ""
 
 
 async def _ingest_feishu_artifacts(
@@ -517,7 +598,14 @@ async def lifespan(app: FastAPI):
     global _weixin_adapter, _weixin_longpoll_runner, _settings
 
     _settings = load_nexus_settings()
+    app.state.auth_config = AuthConfig.from_mapping(_settings.auth_config())
     _runtime = build_runtime(settings=_settings)
+    session_manager = getattr(_runtime, "session_manager", None)
+    if session_manager is not None and hasattr(session_manager, "start"):
+        await session_manager.start()
+    heartbeat_engine = getattr(_runtime, "heartbeat_engine", None)
+    if heartbeat_engine is not None and hasattr(heartbeat_engine, "start"):
+        await heartbeat_engine.start()
     try:
         identity_stats = await _runtime.memory_manager.reindex_identity_documents(force=False)
         logger.info("Identity documents indexed at startup: %s", identity_stats)
@@ -551,14 +639,17 @@ async def lifespan(app: FastAPI):
         context_window=_runtime.context_window,
         run_manager=_runtime.run_manager,
         formatter=MessageFormatter(),
-        provider_gateway=_runtime.provider,
-        search_config=_runtime.search_config,
-        config_path=_runtime.settings.config_path,
+        provider_gateway=getattr(_runtime, "provider", None),
+        search_config=getattr(_runtime, "search_config", None),
+        config_path=getattr(getattr(_runtime, "settings", None), "config_path", None),
         available_tools=_runtime.available_tools,
         skill_manager=_runtime.skill_manager,
         capability_manager=_runtime.capability_manager,
         task_router=getattr(_runtime, "mesh_task_router", None),
         mesh_registry=getattr(_runtime, "mesh_registry", None),
+        session_manager=getattr(_runtime, "session_manager", None),
+        memory_manager=getattr(_runtime, "memory_manager", None),
+        external_base_url=_settings.external_base_url,
     )
     feishu_config = _settings.feishu_config()
     _feishu_adapter = FeishuAdapter(feishu_config) if feishu_config.get("enabled") else None
@@ -609,6 +700,12 @@ async def lifespan(app: FastAPI):
     if _weixin_longpoll_runner is not None:
         _weixin_longpoll_runner.shutdown()
     if _runtime is not None:
+        heartbeat_engine = getattr(_runtime, "heartbeat_engine", None)
+        if heartbeat_engine is not None and hasattr(heartbeat_engine, "stop"):
+            await heartbeat_engine.stop()
+        session_manager = getattr(_runtime, "session_manager", None)
+        if session_manager is not None and hasattr(session_manager, "stop"):
+            await session_manager.stop()
         await stop_mesh_runtime(_runtime)
         await _runtime.background_manager.aclose()
         await _runtime.browser_service.aclose()
@@ -634,6 +731,8 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.state.auth_config = _boot_auth_config
+app.add_middleware(NexusAuthMiddleware, config=_boot_auth_config)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -654,6 +753,15 @@ app.add_middleware(
 )
 
 
+def _current_auth_config() -> AuthConfig:
+    if _settings is not None:
+        return AuthConfig.from_mapping(_settings.auth_config())
+    state_config = getattr(app.state, "auth_config", None)
+    if isinstance(state_config, AuthConfig):
+        return state_config
+    return _boot_auth_config
+
+
 # ---------------------------------------------------------------------------
 # 健康检查
 # ---------------------------------------------------------------------------
@@ -662,6 +770,18 @@ app.add_middleware(
 async def health():
     """基础健康检查"""
     return {"status": "ok", "version": "0.1.0"}
+
+
+@app.get("/auth/session")
+async def auth_session():
+    """Protected endpoint used by the web client to validate auth state."""
+    config = _current_auth_config()
+    return {
+        "authenticated": True,
+        "auth_enabled": config.enabled,
+        "cookie_name": config.cookie_name,
+        "external_base_url": _settings.external_base_url if _settings is not None else "",
+    }
 
 
 @app.get("/health/providers")
@@ -889,6 +1009,13 @@ async def weixin_login_wait(payload: WeixinLoginWaitRequest):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """Web 前端 WebSocket 端点"""
+    auth_config = _current_auth_config()
+    if auth_config.enabled:
+        token = resolve_websocket_token(websocket, auth_config)
+        if not auth_config.is_authorized(token):
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+
     await websocket.accept()
     ws_id = str(id(websocket))
     logger.info(f"WebSocket connected: {ws_id}")
@@ -1042,8 +1169,9 @@ async def recent_documents(limit: int = 20):
 @app.get("/documents/page")
 async def get_document_page(path: str):
     runtime = _require_runtime()
-    page = runtime.structural_index.get_page_by_path(path)
-    if page is None:
+    try:
+        page = await runtime.document_service.get_page(path)
+    except FileNotFoundError:
         return JSONResponse(status_code=404, content={"error": f"Page not found: {path}"})
     content = runtime.document_service.read_page(path)
     backlinks = runtime.structural_index.get_backlinks(page.page_id)
@@ -1467,6 +1595,27 @@ async def vault_read(path: str):
         return {"path": path, "content": content}
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.get("/vault/file")
+async def vault_file(path: str):
+    """Return a vault file as raw bytes for inline preview."""
+    file_path = _safe_vault_path(path)
+    if not file_path.is_file():
+        return JSONResponse(status_code=404, content={"error": f"File not found: {path}"})
+    media_type, _ = mimetypes.guess_type(str(file_path))
+    return FileResponse(
+        file_path,
+        media_type=media_type or "application/octet-stream",
+        filename=file_path.name,
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
+@app.get("/documents/file")
+async def document_file(path: str):
+    """Alias for raw vault file access from the authenticated document UI."""
+    return await vault_file(path)
 
 
 @app.put("/vault/write")

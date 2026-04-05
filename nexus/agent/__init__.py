@@ -19,14 +19,24 @@ Agent Core — 工具调用循环与 Run 状态机
 
 from .background import BackgroundTaskManager
 from .compressor import ContextCompressor
+from .heartbeat import HeartbeatEngine
+from .session_manager import SessionManager
+from .subagent_registry import SubagentRegistry
 from .subagent import SubagentRunner
 from .task_dag import TaskDAG
+from .transcript import TranscriptWriter
+from .transcript_store import TranscriptStore
 from .todo import TodoManager
 
 __all__ = [
     "BackgroundTaskManager",
     "ContextCompressor",
+    "HeartbeatEngine",
+    "SessionManager",
+    "SubagentRegistry",
     "SubagentRunner",
     "TaskDAG",
+    "TranscriptWriter",
+    "TranscriptStore",
     "TodoManager",
 ]

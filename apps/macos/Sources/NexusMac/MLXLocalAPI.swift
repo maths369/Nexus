@@ -113,8 +113,8 @@ struct MLXLocalAPIHealthResponse: Decodable {
     let status: String
     let model: String
     let loaded: Bool
-    let device: String
-    let cacheDir: String
+    let device: String?
+    let cacheDir: String?
 
     enum CodingKeys: String, CodingKey {
         case status
@@ -122,6 +122,31 @@ struct MLXLocalAPIHealthResponse: Decodable {
         case loaded
         case device
         case cacheDir = "cache_dir"
+        case loadedModel = "loaded_model"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        status = (try? container.decode(String.self, forKey: .status)) ?? "ok"
+
+        let legacyModel = try? container.decode(String.self, forKey: .model)
+        let loadedModel = try? container.decode(String.self, forKey: .loadedModel)
+        model = legacyModel ?? loadedModel ?? "unknown"
+
+        if let explicitLoaded = try? container.decode(Bool.self, forKey: .loaded) {
+            loaded = explicitLoaded
+        } else {
+            loaded = !(loadedModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        }
+
+        let decodedDevice = try? container.decode(String.self, forKey: .device)
+        let trimmedDevice = decodedDevice?.trimmingCharacters(in: .whitespacesAndNewlines)
+        device = (trimmedDevice?.isEmpty == false) ? trimmedDevice : nil
+
+        let decodedCacheDir = try? container.decode(String.self, forKey: .cacheDir)
+        let trimmedCacheDir = decodedCacheDir?.trimmingCharacters(in: .whitespacesAndNewlines)
+        cacheDir = (trimmedCacheDir?.isEmpty == false) ? trimmedCacheDir : nil
     }
 }
 
@@ -264,7 +289,10 @@ final class MLXLocalAPISupervisor {
             .split(whereSeparator: \.isNewline)
             .compactMap { rawLine -> pid_t? in
                 let line = String(rawLine)
-                guard scriptCandidates.contains(where: { line.contains($0) }) else { return nil }
+                let matchesLegacyScript = scriptCandidates.contains(where: { line.contains($0) })
+                let matchesMLXVLM = line.contains("mlx_vlm.server")
+                    && line.contains("--port \(settings.port)")
+                guard matchesLegacyScript || matchesMLXVLM else { return nil }
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 let components = trimmed.split(maxSplits: 1, whereSeparator: \.isWhitespace)
                 guard let pidText = components.first, let pid = Int32(pidText) else { return nil }

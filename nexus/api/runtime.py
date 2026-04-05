@@ -11,8 +11,13 @@ import sys
 from nexus.agent import (
     BackgroundTaskManager,
     ContextCompressor,
+    HeartbeatEngine,
+    SessionManager,
+    SubagentRegistry,
     SubagentRunner,
     TaskDAG,
+    TranscriptWriter,
+    TranscriptStore,
     TodoManager,
 )
 from nexus.agent.attempt import AttemptBuilder
@@ -20,7 +25,8 @@ from nexus.agent.run import RunManager
 from nexus.agent.run_store import RunStore
 from nexus.agent.tool_registry import build_tool_registry
 from nexus.agent.approval import ApprovalEngine
-from nexus.agent.tools_policy import ToolsPolicy
+from nexus.agent.tool_profiles import ToolProfile
+from nexus.agent.tools_policy import PolicyLayer, ToolsPolicy
 from nexus.channel.context_window import ContextWindowManager
 from nexus.channel.session_router import SessionRouter
 from nexus.channel.session_store import SessionStore
@@ -64,6 +70,18 @@ from nexus.agent.types import ToolRiskLevel
 logger = logging.getLogger(__name__)
 
 
+def _resolve_audio_device(raw_device: str) -> str:
+    candidate = str(raw_device or "auto").strip().lower()
+    if candidate and candidate != "auto":
+        return candidate
+    try:
+        import torch
+
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
 @dataclass
 class NexusPaths:
     root: Path
@@ -90,6 +108,11 @@ class NexusRuntime:
     run_store: RunStore
     attempt_builder: AttemptBuilder
     run_manager: RunManager
+    session_manager: SessionManager
+    heartbeat_engine: HeartbeatEngine
+    transcript_writer: TranscriptWriter
+    transcript_store: TranscriptStore
+    subagent_registry: SubagentRegistry
     content_store: VaultContentStore
     structural_index: StructuralIndex
     retrieval_index: RetrievalIndex
@@ -145,15 +168,73 @@ def _seed_builtin_skill_registry(skill_registry_dir: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[2] / "skill_registry"
     if not builtin_root.exists():
         return
-    if any(skill_registry_dir.glob("*/skill.yaml")):
+    if any(skill_registry_dir.glob("*/SKILL.md")):
         return
     for skill_dir in builtin_root.iterdir():
         if not skill_dir.is_dir():
             continue
-        manifest_path = skill_dir / "skill.yaml"
+        manifest_path = skill_dir / "SKILL.md"
         if not manifest_path.exists():
             continue
         shutil.copytree(skill_dir, skill_registry_dir / skill_dir.name, dirs_exist_ok=True)
+
+
+def _ensure_heartbeat_template(heartbeat_path: Path) -> None:
+    heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+    if heartbeat_path.exists():
+        return
+    heartbeat_path.write_text(
+        "\n".join(
+            [
+                "# Heartbeat Inbox",
+                "",
+                "<!--",
+                "在这里写入需要心跳巡检处理的待办。",
+                "只有存在非注释正文时，HeartbeatEngine 才会触发巡检。",
+                "-->",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _build_base_tool_layers(
+    settings: NexusSettings,
+    *,
+    testing_mode: bool,
+) -> list[PolicyLayer]:
+    layers: list[PolicyLayer] = []
+
+    profile_name = str(_deep_get(settings.raw, "agent.tool_profile", "full") or "full").strip().lower()
+    if profile_name and profile_name != "full":
+        try:
+            profile = ToolProfile.from_name(profile_name)
+        except ValueError:
+            logger.warning("Unknown agent.tool_profile=%s; ignoring base profile layer", profile_name)
+        else:
+            layers.append(
+                PolicyLayer(
+                    name=f"profile:{profile.name}",
+                    allow=sorted(profile.include) if profile.include is not None else None,
+                    deny=sorted(profile.exclude),
+                    also_allow=sorted(profile.also_allow),
+                    max_risk_level=profile.max_risk_level,
+                )
+            )
+
+    tool_policy_raw = dict(_deep_get(settings.raw, "tool_policy", {}) or {})
+    if tool_policy_raw.get("enabled", True):
+        allowlist = None if testing_mode else tool_policy_raw.get("allowlist")
+        layers.append(
+            PolicyLayer(
+                name="global",
+                allow=[str(item).strip() for item in (allowlist or []) if str(item).strip()] if allowlist else None,
+                deny=[str(item).strip() for item in (tool_policy_raw.get("denylist") or []) if str(item).strip()],
+                also_allow=[str(item).strip() for item in (tool_policy_raw.get("also_allow") or []) if str(item).strip()],
+            )
+        )
+    return layers
 
 
 def build_runtime(
@@ -209,6 +290,14 @@ def build_runtime(
         context_window=context_window,
         provider=provider,
     )
+    session_config = runtime_settings.agent_session_config()
+    session_manager = SessionManager(
+        session_store=session_store,
+        session_router=session_router,
+        idle_timeout_minutes=session_config["idle_timeout_minutes"],
+        max_concurrent_sessions=session_config["max_concurrent_sessions"],
+        sweep_interval_seconds=session_config["sweep_interval_seconds"],
+    )
 
     run_store = RunStore(paths.sqlite / "runs.db")
     content_store = VaultContentStore(paths.vault)
@@ -219,14 +308,32 @@ def build_runtime(
     document_service = DocumentService(content_store, structural_index, retrieval_index)
     document_editor = DocumentEditorService(document_service, structural_index)
     audio_settings = runtime_settings.audio_config()
+    requested_audio_device = str(audio_settings.get("sensevoice_device", "auto"))
+    resolved_audio_device = _resolve_audio_device(requested_audio_device)
     audio_config = AudioConfig(
-        backend=str(audio_settings.get("backend", "sensevoice")),
-        language=str(audio_settings.get("language", "zh")),
+        backend=str(audio_settings.get("backend", "faster_whisper")),
+        language=str(audio_settings.get("language", "auto")),
         sensevoice_model_dir=runtime_settings.resolve_path(
             audio_settings.get("sensevoice_model_dir"),
             "./models/sensevoice/SenseVoiceSmall",
         ),
-        sensevoice_device=str(audio_settings.get("sensevoice_device", "cpu")),
+        sensevoice_device=requested_audio_device,
+        faster_whisper_model=str(audio_settings.get("faster_whisper_model", "large-v3")),
+        faster_whisper_compute_type=str(audio_settings.get("faster_whisper_compute_type", "float16")),
+        preprocessing_enabled=bool(audio_settings.get("preprocessing_enabled", True)),
+        preprocessing_backend=str(audio_settings.get("preprocessing_backend", "ffmpeg")),
+        preprocessing_filters=str(
+            audio_settings.get("preprocessing_filters", "highpass=f=120,lowpass=f=7600,afftdn,loudnorm")
+        ),
+        deepfilternet_model=str(audio_settings.get("deepfilternet_model", "DeepFilterNet3")),
+        deepfilternet_post_filter=bool(audio_settings.get("deepfilternet_post_filter", True)),
+        enhancement_target_rate=int(audio_settings.get("enhancement_target_rate", 48000)),
+        asr_sample_rate=int(audio_settings.get("asr_sample_rate", 16000)),
+        vad_enabled=bool(audio_settings.get("vad_enabled", False)),
+        vad_threshold=float(audio_settings.get("vad_threshold", 0.45)),
+        vad_min_speech_ms=int(audio_settings.get("vad_min_speech_ms", 200)),
+        vad_min_silence_ms=int(audio_settings.get("vad_min_silence_ms", 400)),
+        vad_speech_pad_ms=int(audio_settings.get("vad_speech_pad_ms", 120)),
         temp_directory=runtime_settings.resolve_path(
             audio_settings.get("temp_directory"),
             paths.vault / "_system" / "audio_temp",
@@ -245,6 +352,37 @@ def build_runtime(
     if audio_config.backend.lower() in {"sensevoice_remote", "remote"}:
         remote_client = RemoteAudioWorkerClient(audio_config.base_url)
         remote_transcriber = remote_client.transcribe
+
+    # -- 说话人分离 + 声纹白名单 --
+    diarization_engine = None
+    voiceprint_store = None
+    diar_settings = audio_settings.get("diarization", {})
+    if diar_settings.get("enabled", False):
+        from nexus.services.audio.diarization import DiarizationConfig, DiarizationEngine
+        from nexus.services.audio.voiceprint import VoiceprintStore
+
+        _diar_device = resolved_audio_device
+        diarization_engine = DiarizationEngine(
+            config=DiarizationConfig(
+                enabled=True,
+                vad_model=str(diar_settings.get("vad_model", "fsmn-vad")),
+                embedding_model=str(diar_settings.get("embedding_model", "iic/speech_campplus_sv_zh-cn_16k-common")),
+                device=_diar_device,
+                min_speakers=int(diar_settings.get("min_speakers", 1)),
+                max_speakers=int(diar_settings.get("max_speakers", 10)),
+                clustering=str(diar_settings.get("clustering", "spectral")),
+                similarity_threshold=float(diar_settings.get("similarity_threshold", 0.65)),
+            )
+        )
+        _vp_dir = paths.vault / "_system" / "voiceprints"
+        _vp_dir.mkdir(parents=True, exist_ok=True)
+        voiceprint_store = VoiceprintStore(
+            storage_dir=_vp_dir,
+            similarity_threshold=float(diar_settings.get("similarity_threshold", 0.65)),
+            embedding_extractor=diarization_engine,
+        )
+        logger.info("说话人分离已启用: device=%s, voiceprints=%s", _diar_device, _vp_dir)
+
     audio_service = AudioService(
         content_store,
         retrieval_index,
@@ -252,12 +390,42 @@ def build_runtime(
         editor_service=document_editor,
         config=audio_config,
         transcriber=remote_transcriber,
+        diarization_engine=diarization_engine,
+        voiceprint_store=voiceprint_store,
     )
+    # 视觉 OCR 提取器（优先使用 Qwen-VL，回退到 Tesseract）
+    vision_ocr_extractor = None
+    try:
+        from nexus.services.artifact.vision_ocr import build_vision_ocr_extractor
+
+        _primary_cfg = primary_provider or configured_primary
+        _vl_api_key = _primary_cfg.resolved_api_key() if _primary_cfg else None
+        _vl_base_url = (
+            _deep_get(runtime_settings.raw, "vision_ocr.base_url")
+            or (_primary_cfg.base_url if _primary_cfg else None)
+            or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        _vl_model = str(
+            _deep_get(runtime_settings.raw, "vision_ocr.model") or "qwen-vl-max"
+        )
+        if _vl_api_key:
+            vision_ocr_extractor = build_vision_ocr_extractor(
+                api_key=_vl_api_key,
+                base_url=_vl_base_url,
+                model=_vl_model,
+            )
+            logger.warning("视觉 OCR 已启用: model=%s base_url=%s", _vl_model, _vl_base_url)
+        else:
+            logger.warning("视觉 OCR 未启用: 未找到 API key，将回退到 Tesseract")
+    except Exception:
+        logger.warning("视觉 OCR 初始化失败，将回退到 Tesseract", exc_info=True)
+
     artifact_service = ArtifactService(
         content_store,
         document_service,
         document_editor=document_editor,
         audio_service=audio_service,
+        image_text_extractor=vision_ocr_extractor,
     )
     workspace_service = WorkspaceService([root, paths.vault])
     browser_service = BrowserService(
@@ -285,6 +453,8 @@ def build_runtime(
         catalog_dir=paths.skill_registry,
         system_runner=system_runner,
         python_executable=runtime_settings.evolution_python_executable,
+        remote_sources=_deep_get(runtime_settings.raw, "evolution.skills.remote_sources", []) or [],
+        clawhub_config=_deep_get(runtime_settings.raw, "evolution.skills.clawhub", {}) or {},
     )
     capability_manager = CapabilityManager(
         capabilities_dir=paths.capabilities,
@@ -309,6 +479,8 @@ def build_runtime(
         retrieval=retrieval_index,
         vault_path=paths.vault,
         provider=provider,
+        session_store=session_store,
+        document_service=document_service,
         half_life_days=30.0,
     )
 
@@ -331,18 +503,44 @@ def build_runtime(
         whitelist=tool_allowlist,
         auto_approve_levels=auto_approve,
     )
+    for layer in _build_base_tool_layers(runtime_settings, testing_mode=testing_mode):
+        tools_policy.add_layer(layer)
     approval_engine = ApprovalEngine(
         default_timeout=runtime_settings.approval_timeout
         if hasattr(runtime_settings, "approval_timeout")
         else 120.0,
     )
+    transcript_writer = TranscriptWriter(paths.data / "transcripts")
+    transcript_store = TranscriptStore(paths.vault / "_system" / "transcripts")
+    subagent_registry = SubagentRegistry(paths.vault / "_system" / "subagent_runs")
+    subagent_registry.recover_orphans()
+    from nexus.provider.gateway import get_context_window
+    primary_model = provider.primary_provider.model if provider else ""
     compressor = ContextCompressor(
         provider=provider,
         transcript_dir=paths.vault / "_system" / "context_transcripts",
+        transcript_store=transcript_store,
         memory_flush_callback=memory_manager.flush_before_compact,
+        context_window_tokens=get_context_window(primary_model),
     )
     todo_manager = TodoManager()
-    subagent_runner = SubagentRunner(provider=provider, tools_policy=tools_policy)
+    subagent_policy_cfg = runtime_settings.subagent_policy()
+    subagent_tools_policy = tools_policy.with_layers(
+        PolicyLayer(
+            name="subagent",
+            allow=[str(item).strip() for item in (subagent_policy_cfg.get("allow") or []) if str(item).strip()] or None,
+            deny=[str(item).strip() for item in (subagent_policy_cfg.get("deny") or []) if str(item).strip()],
+            also_allow=[str(item).strip() for item in (subagent_policy_cfg.get("also_allow") or []) if str(item).strip()],
+        )
+    )
+    subagent_runner = SubagentRunner(
+        provider=provider,
+        tools_policy=subagent_tools_policy,
+        session_store=session_store,
+        session_manager=session_manager,
+        context_window=context_window,
+        registry=subagent_registry,
+    )
     task_dag = TaskDAG(paths.root / ".tasks")
     background_manager = BackgroundTaskManager()
     available_tools = build_tool_registry(
@@ -395,12 +593,31 @@ def build_runtime(
         capability_promotion_advisor=capability_promotion_advisor,
         capability_manager=capability_manager,
         skill_manager=skill_manager,
+        memory_manager=memory_manager,
         approval_engine=approval_engine,
+        transcript_writer=transcript_writer,
+        settings=runtime_settings,
         fallback_models=[
             config.model
             for config in [(primary_provider or configured_primary)]
             + (fallback_providers or configured_fallbacks)
         ],
+    )
+    heartbeat_config = runtime_settings.heartbeat_config()
+    heartbeat_path = paths.vault / "_system" / "heartbeat.md"
+    _ensure_heartbeat_template(heartbeat_path)
+    heartbeat_engine = HeartbeatEngine(
+        session_store=session_store,
+        session_manager=session_manager,
+        context_window=context_window,
+        run_manager=run_manager,
+        heartbeat_path=heartbeat_path,
+        enabled=bool(heartbeat_config["enabled"]),
+        interval_minutes=int(heartbeat_config["interval_minutes"]),
+        active_hours=str(heartbeat_config["active_hours"]),
+        quiet_days=list(heartbeat_config["quiet_days"]),
+        ack_max_chars=int(heartbeat_config["ack_max_chars"]),
+        model=heartbeat_config["model"],
     )
 
     return NexusRuntime(
@@ -414,6 +631,11 @@ def build_runtime(
         run_store=run_store,
         attempt_builder=attempt_builder,
         run_manager=run_manager,
+        session_manager=session_manager,
+        heartbeat_engine=heartbeat_engine,
+        transcript_writer=transcript_writer,
+        transcript_store=transcript_store,
+        subagent_registry=subagent_registry,
         content_store=content_store,
         structural_index=structural_index,
         retrieval_index=retrieval_index,

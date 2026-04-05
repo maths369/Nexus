@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 from nexus.channel.context_window import ContextWindowManager
 from nexus.channel.session_router import SessionRouter
-from nexus.channel.session_store import SessionStore
+from nexus.channel.session_store import SessionStore, SessionStatus
 from nexus.channel.types import ChannelType, InboundMessage, MessageIntent
 from nexus.provider.gateway import ProviderConfig, ProviderGateway
 
@@ -155,6 +155,94 @@ def test_router_dedupes_and_sanitizes_candidates():
     assert len(candidates) == 1
     assert "可选项" not in candidates[0]["summary"]
     assert candidates[0]["summary"].startswith("我上传给你个PDF文件")
+
+
+def test_router_follows_up_completed_session_within_freshness(tmp_path):
+    """Run 成功后 session 保持 ACTIVE，但即使被标记为 COMPLETED，
+    只要在 freshness 窗口内也应延续为 FOLLOW_UP（多轮对话核心保障）。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session("u1", "feishu", summary="讨论架构设计")
+    store.add_event(session.session_id, "user", "帮我分析这个架构")
+    store.add_event(session.session_id, "assistant", "好的，这个架构有以下特点...")
+    # 模拟 run 完成后 session 仍为 active（新逻辑），或旧逻辑下为 completed
+    store.update_session_status(session.session_id, SessionStatus.COMPLETED)
+
+    router = SessionRouter(store, ContextWindowManager(store, freshness_minutes=60))
+    decision = __import__("asyncio").run(router.route(_message("那性能方面呢？")))
+
+    assert decision.intent == MessageIntent.FOLLOW_UP
+    assert decision.session_id == session.session_id
+
+
+def test_router_channel_aware_session_lookup(tmp_path):
+    """同一用户在不同通道的 session 应独立，飞书消息优先匹配飞书 session。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    s_web = store.create_session("u1", "web", summary="Web 对话")
+    store.add_event(s_web.session_id, "user", "web 上的问题")
+    s_feishu = store.create_session("u1", "feishu", summary="飞书对话")
+    store.add_event(s_feishu.session_id, "user", "飞书上的问题")
+
+    router = SessionRouter(store, ContextWindowManager(store, freshness_minutes=60))
+    msg = InboundMessage(
+        message_id="m1",
+        channel=ChannelType.FEISHU,
+        sender_id="u1",
+        content="继续讨论",
+        metadata={"channel_key": "feishu"},
+    )
+    decision = __import__("asyncio").run(router.route(msg))
+
+    assert decision.intent == MessageIntent.FOLLOW_UP
+    assert decision.session_id == s_feishu.session_id
+
+
+def test_router_new_task_on_freshness_timeout(tmp_path):
+    """超过 freshness 窗口后，应创建新任务。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session("u1", "feishu", summary="旧对话")
+    store.add_event(session.session_id, "user", "旧消息")
+
+    router = SessionRouter(store, ContextWindowManager(store, freshness_minutes=5))
+    future_ts = datetime.now() + timedelta(minutes=10)
+    msg = InboundMessage(
+        message_id="m1",
+        channel=ChannelType.FEISHU,
+        sender_id="u1",
+        content="全新的话题",
+        timestamp=future_ts,
+    )
+    decision = __import__("asyncio").run(router.route(msg))
+
+    assert decision.intent == MessageIntent.NEW_TASK
+
+
+def test_router_recognizes_slash_new_chinese(tmp_path):
+    """/新对话、/新任务 等中文斜杠命令应识别为 COMMAND:new。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    router = SessionRouter(store, ContextWindowManager(store))
+
+    for cmd_text in ["/新对话", "/新任务", "/new", "新对话", "新任务"]:
+        decision = __import__("asyncio").run(router.route(_message(cmd_text)))
+        assert decision.intent == MessageIntent.COMMAND, f"Failed for: {cmd_text}"
+        assert decision.metadata["action"] == "new", f"Failed for: {cmd_text}"
+
+
+def test_router_recognizes_slash_chinese_commands(tmp_path):
+    """/暂停、/继续、/状态 等中文斜杠命令。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    router = SessionRouter(store, ContextWindowManager(store))
+
+    cases = [
+        ("/暂停", "pause"),
+        ("/继续", "resume"),
+        ("/状态", "status"),
+        ("/压缩", "compress"),
+        ("/帮助", "help"),
+    ]
+    for cmd_text, expected_action in cases:
+        decision = __import__("asyncio").run(router.route(_message(cmd_text)))
+        assert decision.intent == MessageIntent.COMMAND, f"Failed for: {cmd_text}"
+        assert decision.metadata["action"] == expected_action, f"Failed for: {cmd_text}"
 
 
 def test_router_recognizes_provider_slash_command(tmp_path):

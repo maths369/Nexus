@@ -111,6 +111,46 @@ final class NexusMacTests: XCTestCase {
         XCTAssertEqual(command.arguments, [servePath.path])
     }
 
+    func testMLXHealthResponseDecodesLegacyLocalServerShape() throws {
+        let data = Data(
+            """
+            {
+              "status": "ok",
+              "model": "mlx-community/Qwen3.5-9B-OptiQ-4bit",
+              "loaded": true,
+              "device": "gpu",
+              "cache_dir": "/tmp/hf"
+            }
+            """.utf8
+        )
+
+        let health = try JSONDecoder().decode(MLXLocalAPIHealthResponse.self, from: data)
+        XCTAssertEqual(health.status, "ok")
+        XCTAssertEqual(health.model, "mlx-community/Qwen3.5-9B-OptiQ-4bit")
+        XCTAssertTrue(health.loaded)
+        XCTAssertEqual(health.device, "gpu")
+        XCTAssertEqual(health.cacheDir, "/tmp/hf")
+    }
+
+    func testMLXHealthResponseDecodesMLXVLMShape() throws {
+        let data = Data(
+            """
+            {
+              "status": "healthy",
+              "loaded_model": "mlx-community/gemma-4-e4b-it-4bit",
+              "loaded_adapter": null
+            }
+            """.utf8
+        )
+
+        let health = try JSONDecoder().decode(MLXLocalAPIHealthResponse.self, from: data)
+        XCTAssertEqual(health.status, "healthy")
+        XCTAssertEqual(health.model, "mlx-community/gemma-4-e4b-it-4bit")
+        XCTAssertTrue(health.loaded)
+        XCTAssertNil(health.device)
+        XCTAssertNil(health.cacheDir)
+    }
+
     @MainActor
     func testCollectProcessOutputHandlesLargeStdoutWithoutBlocking() {
         let output = SidecarSupervisor.collectProcessOutput(
@@ -171,6 +211,46 @@ final class NexusMacTests: XCTestCase {
         )
 
         XCTAssertEqual(settings.resolvedHubAPIHost, "10.0.0.9")
+    }
+
+    func testResolvedHubBearerTokenFallsBackToStoredValue() {
+        let settings = SidecarSettings(
+            nexusRoot: "/tmp/Nexus",
+            nodeCardPath: "/tmp/Nexus/config/node_cards/mac.yaml",
+            condaExecutable: "/opt/miniconda3/bin/conda",
+            localHost: "127.0.0.1",
+            localPort: 8765,
+            brokerHost: "10.0.0.9",
+            brokerPort: 1883,
+            hubAPIHost: "10.0.0.10",
+            hubAPIPort: 18100,
+            hubBearerToken: "token-123",
+            meshTransport: "tcp",
+            autoStartSidecar: true
+        )
+
+        XCTAssertEqual(settings.resolvedHubBearerToken, "token-123")
+    }
+
+    func testLaunchCommandDoesNotExposeHubTokenInArguments() {
+        let settings = SidecarSettings(
+            nexusRoot: "/tmp/Nexus",
+            nodeCardPath: "/tmp/Nexus/config/node_cards/mac.yaml",
+            condaExecutable: "/opt/miniconda3/bin/conda",
+            localHost: "127.0.0.1",
+            localPort: 8765,
+            brokerHost: "10.0.0.9",
+            brokerPort: 1883,
+            hubAPIHost: "10.0.0.10",
+            hubAPIPort: 18100,
+            hubBearerToken: "top-secret",
+            meshTransport: "tcp",
+            autoStartSidecar: true
+        )
+
+        let command = settings.makeLaunchCommand()
+        XCTAssertFalse(command.arguments.contains("top-secret"))
+        XCTAssertFalse(command.arguments.contains("--hub-api-bearer-token"))
     }
 
     func testCapabilityPresentationTitleMapsKnownCapability() {

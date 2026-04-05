@@ -67,6 +67,7 @@ struct SettingsView: View {
                     NexusField(title: "Hub API Host", text: stringBinding(\.hubAPIHost))
                     NexusField(title: "Hub API Port", text: intBinding(\.hubAPIPort))
                 }
+                NexusField(title: "Hub Bearer Token", text: stringBinding(\.hubBearerToken))
                 if let snapshot = model.snapshot {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("LIVE HUB STATE")

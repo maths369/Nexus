@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from nexus.agent.types import Run
+from nexus.agent.tool_profiles import ToolProfile
 from nexus.api.runtime import NexusRuntime
 
 
@@ -44,6 +45,9 @@ async def run_agent_capability_smoke(runtime: NexusRuntime) -> list[SmokeCheck]:
         "load_skill",
         "skill_list_installable",
         "skill_install",
+        "skill_search_remote",
+        "skill_import_local",
+        "skill_import_remote",
         "skill_create",
         "skill_update",
         "skill_list_installed",
@@ -67,6 +71,13 @@ async def run_agent_capability_smoke(runtime: NexusRuntime) -> list[SmokeCheck]:
         "task_get",
         "background_run",
         "check_background",
+        "system_run",
+        "read_local_file",
+        "code_read_file",
+        "write_local_file",
+        "file_write",
+        "file_edit",
+        "file_search",
     }
     missing_tools = sorted(expected_tools - set(tool_map))
     checks.append(
@@ -118,12 +129,16 @@ async def run_agent_capability_smoke(runtime: NexusRuntime) -> list[SmokeCheck]:
         )
 
         load_skill_result = await tool_map["load_skill"].handler("smoke-skill")
-        load_skill_ok = "Use this skill for smoke verification." in load_skill_result
+        load_skill_ok = (
+            "Use this skill for smoke verification." in load_skill_result
+            and "<location>" in load_skill_result
+            and "<root>" in load_skill_result
+        )
         checks.append(
             SmokeCheck(
                 name="skill_layer2",
                 ok=load_skill_ok,
-                detail="load_skill returned full skill content" if load_skill_ok else "load_skill content mismatch",
+                detail="load_skill returned full skill content with paths" if load_skill_ok else "load_skill content mismatch",
             )
         )
 
@@ -144,6 +159,23 @@ async def run_agent_capability_smoke(runtime: NexusRuntime) -> list[SmokeCheck]:
                 name="installable_skill_registry",
                 ok=installable_ok,
                 detail=installable_skills,
+            )
+        )
+
+        coding_profile_names = {tool.name for tool in ToolProfile.coding().filter(runtime.available_tools)}
+        coding_profile_ok = {
+            "code_read_file",
+            "file_write",
+            "file_edit",
+            "file_search",
+            "system_run",
+            "dispatch_subagent",
+        } <= coding_profile_names
+        checks.append(
+            SmokeCheck(
+                name="coding_profile",
+                ok=coding_profile_ok,
+                detail=", ".join(sorted(coding_profile_names)),
             )
         )
 
@@ -219,6 +251,54 @@ async def run_agent_capability_smoke(runtime: NexusRuntime) -> list[SmokeCheck]:
             )
         )
         runtime.background_manager.clear_completed()
+
+        coding_file_path = "data/staging/smoke_coding_loop.txt"
+        write_payload = json.loads(await tool_map["file_write"].handler(path=coding_file_path, content="alpha\nbeta\n"))
+        read_payload = await tool_map["code_read_file"].handler(coding_file_path)
+        edit_payload = json.loads(
+            await tool_map["file_edit"].handler(
+                path=coding_file_path,
+                old_text="beta",
+                new_text="gamma",
+            )
+        )
+        reread_payload = await tool_map["code_read_file"].handler(coding_file_path)
+        search_payload = json.loads(
+            await tool_map["file_search"].handler(
+                pattern="gamma",
+                path="data/staging",
+                max_results=5,
+            )
+        )
+        python_readback = (
+            "from pathlib import Path; "
+            "print(Path('data/staging/smoke_coding_loop.txt').read_text().strip())"
+        )
+        exec_payload = json.loads(
+            await tool_map["system_run"].handler(
+                command=f"{shlex.quote(sys.executable)} -c {shlex.quote(python_readback)}",
+                workdir=str(runtime.paths.root),
+                timeout=30,
+            )
+        )
+        coding_loop_ok = (
+            write_payload.get("success") is True
+            and "alpha" in read_payload
+            and edit_payload.get("success") is True
+            and "gamma" in reread_payload
+            and search_payload.get("exit_code") == 0
+            and "smoke_coding_loop.txt" in search_payload.get("matches", "")
+            and "gamma" in search_payload.get("matches", "")
+            and exec_payload.get("exit_code") == 0
+            and "gamma" in exec_payload.get("stdout", "")
+        )
+        checks.append(
+            SmokeCheck(
+                name="coding_loop",
+                ok=coding_loop_ok,
+                detail=search_payload.get("matches", "")[:200],
+            )
+        )
 
         original_compressor_provider = runtime.compressor._provider  # noqa: SLF001
         original_transcript_dir = runtime.compressor._transcript_dir  # noqa: SLF001

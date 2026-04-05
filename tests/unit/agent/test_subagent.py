@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from typing import Any
 
 import pytest
 
+from nexus.agent.session_manager import SessionManager
+from nexus.agent.subagent_registry import SubagentRegistry
 from nexus.agent.subagent import SubagentRunner, EXCLUDED_TOOLS
 from nexus.agent.types import AttemptConfig, ToolDefinition, ToolRiskLevel
+from nexus.channel.context_window import ContextWindowManager
+from nexus.channel.session_store import SessionStore
 from nexus.agent.tools_policy import ToolsPolicy
 
 
@@ -39,6 +42,16 @@ class FakeGateway:
         resp = self._responses[self._call_index]
         self._call_index += 1
         return resp
+
+
+class FakeGatewayWithPrimary(FakeGateway):
+    def __init__(self, responses: list[dict[str, Any]], *, model: str, name: str = "primary"):
+        super().__init__(responses)
+        self.primary_provider = type(
+            "PrimaryProvider",
+            (),
+            {"model": model, "name": name},
+        )()
 
 
 def _text_response(content: str) -> dict[str, Any]:
@@ -195,6 +208,16 @@ def test_dispatch_custom_model():
     assert gateway.calls[0]["model"] == "default-model"
 
 
+def test_dispatch_defaults_to_provider_primary_model():
+    gateway = FakeGatewayWithPrimary([_text_response("完成")], model="qwen3.5-plus")
+    policy = ToolsPolicy()
+    runner = SubagentRunner(provider=gateway, tools_policy=policy)
+
+    asyncio.run(runner.dispatch("测试"))
+
+    assert gateway.calls[0]["model"] == "qwen3.5-plus"
+
+
 def test_dispatch_description_in_logs():
     """description 用于日志（不影响执行）"""
     gateway = FakeGateway([_text_response("完成")])
@@ -214,3 +237,51 @@ def test_excluded_tools_constant():
     assert "dispatch_subagent" in EXCLUDED_TOOLS
     assert "compact" in EXCLUDED_TOOLS
     assert "todo_write" in EXCLUDED_TOOLS
+
+
+def test_dispatch_session_mode_persists_context(tmp_path):
+    gateway = FakeGateway([
+        _text_response("第一次结论"),
+        _text_response("第二次结论"),
+    ])
+    policy = ToolsPolicy()
+    store = SessionStore(tmp_path / "sessions.db")
+    context = ContextWindowManager(store)
+    manager = SessionManager(store, None)
+    registry = SubagentRegistry(tmp_path / "subagents")
+    parent = store.create_session("user-1", "feishu", summary="父会话")
+    runner = SubagentRunner(
+        provider=gateway,
+        tools_policy=policy,
+        session_store=store,
+        session_manager=manager,
+        context_window=context,
+        registry=registry,
+    )
+
+    first = asyncio.run(
+        runner.dispatch(
+            "先分析模块 A",
+            spawn_mode="session",
+            parent_session_id=parent.session_id,
+        )
+    )
+    assert "子Agent(session)" in first
+    session_id = first.split("`")[1]
+
+    second = asyncio.run(
+        runner.dispatch(
+            "继续补充模块 B",
+            spawn_mode="session",
+            session_id=session_id,
+            parent_session_id=parent.session_id,
+        )
+    )
+
+    assert "第二次结论" in second
+    child = store.get_session(session_id)
+    assert child is not None
+    events = store.get_events(session_id)
+    assert len([event for event in events if event.role == "assistant"]) == 2
+    parent_events = store.get_events(parent.session_id)
+    assert any("subagent:" in event.content for event in parent_events if event.role == "system")

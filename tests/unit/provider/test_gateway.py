@@ -260,3 +260,24 @@ def test_gateway_temporarily_deprioritizes_recently_unhealthy_provider():
     assert second["provider"] == "qwen"
     assert calls["kimi"] == 1
     assert calls["qwen"] == 2
+
+
+def test_get_context_window_known_models():
+    """已知模型返回正确的上下文窗口大小"""
+    from nexus.provider.gateway import get_context_window
+    assert get_context_window("qwen-max") == 128_000
+    assert get_context_window("moonshot-v1-32k") == 32_000
+    assert get_context_window("deepseek-chat") == 64_000
+
+
+def test_get_context_window_prefix_match():
+    """带后缀的模型名通过前缀匹配"""
+    from nexus.provider.gateway import get_context_window
+    assert get_context_window("qwen-max-latest") == 128_000
+    assert get_context_window("kimi-k2.5-0613") == 128_000
+
+
+def test_get_context_window_unknown_model():
+    """未知模型返回默认值"""
+    from nexus.provider.gateway import get_context_window, DEFAULT_CONTEXT_WINDOW
+    assert get_context_window("some-unknown-model-v3") == DEFAULT_CONTEXT_WINDOW

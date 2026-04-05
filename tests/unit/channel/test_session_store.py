@@ -130,6 +130,46 @@ def test_get_most_recent_session(tmp_path):
     assert recent.session_id == s2.session_id
 
 
+def test_get_active_session_by_channel(tmp_path):
+    """通道感知的 session 查找：优先匹配 (sender, channel, active/completed)。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    s_feishu = store.create_session("user-1", "feishu", summary="飞书对话")
+    s_web = store.create_session("user-1", "web", summary="Web 对话")
+
+    # 查飞书通道 → 应返回飞书 session
+    result = store.get_active_session_by_channel("user-1", "feishu")
+    assert result is not None
+    assert result.session_id == s_feishu.session_id
+
+    # 查 web 通道 → 应返回 web session
+    result = store.get_active_session_by_channel("user-1", "web")
+    assert result is not None
+    assert result.session_id == s_web.session_id
+
+
+def test_get_active_session_by_channel_finds_completed(tmp_path):
+    """通道感知查找也能找到 COMPLETED 状态的 session（用于多轮延续）。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    s = store.create_session("user-1", "feishu", summary="已完成的对话")
+    store.update_session_status(s.session_id, SessionStatus.COMPLETED)
+
+    result = store.get_active_session_by_channel("user-1", "feishu")
+    assert result is not None
+    assert result.session_id == s.session_id
+
+
+def test_get_active_session_by_channel_prefers_active_over_completed(tmp_path):
+    """active 状态优先于 completed。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    s_completed = store.create_session("user-1", "feishu", summary="旧对话")
+    store.update_session_status(s_completed.session_id, SessionStatus.COMPLETED)
+    s_active = store.create_session("user-1", "feishu", summary="新对话")
+
+    result = store.get_active_session_by_channel("user-1", "feishu")
+    assert result is not None
+    assert result.session_id == s_active.session_id
+
+
 def test_append_and_get_recent_artifacts(tmp_path):
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session("user-1", "feishu", summary="附件测试")

@@ -348,6 +348,15 @@ def build_tool_registry(
         )
         return _json({"entry_id": entry.entry_id, "kind": entry.kind, "summary": entry.summary})
 
+    async def memory_suggest_evolution(task: str, min_occurrences: int = 3) -> str:
+        if memory_manager is None:
+            return _json({"suggestion": None, "reason": "memory_manager_unavailable"})
+        suggestion = memory_manager.suggest_evolution_opportunity(
+            task=task,
+            min_occurrences=min_occurrences,
+        )
+        return _json({"suggestion": suggestion})
+
     async def knowledge_ingest(path: str = "", delta_only: bool = True) -> str:
         relative = path.strip().lstrip("/")
         if relative and content_store.resolve_path(relative).is_file():
@@ -361,6 +370,7 @@ def build_tool_registry(
         title: str | None = None,
         materialize: bool = True,
         language: str | None = None,
+        diarize: bool = False,
     ) -> str:
         if materialize:
             result = await audio_service.transcribe_and_materialize(
@@ -368,6 +378,7 @@ def build_tool_registry(
                 target_section=target_section,
                 title=title,
                 language=language,
+                diarize=diarize,
             )
             return _json(
                 {
@@ -380,7 +391,9 @@ def build_tool_registry(
                 }
             )
 
-        transcription = await asyncio.to_thread(audio_service.transcribe_file, Path(audio_path), language)
+        transcription = await asyncio.to_thread(
+            audio_service.transcribe_file, Path(audio_path), language, diarize,
+        )
         return _json(
             {
                 "mode": "transcribed",
@@ -393,6 +406,8 @@ def build_tool_registry(
                         "end": segment.end,
                         "text": segment.text,
                         "confidence": segment.confidence,
+                        "speaker_id": segment.speaker_id,
+                        "speaker_name": segment.speaker_name,
                     }
                     for segment in transcription.segments
                 ],
@@ -424,6 +439,44 @@ def build_tool_registry(
                 "action_items": result.action_items,
             }
         )
+
+    async def voiceprint_register(name: str, audio_path: str) -> str:
+        """注册声纹到白名单。"""
+        vp_store = getattr(audio_service, "_voiceprint_store", None)
+        if vp_store is None:
+            return _json({"error": "声纹服务未启用，请在配置中开启 diarization"})
+        profile = await asyncio.to_thread(
+            vp_store.register, name, Path(audio_path),
+        )
+        return _json({
+            "status": "registered",
+            "name": profile.name,
+            "sample_count": profile.sample_count,
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+        })
+
+    async def voiceprint_list() -> str:
+        """列出已注册的声纹白名单。"""
+        vp_store = getattr(audio_service, "_voiceprint_store", None)
+        if vp_store is None:
+            return _json({"error": "声纹服务未启用"})
+        profiles = vp_store.list_profiles()
+        return _json({
+            "count": len(profiles),
+            "profiles": [
+                {"name": p.name, "sample_count": p.sample_count, "updated_at": p.updated_at}
+                for p in profiles
+            ],
+        })
+
+    async def voiceprint_delete(name: str) -> str:
+        """从白名单中删除声纹。"""
+        vp_store = getattr(audio_service, "_voiceprint_store", None)
+        if vp_store is None:
+            return _json({"error": "声纹服务未启用"})
+        deleted = vp_store.delete(name)
+        return _json({"deleted": deleted, "name": name})
 
     async def excel_list_sheets(excel_path: str) -> str:
         sheets = await asyncio.to_thread(spreadsheet_service.list_sheets, excel_path)
@@ -658,6 +711,10 @@ def build_tool_registry(
 
     async def code_read_file(path: str) -> str:
         return workspace_service.read_text(path)
+
+    async def read_local_file(path: str) -> str:
+        """兼容旧工具名，复用 code_read_file。"""
+        return await code_read_file(path)
 
     async def browser_navigate(url: str) -> str:
         result = await browser_service.navigate(url)
@@ -937,7 +994,7 @@ def build_tool_registry(
                     "kind": {
                         "type": "string",
                         "default": "fact",
-                        "description": "类型: decision/preference/fact/project_state/context",
+                        "description": "类型: decision/preference/fact/project_state/context/workflow_success/workflow_failure/tool_pattern",
                     },
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "标签列表"},
                     "session_id": {"type": "string"},
@@ -948,6 +1005,21 @@ def build_tool_registry(
             handler=memory_write,
             risk_level=ToolRiskLevel.MEDIUM,
             tags=["memory", "write"],
+        ),
+        ToolDefinition(
+            name="memory_suggest_evolution",
+            description="检查某类任务是否已经形成重复成功模式，并给出 skill 演化建议。适合在任务收尾或做体系化沉淀时调用。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "任务描述"},
+                    "min_occurrences": {"type": "integer", "default": 3},
+                },
+                "required": ["task"],
+            },
+            handler=memory_suggest_evolution,
+            risk_level=ToolRiskLevel.LOW,
+            tags=["memory", "evolution"],
         ),
         ToolDefinition(
             name="knowledge_ingest",
@@ -965,7 +1037,7 @@ def build_tool_registry(
         ),
         ToolDefinition(
             name="audio_transcribe_path",
-            description="转录本地音频文件；可选自动物化到 Vault 会议纪要/语音笔记页面。",
+            description="转录本地音频文件；可选自动物化到 Vault 会议纪要/语音笔记页面。支持多说话人分离（diarize=true）。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -974,12 +1046,13 @@ def build_tool_registry(
                     "title": {"type": "string"},
                     "materialize": {"type": "boolean", "default": True},
                     "language": {"type": "string"},
+                    "diarize": {"type": "boolean", "default": False, "description": "启用说话人分离，自动识别不同发言人"},
                 },
                 "required": ["audio_path"],
             },
             handler=audio_transcribe_path,
             risk_level=ToolRiskLevel.MEDIUM,
-            tags=["audio", "transcription", "vault"],
+            tags=["audio", "transcription", "vault", "diarization"],
         ),
         ToolDefinition(
             name="audio_materialize_transcript",
@@ -999,6 +1072,43 @@ def build_tool_registry(
             handler=audio_materialize_transcript,
             risk_level=ToolRiskLevel.MEDIUM,
             tags=["audio", "transcription", "vault"],
+        ),
+        ToolDefinition(
+            name="voiceprint_register",
+            description="注册声纹到白名单：提供姓名和一段清晰语音（10-30秒），后续转录将自动识别该发言人。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "发言人显示名称"},
+                    "audio_path": {"type": "string", "description": "音频样本路径（建议10-30秒清晰单人语音）"},
+                },
+                "required": ["name", "audio_path"],
+            },
+            handler=voiceprint_register,
+            risk_level=ToolRiskLevel.LOW,
+            tags=["audio", "voiceprint"],
+        ),
+        ToolDefinition(
+            name="voiceprint_list",
+            description="列出已注册的声纹白名单，显示所有已知发言人及采样次数。",
+            parameters={"type": "object", "properties": {}},
+            handler=voiceprint_list,
+            risk_level=ToolRiskLevel.LOW,
+            tags=["audio", "voiceprint"],
+        ),
+        ToolDefinition(
+            name="voiceprint_delete",
+            description="从声纹白名单中删除指定发言人。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "要删除的发言人名称"},
+                },
+                "required": ["name"],
+            },
+            handler=voiceprint_delete,
+            risk_level=ToolRiskLevel.MEDIUM,
+            tags=["audio", "voiceprint"],
         ),
         ToolDefinition(
             name="excel_list_sheets",
@@ -1248,6 +1358,18 @@ def build_tool_registry(
             risk_level=ToolRiskLevel.LOW,
             tags=["workspace", "read"],
         ),
+        ToolDefinition(
+            name="read_local_file",
+            description="兼容旧工具名：读取工作区中的代码或文本文件。",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            handler=read_local_file,
+            risk_level=ToolRiskLevel.LOW,
+            tags=["workspace", "read", "compat"],
+        ),
     ]
 
     if browser_service.enabled:
@@ -1445,11 +1567,18 @@ def build_tool_registry(
         async def dispatch_subagent(
             prompt: str,
             description: str = "",
+            spawn_mode: str = "run",
+            session_id: str = "",
+            _tool_context: dict[str, Any] | None = None,
         ) -> str:
             return await subagent_runner.dispatch(
                 prompt=prompt,
                 description=description,
                 tools=tools,  # 传入当前工具列表（SubagentRunner 会过滤）
+                spawn_mode=spawn_mode,
+                session_id=session_id.strip() or None,
+                parent_session_id=str((_tool_context or {}).get("session_id") or "") or None,
+                parent_run_id=str((_tool_context or {}).get("run_id") or "") or None,
             )
 
         tools.append(ToolDefinition(
@@ -1465,6 +1594,15 @@ def build_tool_registry(
                     "description": {
                         "type": "string",
                         "description": "子任务简短描述（用于日志）",
+                    },
+                    "spawn_mode": {
+                        "type": "string",
+                        "enum": ["run", "session"],
+                        "description": "run=一次性执行后返回摘要；session=保留独立上下文并可通过 session_id 续跑。",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "当 spawn_mode=session 时，可选填写已有子代理 session_id 以继续该上下文。",
                     },
                 },
                 "required": ["prompt"],
@@ -1909,6 +2047,84 @@ def build_tool_registry(
         async def skill_install(skill_id: str) -> str:
             return _json(await skill_manager.install_from_catalog(skill_id, actor="agent"))
 
+        async def skill_import_local(
+            path: str,
+            install: bool = True,
+            skill_id: str | None = None,
+        ) -> str:
+            return _json(
+                await skill_manager.import_from_local(
+                    path,
+                    actor="agent",
+                    install=install,
+                    skill_id=skill_id,
+                )
+            )
+
+        async def skill_import_remote(
+            repo: str,
+            path: str,
+            ref: str = "main",
+            install: bool = True,
+            skill_id: str | None = None,
+        ) -> str:
+            return _json(
+                await skill_manager.import_from_remote(
+                    repo,
+                    path,
+                    ref=ref,
+                    actor="agent",
+                    install=install,
+                    skill_id=skill_id,
+                )
+            )
+
+        async def skill_search_remote(
+            query: str,
+            repo: str | None = None,
+            ref: str | None = None,
+            limit: int = 10,
+        ) -> str:
+            return _json(
+                await skill_manager.search_remote_skills(
+                    query,
+                    repo=repo,
+                    ref=ref,
+                    limit=limit,
+                )
+            )
+
+        async def skill_search_clawhub(
+            query: str,
+            limit: int = 10,
+            base_url: str | None = None,
+        ) -> str:
+            return _json(
+                await skill_manager.search_clawhub_skills(
+                    query,
+                    limit=limit,
+                    base_url=base_url,
+                )
+            )
+
+        async def skill_import_clawhub(
+            slug: str,
+            version: str | None = None,
+            install: bool = True,
+            skill_id: str | None = None,
+            base_url: str | None = None,
+        ) -> str:
+            return _json(
+                await skill_manager.import_from_clawhub(
+                    slug,
+                    version=version,
+                    actor="agent",
+                    install=install,
+                    skill_id=skill_id,
+                    base_url=base_url,
+                )
+            )
+
         async def skill_create(
             skill_id: str,
             name: str,
@@ -1983,6 +2199,164 @@ def build_tool_registry(
                 handler=skill_install,
                 risk_level=ToolRiskLevel.MEDIUM,
                 tags=["evolution", "skill", "install"],
+            ),
+            ToolDefinition(
+                name="skill_import_local",
+                description=(
+                    "从本地目录或 SKILL.md 文件导入一个 skill bundle 到受管 registry。可选地立即安装为正式 Skill。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "本地 skill 目录路径，或该 skill 的 SKILL.md 文件路径",
+                        },
+                        "install": {
+                            "type": "boolean",
+                            "description": "导入后是否立即安装到正式 skills 目录",
+                        },
+                        "skill_id": {
+                            "type": "string",
+                            "description": "可选：覆盖导入后的 skill_id（默认取 frontmatter.id 或目录名）",
+                        },
+                    },
+                    "required": ["path"],
+                },
+                handler=skill_import_local,
+                risk_level=ToolRiskLevel.MEDIUM,
+                tags=["evolution", "skill", "import"],
+            ),
+            ToolDefinition(
+                name="skill_import_remote",
+                description=(
+                    "从 GitHub 仓库导入一个远程 skill bundle 到受管 registry。可选地立即安装为正式 Skill。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "repo": {
+                            "type": "string",
+                            "description": "GitHub 仓库，格式 owner/repo",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "仓库内 skill 目录路径，例如 skills/iso-13485-certification",
+                        },
+                        "ref": {
+                            "type": "string",
+                            "description": "可选：分支、tag 或 commit，默认 main",
+                        },
+                        "install": {
+                            "type": "boolean",
+                            "description": "导入后是否立即安装到正式 skills 目录",
+                        },
+                        "skill_id": {
+                            "type": "string",
+                            "description": "可选：覆盖导入后的 skill_id（默认取 frontmatter.id 或目录名）",
+                        },
+                    },
+                    "required": ["repo", "path"],
+                },
+                handler=skill_import_remote,
+                risk_level=ToolRiskLevel.MEDIUM,
+                tags=["evolution", "skill", "import", "remote"],
+            ),
+            ToolDefinition(
+                name="skill_search_remote",
+                description=(
+                    "从配置好的远程 GitHub skill 源搜索匹配的 Skill，返回 repo/path/ref 候选，"
+                    "便于后续调用 skill_import_remote 导入。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "当前任务或能力缺口的描述，用于匹配远程 skill",
+                        },
+                        "repo": {
+                            "type": "string",
+                            "description": "可选：仅搜索指定 GitHub 仓库，格式 owner/repo",
+                        },
+                        "ref": {
+                            "type": "string",
+                            "description": "可选：指定远程仓库分支、tag 或 commit",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "返回候选数量上限，默认 10，最大 50",
+                        },
+                    },
+                    "required": ["query"],
+                },
+                handler=skill_search_remote,
+                risk_level=ToolRiskLevel.LOW,
+                tags=["evolution", "skill", "search", "remote"],
+            ),
+            ToolDefinition(
+                name="skill_search_clawhub",
+                description=(
+                    "从 ClawHub registry 搜索匹配的 Skill，返回 slug/version 等候选，"
+                    "便于后续调用 skill_import_clawhub 导入。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "当前任务或能力缺口的描述，用于匹配 ClawHub skill",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "返回候选数量上限，默认 10，最大 50",
+                        },
+                        "base_url": {
+                            "type": "string",
+                            "description": "可选：覆盖默认 ClawHub registry 地址",
+                        },
+                    },
+                    "required": ["query"],
+                },
+                handler=skill_search_clawhub,
+                risk_level=ToolRiskLevel.LOW,
+                tags=["evolution", "skill", "search", "registry", "clawhub"],
+            ),
+            ToolDefinition(
+                name="skill_import_clawhub",
+                description=(
+                    "从 ClawHub registry 下载并导入一个远程 skill bundle 到受管 registry。"
+                    "可选地立即安装为正式 Skill。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "ClawHub skill slug",
+                        },
+                        "version": {
+                            "type": "string",
+                            "description": "可选：指定要导入的版本",
+                        },
+                        "install": {
+                            "type": "boolean",
+                            "description": "导入后是否立即安装到正式 skills 目录",
+                        },
+                        "skill_id": {
+                            "type": "string",
+                            "description": "可选：覆盖导入后的 skill_id（默认取 frontmatter.id 或 slug）",
+                        },
+                        "base_url": {
+                            "type": "string",
+                            "description": "可选：覆盖默认 ClawHub registry 地址",
+                        },
+                    },
+                    "required": ["slug"],
+                },
+                handler=skill_import_clawhub,
+                risk_level=ToolRiskLevel.MEDIUM,
+                tags=["evolution", "skill", "import", "registry", "clawhub"],
             ),
             ToolDefinition(
                 name="skill_create",
@@ -2148,8 +2522,13 @@ def build_tool_registry(
             return _json(memory_manager.list_journals(limit))
 
         async def memory_reindex() -> str:
-            """重建所有记忆的语义索引"""
-            result = await memory_manager.reindex_all_memories()
+            """重建记忆、身份、日志与 Vault 文档的检索索引"""
+            result = await memory_manager.reindex_all_retrieval_sources()
+            return _json(result)
+
+        async def memory_sync() -> str:
+            """按 manifest/hash 增量同步所有记忆相关检索源"""
+            result = await memory_manager.sync_retrieval_sources(delta_only=True, include_vault=True)
             return _json(result)
 
         tools.extend([
@@ -2251,11 +2630,19 @@ def build_tool_registry(
             ),
             ToolDefinition(
                 name="memory_reindex",
-                description="重建所有记忆的语义索引。当记忆搜索质量不佳时使用。",
+                description="重建记忆、身份、日志与 Vault 文档的检索索引。当记忆搜索质量不佳或索引明显失真时使用。",
                 parameters={"type": "object", "properties": {}},
                 handler=memory_reindex,
                 risk_level=ToolRiskLevel.MEDIUM,
                 tags=["memory", "index"],
+            ),
+            ToolDefinition(
+                name="memory_sync",
+                description="按 hash/manifest 增量同步记忆相关索引。适合在对话前或批量写入文档后刷新 Memory/RAG。",
+                parameters={"type": "object", "properties": {}},
+                handler=memory_sync,
+                risk_level=ToolRiskLevel.MEDIUM,
+                tags=["memory", "sync"],
             ),
         ])
 
@@ -2587,6 +2974,10 @@ def build_tool_registry(
             "chars": len(content),
         })
 
+    async def write_local_file(path: str, content: str) -> str:
+        """兼容旧工具名，复用 file_write。"""
+        return await file_write(path, content)
+
     tools.append(ToolDefinition(
         name="file_write",
         description=(
@@ -2610,6 +3001,31 @@ def build_tool_registry(
         handler=file_write,
         risk_level=ToolRiskLevel.MEDIUM,
         tags=["workspace", "coding", "write"],
+    ))
+
+    tools.append(ToolDefinition(
+        name="write_local_file",
+        description=(
+            "兼容旧工具名：创建新文件或完整覆盖已有文件。"
+            "对于已有文件的局部修改，优先使用 file_edit。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "文件路径（相对路径基于工作区根目录）",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "文件的完整内容",
+                },
+            },
+            "required": ["path", "content"],
+        },
+        handler=write_local_file,
+        risk_level=ToolRiskLevel.MEDIUM,
+        tags=["workspace", "coding", "write", "compat"],
     ))
 
     if system_runner is not None:

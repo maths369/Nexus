@@ -212,7 +212,8 @@ final class AppModel: ObservableObject {
                     lane: health.loaded ? .node : .engine,
                     title: health.loaded ? "MLX model loaded" : "MLX service idle",
                     detail: health.loaded
-                        ? "The MLX local API loaded \(health.model) on \(health.device)."
+                        ? health.device.map { "The MLX local API loaded \(health.model) on \($0)." }
+                            ?? "The MLX local API loaded \(health.model)."
                         : "The MLX local API is online at \(mlxSettings.host):\(mlxSettings.port), but the model has not been loaded yet."
                 )
             }
@@ -277,7 +278,11 @@ final class AppModel: ObservableObject {
     }
 
     func refreshHubHealth() async {
-        let client = HubAPIClient(host: settings.resolvedHubAPIHost, port: settings.resolvedHubAPIPort)
+        let client = HubAPIClient(
+            host: settings.resolvedHubAPIHost,
+            port: settings.resolvedHubAPIPort,
+            bearerToken: settings.resolvedHubBearerToken
+        )
         do {
             hubHealth = try await client.health()
             if lastKnownHubReachable != true {
@@ -515,7 +520,11 @@ final class AppModel: ObservableObject {
     }
 
     private func sendViaHub(_ content: String) async {
-        let client = HubAPIClient(host: settings.resolvedHubAPIHost, port: settings.resolvedHubAPIPort)
+        let client = HubAPIClient(
+            host: settings.resolvedHubAPIHost,
+            port: settings.resolvedHubAPIPort,
+            bearerToken: settings.resolvedHubBearerToken
+        )
         let senderID = hubSenderID
         do {
             try await client.sendMessage(content: content, senderID: senderID) { [weak self] entry in
@@ -759,7 +768,10 @@ final class AppModel: ObservableObject {
         let mlxSettings = MLXLocalAPISettings.defaultSettings()
         if let health = mlxHealth {
             if health.loaded {
-                return "\(health.model) on \(health.device)"
+                if let device = health.device {
+                    return "\(health.model) on \(device)"
+                }
+                return "\(health.model) is ready at \(mlxSettings.host):\(mlxSettings.port)."
             }
             return "Reachable at \(mlxSettings.host):\(mlxSettings.port); the model will load on first use."
         }

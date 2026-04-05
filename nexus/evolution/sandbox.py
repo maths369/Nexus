@@ -346,13 +346,70 @@ class Sandbox:
                 )
             return CheckResult(name="schema", passed=True, message="OK")
 
-        # TODO: 使用 jsonschema 或 pydantic 进行完整的 schema 验证
+        if not isinstance(schema, dict):
+            return CheckResult(
+                name="schema",
+                passed=False,
+                message="Schema must be a mapping",
+            )
+
+        errors = self._validate_schema_value(value, schema, path=key or "$")
+        if errors:
+            return CheckResult(
+                name="schema",
+                passed=False,
+                message="; ".join(errors[:3]),
+                details={"errors": errors},
+            )
         return CheckResult(name="schema", passed=True, message="OK")
 
     async def _dry_run_config(self, key: str, value: Any) -> CheckResult:
         """Dry-run: 模拟应用配置变更"""
-        # 第一阶段：只做基本可行性检查
-        # 未来可以在沙箱环境中实际应用并验证
+        lowered = key.lower().strip()
+
+        if any(token in lowered for token in ("path", "dir", "root", "workspace", "vault")):
+            if not isinstance(value, str) or not value.strip():
+                return CheckResult(
+                    name="dry_run",
+                    passed=False,
+                    message="Path-like config must be a non-empty string",
+                )
+            normalized = value.replace("\\", "/")
+            if any(pattern in normalized for pattern in _FORBIDDEN_PATH_PATTERNS):
+                return CheckResult(
+                    name="dry_run",
+                    passed=False,
+                    message=f"Path references forbidden location: {value}",
+                )
+
+        if any(token in lowered for token in ("timeout", "max_steps", "retries", "interval")):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return CheckResult(
+                    name="dry_run",
+                    passed=False,
+                    message="Numeric config must be an int or float",
+                )
+            if float(value) < 0:
+                return CheckResult(
+                    name="dry_run",
+                    passed=False,
+                    message="Numeric config cannot be negative",
+                )
+
+        if any(token in lowered for token in ("url", "endpoint", "base_url")) and value is not None:
+            if not isinstance(value, str) or not value.strip():
+                return CheckResult(
+                    name="dry_run",
+                    passed=False,
+                    message="URL config must be a non-empty string",
+                )
+            if not value.startswith(("http://", "https://")):
+                return CheckResult(
+                    name="dry_run",
+                    passed=False,
+                    message="URL config must start with http:// or https://",
+                )
+
         return CheckResult(name="dry_run", passed=True, message="OK")
 
     # ------------------------------------------------------------------
@@ -370,3 +427,95 @@ class Sandbox:
             ]):
                 del env[key]
         return env
+
+    def _validate_schema_value(
+        self,
+        value: Any,
+        schema: dict[str, Any],
+        *,
+        path: str,
+    ) -> list[str]:
+        errors: list[str] = []
+        expected_type = schema.get("type")
+
+        if expected_type and not self._schema_type_matches(value, expected_type):
+            errors.append(f"{path} expected type {expected_type}")
+            return errors
+
+        if "enum" in schema and value not in schema.get("enum", []):
+            errors.append(f"{path} must be one of {schema.get('enum')}")
+
+        if isinstance(value, str):
+            min_length = schema.get("minLength")
+            max_length = schema.get("maxLength")
+            pattern = schema.get("pattern")
+            if isinstance(min_length, int) and len(value) < min_length:
+                errors.append(f"{path} length must be >= {min_length}")
+            if isinstance(max_length, int) and len(value) > max_length:
+                errors.append(f"{path} length must be <= {max_length}")
+            if isinstance(pattern, str):
+                try:
+                    if re.search(pattern, value) is None:
+                        errors.append(f"{path} does not match pattern {pattern}")
+                except re.error:
+                    errors.append(f"{path} has invalid regex pattern {pattern}")
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            minimum = schema.get("minimum")
+            maximum = schema.get("maximum")
+            if isinstance(minimum, (int, float)) and value < minimum:
+                errors.append(f"{path} must be >= {minimum}")
+            if isinstance(maximum, (int, float)) and value > maximum:
+                errors.append(f"{path} must be <= {maximum}")
+
+        if isinstance(value, list):
+            min_items = schema.get("minItems")
+            max_items = schema.get("maxItems")
+            item_schema = schema.get("items")
+            if isinstance(min_items, int) and len(value) < min_items:
+                errors.append(f"{path} must contain at least {min_items} items")
+            if isinstance(max_items, int) and len(value) > max_items:
+                errors.append(f"{path} must contain at most {max_items} items")
+            if isinstance(item_schema, dict):
+                for idx, item in enumerate(value):
+                    errors.extend(self._validate_schema_value(item, item_schema, path=f"{path}[{idx}]"))
+
+        if isinstance(value, dict):
+            required = schema.get("required") or []
+            properties = schema.get("properties") or {}
+            for key in required:
+                if key not in value:
+                    errors.append(f"{path}.{key} is required")
+            if isinstance(properties, dict):
+                for key, sub_schema in properties.items():
+                    if key not in value or not isinstance(sub_schema, dict):
+                        continue
+                    errors.extend(
+                        self._validate_schema_value(
+                            value[key],
+                            sub_schema,
+                            path=f"{path}.{key}",
+                        )
+                    )
+
+        return errors
+
+    @staticmethod
+    def _schema_type_matches(value: Any, expected_type: str) -> bool:
+        type_map: dict[str, type | tuple[type, ...]] = {
+            "string": str,
+            "integer": int,
+            "number": (int, float),
+            "boolean": bool,
+            "object": dict,
+            "array": list,
+            "null": type(None),
+        }
+        target = type_map.get(expected_type)
+        if target is None:
+            return True
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        return isinstance(value, target)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -123,3 +124,52 @@ def test_import_legacy_vault_filters_system_files_and_maps_sections(tmp_path):
     assert (target_root / "journals" / "imports" / "macos-ai-assistant" / "日志" / "2026-01-01.md").exists()
     assert not (target_root / "_system" / "index.db").exists()
     assert result.summary_note_path.exists()
+
+
+def test_bootstrap_medical_knowledge_vault_archives_old_content_and_preserves_system_state(tmp_path):
+    _write_config(tmp_path)
+    vault_root = tmp_path / "vault"
+    (vault_root / "pages").mkdir(parents=True, exist_ok=True)
+    (vault_root / "knowledge").mkdir(parents=True, exist_ok=True)
+    (vault_root / "_system" / "memory").mkdir(parents=True, exist_ok=True)
+    (vault_root / "_system" / "voiceprints").mkdir(parents=True, exist_ok=True)
+    (vault_root / "pages" / "legacy.md").write_text("# Legacy\n\nold\n", encoding="utf-8")
+    (vault_root / "knowledge" / "old.md").write_text("# Old\n\nlegacy\n", encoding="utf-8")
+    (vault_root / "_system" / "memory" / "USER.md").write_text("# USER\n", encoding="utf-8")
+    (vault_root / "_system" / "memory" / "episodic.jsonl").write_text('{"summary":"x"}\n', encoding="utf-8")
+    (vault_root / "_system" / "voiceprints" / "speaker.txt").write_text("voice", encoding="utf-8")
+    (vault_root / "_system" / "heartbeat.md").write_text("# Heartbeat\n", encoding="utf-8")
+
+    sqlite_dir = tmp_path / "data" / "sqlite"
+    sqlite_dir.mkdir(parents=True, exist_ok=True)
+    (sqlite_dir / "knowledge.db").write_text("old-knowledge", encoding="utf-8")
+    (sqlite_dir / "retrieval.db").write_text("old-retrieval", encoding="utf-8")
+    (sqlite_dir / "sessions.db").write_text("keep-session-db", encoding="utf-8")
+
+    settings = load_nexus_settings(tmp_path)
+    manager = VaultManagerService(settings)
+    result = manager.bootstrap_medical_knowledge_vault()
+
+    assert result.old_root == vault_root.resolve()
+    assert result.new_root == vault_root.resolve()
+    assert result.archive_path.exists()
+    assert result.manifest_path.exists()
+    assert (vault_root / "_system" / "memory" / "USER.md").exists()
+    assert (vault_root / "_system" / "memory" / "episodic.jsonl").exists()
+    assert (vault_root / "_system" / "voiceprints" / "speaker.txt").exists()
+    assert (vault_root / "_system" / "heartbeat.md").exists()
+    assert not (vault_root / "pages" / "legacy.md").exists()
+    assert not (vault_root / "knowledge" / "old.md").exists()
+    assert (vault_root / "knowledge" / "medical-device-engineering" / "00_导航与索引" / "总览.md").exists()
+    assert (vault_root / "knowledge" / "medical-device-engineering" / "06_工作记录" / "技术决策记录" / "README.md").exists()
+    assert (sqlite_dir / "sessions.db").read_text(encoding="utf-8") == "keep-session-db"
+    assert not (sqlite_dir / "knowledge.db").exists()
+    assert not (sqlite_dir / "retrieval.db").exists()
+    assert list(sqlite_dir.glob("knowledge.db.bak-*"))
+    assert list(sqlite_dir.glob("retrieval.db.bak-*"))
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    manifest_paths = {item["relative_path"] for item in manifest["files"]}
+    assert "pages/legacy.md" in manifest_paths
+    assert "_system/memory/USER.md" in manifest_paths
+    assert "knowledge/old.md" in manifest_paths

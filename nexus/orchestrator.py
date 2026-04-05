@@ -17,6 +17,7 @@ import uuid
 import re
 from pathlib import Path
 from typing import Any, Callable, Awaitable
+from urllib.parse import quote
 
 from nexus.channel.types import (
     InboundMessage,
@@ -30,6 +31,7 @@ from nexus.channel.session_store import SessionStore, SessionStatus
 from nexus.channel.context_window import ContextWindowManager
 from nexus.channel.message_formatter import MessageFormatter
 from nexus.agent.run import RunManager
+from nexus.agent.session_manager import EnqueueResult, SessionManager
 from nexus.agent.types import RunStatus
 from nexus.agent.tool_profiles import ToolProfile
 from nexus.provider.gateway import ProviderGateway, ProviderGatewayError
@@ -65,6 +67,9 @@ class Orchestrator:
         capability_manager: Any | None = None,
         task_router: Any | None = None,
         mesh_registry: Any | None = None,
+        session_manager: SessionManager | None = None,
+        memory_manager: Any | None = None,
+        external_base_url: str | None = None,
     ):
         self._router = session_router
         self._sessions = session_store
@@ -79,8 +84,12 @@ class Orchestrator:
         self._capability_manager = capability_manager
         self._task_router = task_router
         self._mesh_registry = mesh_registry
-        # 防止同一 session 并发执行多个 run
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._external_base_url = str(external_base_url or "").rstrip("/")
+        self._memory_manager = memory_manager
+        self._session_manager = session_manager or SessionManager(
+            session_store=session_store,
+            session_router=session_router,
+        )
 
     async def handle_message(
         self,
@@ -127,11 +136,11 @@ class Orchestrator:
         decision: RoutingDecision,
         reply: ReplyFn,
     ) -> None:
-        """处理新任务意图 — 总是开启新 session，并收口旧的 active session。"""
+        """处理新任务意图 — 开启新 session，将旧的 active session 标记为 completed。"""
         channel_key = message.metadata.get("channel_key") or message.channel.value
         self._sessions.close_other_active_sessions(
             sender_id=message.sender_id,
-            new_status=SessionStatus.ABANDONED,
+            new_status=SessionStatus.COMPLETED,
         )
         session = self._sessions.create_session(
             sender_id=message.sender_id,
@@ -146,7 +155,15 @@ class Orchestrator:
         ))
 
         # 启动 run
-        await self._start_run(session.session_id, message.content, reply, route_hint=str(message.metadata.get("route_mode", "auto")))
+        channel_name, group_id = self._resolve_policy_scope(message)
+        await self._start_run(
+            session.session_id,
+            message.content,
+            reply,
+            route_hint=str(message.metadata.get("route_mode", "auto")),
+            channel=channel_name,
+            group_id=group_id,
+        )
 
     async def _handle_follow_up(
         self,
@@ -168,7 +185,15 @@ class Orchestrator:
         # 记录用户消息
         self._record_inbound_message(session_id, message)
         # 启动 run（带上下文）
-        await self._start_run(session_id, message.content, reply, route_hint=str(message.metadata.get("route_mode", "auto")))
+        channel_name, group_id = self._resolve_policy_scope(message)
+        await self._start_run(
+            session_id,
+            message.content,
+            reply,
+            route_hint=str(message.metadata.get("route_mode", "auto")),
+            channel=channel_name,
+            group_id=group_id,
+        )
 
     async def _handle_resume(
         self,
@@ -193,7 +218,15 @@ class Orchestrator:
                 new_status=SessionStatus.ABANDONED,
             )
         self._record_inbound_message(session_id, message)
-        await self._start_run(session_id, message.content, reply, route_hint=str(message.metadata.get("route_mode", "auto")))
+        channel_name, group_id = self._resolve_policy_scope(message)
+        await self._start_run(
+            session_id,
+            message.content,
+            reply,
+            route_hint=str(message.metadata.get("route_mode", "auto")),
+            channel=channel_name,
+            group_id=group_id,
+        )
 
     async def _handle_status_query(
         self,
@@ -278,14 +311,14 @@ class Orchestrator:
                 status="已取消",
             ))
         elif cmd == "new":
-            # 开始新对话：abandon 当前 session，下条消息将创建新 session
+            # 开始新对话：关闭当前 session，下条消息将创建新 session
             if session:
                 self._sessions.update_session_status(
-                    session.session_id, SessionStatus.ABANDONED
+                    session.session_id, SessionStatus.COMPLETED
                 )
             await reply(self._formatter.format_result(
                 session_id=session_id,
-                result="已清除当前对话，下一条消息将开始新任务。",
+                result="已结束当前对话，下一条消息将开始新任务。",
             ))
         elif cmd == "restart":
             # 重启 Hub 服务
@@ -553,7 +586,9 @@ class Orchestrator:
         - 任务包含编码相关关键词 → coding profile
         - 否则 → None（使用全量工具集，由 LLM 自行决策）
 
-        这是一个轻量级提示，不做硬限制。LLM 仍然是最终决策者。
+        注意：
+        - Tool Profile 在运行时会作为工具白名单参与过滤，不只是提示。
+        - coding profile 需要保留 dispatch_subagent，避免编码/文件类任务无法委派子代理。
         """
         task_lower = task.lower()
         for keyword in self._CODING_KEYWORDS:
@@ -569,21 +604,11 @@ class Orchestrator:
         reply: ReplyFn,
         *,
         route_hint: str = "auto",
+        channel: str | None = None,
+        group_id: str | None = None,
     ) -> None:
         """启动一个 run 并将结果通过 reply 回调返回"""
-        # 获取 session 锁，防止并发
-        lock = self._session_locks.setdefault(
-            session_id, asyncio.Lock()
-        )
-
-        if lock.locked():
-            await reply(self._formatter.format_blocked(
-                session_id=session_id,
-                reason='当前有一个任务正在执行中，请等待完成或发送“取消”终止。',
-            ))
-            return
-
-        async with lock:
+        async def _execute_run() -> None:
             try:
                 logger.info(
                     "Run start requested: session_id=%s task_preview=%s",
@@ -653,6 +678,27 @@ class Orchestrator:
 
                 # 根据任务内容选择 Tool Profile
                 tool_profile = self._select_tool_profile(effective_task)
+                provider_name = None
+                if self._provider_gateway is not None:
+                    provider_name = str(self._provider_gateway.primary_provider.model or self._provider_gateway.primary_provider.name)
+                tool_names: list[str] = []
+                if extra_tools:
+                    tool_names.extend(
+                        str(getattr(tool, "name", "")).strip()
+                        for tool in extra_tools
+                        if str(getattr(tool, "name", "")).strip()
+                    )
+                self._session_manager.capture_runtime_snapshot(
+                    session_id,
+                    provider_name=provider_name,
+                    context_message_count=len(context_messages),
+                    tool_profile=tool_profile.name if tool_profile is not None else None,
+                    tool_names=tool_names,
+                    route_hint=route_hint,
+                    extra={
+                        "disabled_tool_count": len(disabled_tool_names or []),
+                    },
+                )
 
                 # 执行 run
                 run = await self._run_manager.execute(
@@ -663,6 +709,8 @@ class Orchestrator:
                     extra_tools=extra_tools,
                     disabled_tool_names=disabled_tool_names,
                     tool_profile=tool_profile,
+                    channel=channel,
+                    group_id=group_id,
                 )
                 logger.info(
                     "Run finished: session_id=%s run_id=%s status=%s error=%s",
@@ -723,14 +771,22 @@ class Orchestrator:
 
                 # 发送结果
                 if run.status == RunStatus.SUCCEEDED:
-                    self._sessions.update_session_status(
-                        session_id,
-                        SessionStatus.COMPLETED,
-                    )
+                    # 保持 session ACTIVE，允许用户多轮对话延续上下文。
+                    # Session 的结束由 freshness 超时或用户显式 "新任务" 命令控制，
+                    # 而非每次 run 完成后立即关闭（借鉴 Claude Code 的持续累积模型）。
+                    self._sessions.touch_session(session_id)
+                    result_artifacts = self._build_result_artifacts(run.metadata.get("vault_write_artifacts"))
                     await reply(self._formatter.format_result(
                         session_id=session_id,
                         result=run.result,
+                        artifacts=result_artifacts,
                     ))
+                    # 后处理工作全部 fire-and-forget，不阻塞 worker 释放。
+                    # 这样用户发送下一条消息时 worker.running 已经是 False，
+                    # 不会被误判为"任务正在执行中"。
+                    asyncio.create_task(
+                        self._post_run_background(session_id)
+                    )
                 else:
                     self._sessions.update_session_status(
                         session_id,
@@ -754,6 +810,103 @@ class Orchestrator:
                     session_id=session_id,
                     error=str(e),
                 ))
+
+        result, future = await self._session_manager.enqueue_run(session_id, _execute_run)
+        if result == EnqueueResult.FULL:
+            await reply(self._formatter.format_blocked(
+                session_id=session_id,
+                reason='当前队列已满，请稍后重试或发送 /new 开始新对话。',
+            ))
+            return
+        if result == EnqueueResult.QUEUED:
+            await reply(self._formatter.format_queued(
+                session_id=session_id,
+                position=self._session_manager.get_queue_depth(session_id),
+            ))
+        if future is not None:
+            await future
+
+    async def _promote_completed_session_memory(self, session_id: str) -> None:
+        if self._memory_manager is None:
+            return
+        session = self._sessions.get_session(session_id)
+        if session is None:
+            return
+        if not str(session.channel or "").startswith("feishu"):
+            return
+        try:
+            result = await self._memory_manager.promote_session_to_medical_knowledge(session_id=session_id)
+        except Exception:
+            logger.warning("Failed to promote medical knowledge for session %s", session_id, exc_info=True)
+            return
+        if result.get("promoted"):
+            logger.info(
+                "Medical knowledge promoted for session %s: l2=%s l3=%s l4=%s conflicts=%s",
+                session_id,
+                result.get("l2_saved", 0),
+                result.get("l3_written", 0),
+                result.get("l4_written", 0),
+                result.get("conflicts", 0),
+            )
+
+    async def _post_run_background(self, session_id: str) -> None:
+        """Run 成功后的后台处理（fire-and-forget）。
+
+        包含知识提取和标题生成，均为非关键路径，
+        失败不影响用户体验，不阻塞下一条消息的接受。
+        """
+        try:
+            await self._promote_completed_session_memory(session_id)
+        except Exception:
+            logger.debug(
+                "Post-run memory promotion failed for %s (non-critical)",
+                session_id[:8], exc_info=True,
+            )
+        try:
+            await self._generate_session_title(session_id)
+        except Exception:
+            logger.debug(
+                "Post-run title generation failed for %s (non-critical)",
+                session_id[:8], exc_info=True,
+            )
+
+    async def _generate_session_title(self, session_id: str) -> None:
+        """异步生成会话标题，不阻塞主流程，失败时静默降级。"""
+        if self._provider_gateway is None:
+            return
+        try:
+            from nexus.channel.session_title import generate_session_title
+            events = self._sessions.get_events(session_id)
+            if not events:
+                return
+            event_dicts = [
+                {"role": e.role, "content": e.content} for e in events
+            ]
+            title = await generate_session_title(
+                self._provider_gateway, event_dicts,
+            )
+            if title:
+                self._sessions.update_session_summary(session_id, title)
+                logger.info(
+                    "Session %s title generated: %s", session_id[:8], title,
+                )
+        except Exception:
+            logger.debug(
+                "Session title generation failed for %s (non-critical)",
+                session_id[:8], exc_info=True,
+            )
+
+    @staticmethod
+    def _resolve_policy_scope(message: InboundMessage) -> tuple[str, str | None]:
+        channel = message.channel.value
+        metadata = message.metadata or {}
+        chat_id = str(metadata.get("chat_id") or "").strip()
+        if chat_id:
+            return channel, chat_id
+        channel_key = str(metadata.get("channel_key") or "").strip()
+        if ":" in channel_key:
+            return channel, channel_key.split(":", 1)[1] or None
+        return channel, None
 
     def _format_run_failure_error(self, run: Any) -> str:
         base_error = str(getattr(run, "error", "") or "执行失败，请重试。").strip()
@@ -993,6 +1146,27 @@ class Orchestrator:
             lines.append("，".join(parts))
         lines.append("以上是本会话最近处理的附件和产出物。若用户提到相关文件,优先指代这些路径,不要再次索要文件路径。")
         return "\n".join(lines).strip()
+
+    def _build_result_artifacts(self, artifacts: Any) -> list[dict[str, str]]:
+        if not isinstance(artifacts, list) or not artifacts:
+            return []
+        results: list[dict[str, str]] = []
+        for item in artifacts:
+            if not isinstance(item, dict):
+                continue
+            relative_path = str(item.get("relative_path") or "").strip()
+            if not relative_path:
+                continue
+            page_url = ""
+            if self._external_base_url:
+                page_url = f"{self._external_base_url}/?path={quote(relative_path)}&mode=read"
+            results.append(
+                {
+                    "name": str(item.get("title") or relative_path),
+                    "path": page_url or relative_path,
+                }
+            )
+        return results
 
     def _record_inbound_message(
         self,

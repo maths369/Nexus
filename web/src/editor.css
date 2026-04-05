@@ -458,3 +458,62 @@ details[open] > .toggle-summary::before {
 .tippy-box[data-theme~="light"] .tippy-content {
   padding: 0;
 }
+
+@media (max-width: 640px) {
+  .document-editor-mobile .tiptap {
+    min-height: 52vh;
+    padding: 8px 0 96px;
+    font-size: 15px;
+    line-height: 1.68;
+  }
+
+  .document-editor-mobile .tiptap h1 {
+    font-size: 1.5rem;
+    margin-top: 1rem;
+    margin-bottom: 0.3rem;
+  }
+
+  .document-editor-mobile .tiptap h2 {
+    font-size: 1.25rem;
+    margin-top: 0.95rem;
+    margin-bottom: 0.28rem;
+  }
+
+  .document-editor-mobile .tiptap h3 {
+    font-size: 1.05rem;
+    margin-top: 0.9rem;
+    margin-bottom: 0.24rem;
+  }
+
+  .document-editor-mobile .tiptap p,
+  .document-editor-mobile .tiptap li {
+    margin: 0.55rem 0;
+    font-size: 15px;
+  }
+
+  .document-editor-mobile .tiptap table,
+  .document-editor-mobile .tiptap .table {
+    display: block;
+    overflow-x: auto;
+    width: max-content;
+    min-width: 100%;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .document-editor-mobile .tiptap th,
+  .document-editor-mobile .tiptap td {
+    min-width: 88px;
+    padding: 8px 10px;
+    font-size: 14px;
+  }
+
+  .document-editor-mobile .bubble-toolbar {
+    padding: 5px 8px;
+    border-radius: 10px;
+  }
+
+  .document-editor-mobile .mini-btn {
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+}

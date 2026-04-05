@@ -860,6 +860,12 @@ def _mesh_config(settings: NexusSettings, args: argparse.Namespace) -> dict[str,
     broker_port = int(args.broker_port or raw["broker_port"])
     hub_api_host = getattr(args, "hub_api_host", "") or ""
     hub_api_port = int(getattr(args, "hub_api_port", 0) or 0)
+    hub_api_bearer_token = (
+        getattr(args, "hub_api_bearer_token", "")
+        or os.getenv("NEXUS_HUB_BEARER_TOKEN")
+        or os.getenv("NEXUS_BEARER_TOKEN")
+        or ""
+    ).strip()
     transport = str(args.mesh_transport or raw["transport"])
     mesh_username = args.mesh_username if args.mesh_username is not None else raw["username"]
     mesh_password = args.mesh_password if args.mesh_password is not None else raw["password"]
@@ -884,6 +890,7 @@ def _mesh_config(settings: NexusSettings, args: argparse.Namespace) -> dict[str,
         "node_card_path": node_card_path,
         **({"hub_api_host": hub_api_host} if hub_api_host else {}),
         **({"hub_api_port": hub_api_port} if hub_api_port else {}),
+        **({"hub_api_bearer_token": hub_api_bearer_token} if hub_api_bearer_token else {}),
     }
 
 
@@ -1192,8 +1199,9 @@ class MacOSSidecarRuntime:
         error: str | None = None
 
         base_url = f"http://{self._hub_api_host}:{self._hub_api_port}"
+        headers = self._hub_api_headers()
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers or None) as session:
                 async with session.get(f"{base_url}/health") as response:
                     if response.status != 200:
                         raise RuntimeError(f"/health returned {response.status}")
@@ -1532,6 +1540,19 @@ class MacOSSidecarRuntime:
     def _hub_api_port(self) -> int:
         return int(self._mesh_config.get("hub_api_port") or 8000)
 
+    @property
+    def _hub_api_bearer_token(self) -> str:
+        return str(self._mesh_config.get("hub_api_bearer_token") or "").strip()
+
+    def _hub_api_headers(self, *, content_type: str | None = None) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if content_type:
+            headers["Content-Type"] = content_type
+        token = self._hub_api_bearer_token
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
     async def startup(self) -> None:
         self._state.add_event("startup", "Starting macOS sidecar")
         try:
@@ -1598,6 +1619,7 @@ class MacOSSidecarRuntime:
                 hub_host=self._hub_api_host,
                 hub_port=self._hub_api_port,
                 node_id=node_id,
+                bearer_token=self._hub_api_bearer_token,
             )
         await self._agent.stop()
         await self._browser_service.aclose()
@@ -1614,6 +1636,7 @@ class MacOSSidecarRuntime:
                     hub_host=self._hub_api_host,
                     hub_port=self._hub_api_port,
                     node_id=node_id,
+                    bearer_token=self._hub_api_bearer_token,
                 )
                 if synced > 0:
                     self._state.add_event(
@@ -1795,7 +1818,7 @@ class MacOSSidecarRuntime:
                     task_id=local_task_id,
                     phase="received",
                     source="desktop",
-                    node=state.mesh_summary.get("node_id", "mac"),
+                    node=runtime.state.mesh_summary.get("node_id", "mac"),
                     message=f"📥 本地任务: {request.task[:200]}",
                 )
 
@@ -1819,7 +1842,7 @@ class MacOSSidecarRuntime:
                     task_id=local_task_id,
                     phase="executing",
                     source="desktop",
-                    node=state.mesh_summary.get("node_id", "mac"),
+                    node=runtime.state.mesh_summary.get("node_id", "mac"),
                     message="⚙️ 开始执行...",
                 )
 
@@ -1836,7 +1859,7 @@ class MacOSSidecarRuntime:
                         task_id=local_task_id,
                         phase="failed",
                         source="desktop",
-                        node=state.mesh_summary.get("node_id", "mac"),
+                        node=runtime.state.mesh_summary.get("node_id", "mac"),
                         message=f"❌ 失败: {err_msg[:200]}",
                     )
                     yield f"data: {_json.dumps({'type': 'error', 'content': err_msg})}\n\n"
@@ -1853,7 +1876,7 @@ class MacOSSidecarRuntime:
                         task_id=local_task_id,
                         phase="completed" if result.success else "failed",
                         source="desktop",
-                        node=state.mesh_summary.get("node_id", "mac"),
+                        node=runtime.state.mesh_summary.get("node_id", "mac"),
                         message=f"{'✅ 完成' if result.success else '❌ 失败'}: {request.task[:100]}",
                         duration_ms=result.duration_ms,
                         output_preview=result.output[:300] if result.output else "",
@@ -2071,7 +2094,9 @@ class MacOSSidecarRuntime:
             timeout_cfg = aiohttp.ClientTimeout(total=10)
             try:
                 body = await request.body()
-                headers = {"Content-Type": request.headers.get("content-type", "application/json")}
+                headers = runtime._hub_api_headers(
+                    content_type=request.headers.get("content-type", "application/json")
+                )
                 async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
                     async with session.request(
                         request.method, target, data=body if body else None, headers=headers
@@ -2099,7 +2124,7 @@ class MacOSSidecarRuntime:
                 resp = await session.post(
                     target,
                     data=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=runtime._hub_api_headers(content_type="application/json"),
                 )
 
                 async def stream():
@@ -2161,6 +2186,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--hub-api-host", default="", help="Hub API hostname override.")
     parser.add_argument("--hub-api-port", type=int, default=0, help="Hub API port override.")
+    parser.add_argument("--hub-api-bearer-token", default="", help="Hub API bearer token override.")
     parser.add_argument("--mesh-username", default=None, help="MQTT username override.")
     parser.add_argument("--mesh-password", default=None, help="MQTT password override.")
     parser.add_argument("--tls-enabled", action="store_true", default=None, help="Enable MQTT TLS.")

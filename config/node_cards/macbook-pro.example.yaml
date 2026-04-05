@@ -1,0 +1,83 @@
+node_id: macbook-pro-yanglei
+node_type: edge
+display_name: MacBook Pro
+platform: macos
+arch: arm64
+
+providers:
+  - name: kimi
+    model: kimi-k2.5
+    via: api
+    properties:
+      provider_type: moonshot
+      base_url: https://api.moonshot.cn/v1
+      api_key: sk-F4KJm6nrbynjZWu5dYH0KowzN0TrdlK0TckH026MhI86Dc0e
+  - name: minimax
+    model: MiniMax-M2.7
+    via: api
+    properties:
+      provider_type: minimax
+      base_url: https://api.minimaxi.com/v1
+      api_key: sk-api-Uxf5aqe5FNAyiqdko7TYtgall9TeVvxnqilKAS1hPH--M6eDzFBR6AXLlvivk81LT8Wsv-ebeIj5ke0QlAACQ_zEBfsTJWOcyNnHiQtquEimyCLQ2BCcmaA
+  - name: mlx-local-api
+    model: mlx-community/gemma-4-e2b-it-4bit
+    via: local
+    properties:
+      provider_type: openai-compatible
+      base_url: http://localhost:8008/v1
+      api_key: mlx-local-api
+
+capabilities:
+  - capability_id: browser_automation
+    description: 操作用户 Mac 上正在运行的真实 Google Chrome 浏览器（保留用户已登录的会话和Cookie），可以导航网页、读取页面内容、点击元素、填写表单、阅读邮箱邮件等。不是 Playwright，不会创建独立浏览器会话。
+    tools:
+      - chrome_navigate
+      - chrome_get_page_text
+      - chrome_get_elements
+      - chrome_click
+      - chrome_type
+      - chrome_scroll
+      - chrome_wait_for
+      - chrome_execute_js
+      - chrome_get_tab_info
+      - chrome_read_mail
+    requires_user_interaction: true
+  - capability_id: local_filesystem
+    description: Access to macOS local filesystem.
+    tools:
+      - list_local_files
+      - code_read_file
+  - capability_id: screen_capture
+    description: Screen capture and recording.
+    tools:
+      - capture_screen
+      - record_screen
+  - capability_id: clipboard
+    description: Clipboard read and write.
+    tools:
+      - read_clipboard
+      - write_clipboard
+  - capability_id: apple_shortcuts
+    description: Apple Shortcuts available on the local Mac session.
+    tools:
+      - list_shortcuts
+      - run_shortcut
+    requires_user_interaction: true
+  - capability_id: apple_automation
+    description: Local AppleScript or JXA automation for the current macOS session.
+    tools:
+      - run_applescript
+    requires_user_interaction: true
+
+resources:
+  cpu_cores: 10
+  memory_gb: 16
+  gpu: Apple M3 Pro
+  gpu_memory_gb: 0
+  disk_free_gb: 120
+  battery_powered: true
+
+availability:
+  schedule: weekdays 08:00-23:00
+  intermittent: true
+  max_task_duration_seconds: 1800

@@ -400,3 +400,39 @@ class TestTaskJournalSync:
             )
             assert synced == 0
             assert len(journal.unsynced_entries()) == 1  # Not marked as synced
+
+    @pytest.mark.asyncio
+    async def test_sync_to_hub_attaches_bearer_token(self, tmp_path: Path) -> None:
+        from nexus.edge.local_runtime import TaskJournal
+
+        journal = TaskJournal(journal_dir=tmp_path / "journal")
+        journal.record(
+            task="test task", run_id="r1", mode="local", model="m",
+            success=True, output="ok", error=None, duration_ms=10, events=[],
+        )
+        entry_id = journal.unsynced_entries()[0].entry_id
+
+        with patch("nexus.edge.local_runtime.aiohttp") as mock_aiohttp:
+            mock_response = MagicMock()
+            mock_response.status = 200
+            mock_response.json = AsyncMock(return_value={"entry_ids": [entry_id]})
+            mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+            mock_response.__aexit__ = AsyncMock(return_value=False)
+
+            mock_session = MagicMock()
+            mock_session.post = MagicMock(return_value=mock_response)
+            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+            mock_session.__aexit__ = AsyncMock(return_value=False)
+
+            mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+            mock_aiohttp.ClientTimeout = MagicMock()
+
+            synced = await journal.sync_to_hub(
+                hub_host="127.0.0.1",
+                hub_port=8000,
+                node_id="test-mac",
+                bearer_token="secret-token",
+            )
+            assert synced == 1
+            _, kwargs = mock_session.post.call_args
+            assert kwargs["headers"]["Authorization"] == "Bearer secret-token"

@@ -64,6 +64,22 @@ class MessageFormatter:
             content=f"收到，正在处理：{task_summary}",
         )
 
+    def format_queued(
+        self,
+        session_id: str,
+        position: int = 1,
+    ) -> OutboundMessage:
+        """生成排队通知 — 告知用户消息已排队等待处理。"""
+        content = (
+            "当前任务仍在执行中，你的消息已排队，完成后将自动处理。\n"
+            "如需开始全新话题，请先发送 /new 再发消息。"
+        )
+        return OutboundMessage(
+            session_id=session_id,
+            message_type=OutboundMessageType.STATUS,
+            content=content,
+        )
+
     def format_status(
         self, session_id: str, status: str, progress: str = ""
     ) -> OutboundMessage:
@@ -238,10 +254,57 @@ class MessageFormatter:
         result = self._render_mobile_plain_text(text)
         if not result:
             return ""
-        return self._format_source_sections(
+        result = self._format_source_sections(
             result,
             formatter=self._render_weixin_source_entries,
         ).strip()
+        # 增强微信结构化排版
+        result = self._enhance_weixin_structure(result)
+        return result
+
+    @staticmethod
+    def _enhance_weixin_structure(text: str) -> str:
+        """为微信纯文本消息添加结构化排版元素。
+
+        使用 Unicode 分隔符和状态前缀增强可读性，
+        同时保持纯文本兼容（iLinkai 仅支持文本消息）。
+        """
+        lines = text.splitlines()
+        out: list[str] = []
+        prev_was_heading = False
+        for line in lines:
+            stripped = line.strip()
+            # 【标题】样式 → 添加分隔线
+            if stripped.startswith("【") and stripped.endswith("】"):
+                if out and out[-1].strip():
+                    out.append("")
+                out.append(f"{'─' * 18}")
+                out.append(f"  {stripped}")
+                out.append(f"{'─' * 18}")
+                prev_was_heading = True
+                continue
+            # 成功/失败/警告状态行前缀
+            if stripped.startswith("- "):
+                body = stripped[2:].strip()
+                if any(body.startswith(kw) for kw in ("成功", "已完成", "已保存", "已创建", "已更新")):
+                    out.append(f"  {body}")
+                elif any(body.startswith(kw) for kw in ("失败", "错误", "异常", "无法")):
+                    out.append(f"  {body}")
+                elif any(body.startswith(kw) for kw in ("注意", "警告", "提醒")):
+                    out.append(f"  {body}")
+                else:
+                    out.append(f"  {stripped}")
+                prev_was_heading = False
+                continue
+            if prev_was_heading and not stripped:
+                prev_was_heading = False
+                continue
+            prev_was_heading = False
+            out.append(line)
+        result = "\n".join(out)
+        # 压缩连续空行
+        result = re.sub(r"\n{3,}", "\n\n", result)
+        return result.strip()
 
     def _render_feishu_card_body(self, text: str) -> str:
         result = str(text or "").replace("\r\n", "\n").strip()

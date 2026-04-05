@@ -207,10 +207,13 @@ class DocumentEditorService:
         return f"<summary-block>\n\n{payload}\n\n</summary-block>"
 
     @staticmethod
-    def render_transcript_segment(*, index: int, timestamp: str, text: str) -> str:
+    def render_transcript_segment(
+        *, index: int, timestamp: str, text: str, speaker: str | None = None,
+    ) -> str:
         body = text.strip()
+        speaker_attr = f' speaker="{speaker}"' if speaker else ""
         return (
-            f'<transcript-segment index="{index}" timestamp="{timestamp}">\n\n'
+            f'<transcript-segment index="{index}" timestamp="{timestamp}"{speaker_attr}>\n\n'
             f"{body}\n\n"
             "</transcript-segment>"
         )
@@ -230,7 +233,10 @@ class DocumentEditorService:
                 text = str(segment.get("text") or "").strip()
                 if not text:
                     continue
-                lines.append(self.render_transcript_segment(index=idx, timestamp=timestamp, text=text))
+                speaker = segment.get("speaker") or None
+                lines.append(self.render_transcript_segment(
+                    index=idx, timestamp=timestamp, text=text, speaker=speaker,
+                ))
                 lines.append("")
         else:
             lines.append(transcript.strip())

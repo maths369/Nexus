@@ -43,6 +43,7 @@ _MINIMAL_TOOLS: frozenset[str] = frozenset({
     # 读取
     "list_local_files",
     "read_local_file",
+    "code_read_file",
     "list_vault_pages",
     "find_vault_pages",
     # 搜索
@@ -70,6 +71,9 @@ _MINIMAL_TOOLS: frozenset[str] = frozenset({
 _CODING_TOOLS: frozenset[str] = _MINIMAL_TOOLS | frozenset({
     # 文件写入
     "write_local_file",
+    "file_write",
+    "file_edit",
+    "file_search",
     # 代码执行
     "system_run",
     "background_run",
@@ -78,6 +82,11 @@ _CODING_TOOLS: frozenset[str] = _MINIMAL_TOOLS | frozenset({
     "skill_create",
     "skill_update",
     "skill_install",
+    "skill_search_remote",
+    "skill_search_clawhub",
+    "skill_import_local",
+    "skill_import_remote",
+    "skill_import_clawhub",
     "evolution_audit",
     # Capability
     "capability_list_available",
@@ -92,6 +101,8 @@ _CODING_TOOLS: frozenset[str] = _MINIMAL_TOOLS | frozenset({
     # 任务管理
     "task_create",
     "task_update",
+    # 委派
+    "dispatch_subagent",
     # 浏览器 (完整)
     "browser_screenshot",
     "browser_fill_form",
@@ -123,6 +134,10 @@ _MESSAGING_TOOLS: frozenset[str] = _MINIMAL_TOOLS | frozenset({
     # 音频
     "audio_transcribe_path",
     "audio_materialize_transcript",
+    # 声纹
+    "voiceprint_register",
+    "voiceprint_list",
+    "voiceprint_delete",
 })
 
 # full: 不做过滤，返回全量
@@ -146,6 +161,8 @@ class ToolProfile:
     include: frozenset[str] | None = None
     # 排除的工具名称 (优先于 include)
     exclude: frozenset[str] = field(default_factory=frozenset)
+    # 补偿允许的工具名称（即使不在 include 中也可保留）
+    also_allow: frozenset[str] = field(default_factory=frozenset)
     # 允许的最高风险等级 (None = 不限制)
     max_risk_level: ToolRiskLevel | None = None
 
@@ -155,6 +172,10 @@ class ToolProfile:
         for tool in tools:
             # 排除列表优先
             if tool.name in self.exclude:
+                continue
+            # also_allow 可补偿 include 收窄，但不绕过 exclude
+            if tool.name in self.also_allow:
+                result.append(tool)
                 continue
             # 包含列表检查
             if self.include is not None and tool.name not in self.include:
@@ -182,6 +203,7 @@ class ToolProfile:
             description=f"Merged: {self.description} + {other.description}",
             include=merged_include,
             exclude=self.exclude | other.exclude,
+            also_allow=self.also_allow | other.also_allow,
             max_risk_level=_min_risk(self.max_risk_level, other.max_risk_level),
         )
 
@@ -192,6 +214,7 @@ class ToolProfile:
             "description": self.description,
             "include": sorted(self.include) if self.include else None,
             "exclude": sorted(self.exclude) if self.exclude else [],
+            "also_allow": sorted(self.also_allow) if self.also_allow else [],
             "max_risk_level": self.max_risk_level.value if self.max_risk_level else None,
         }
 
@@ -243,6 +266,7 @@ class ToolProfile:
         *,
         include: set[str] | None = None,
         exclude: set[str] | None = None,
+        also_allow: set[str] | None = None,
         max_risk_level: ToolRiskLevel | None = None,
     ) -> ToolProfile:
         """自定义工具集"""
@@ -251,6 +275,7 @@ class ToolProfile:
             description="自定义工具集",
             include=frozenset(include) if include else None,
             exclude=frozenset(exclude) if exclude else frozenset(),
+            also_allow=frozenset(also_allow) if also_allow else frozenset(),
             max_risk_level=max_risk_level,
         )
 

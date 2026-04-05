@@ -181,6 +181,29 @@ class SessionStore:
             ).fetchone()
         return self._row_to_session(row) if row else None
 
+    def get_active_session_by_channel(
+        self, sender_id: str, channel: str,
+    ) -> Session | None:
+        """获取用户在指定通道上当前活跃的 session（优先匹配通道）。
+
+        查找优先级:
+        1. (sender_id, channel, status=active)
+        2. (sender_id, channel, status=completed) — 刚完成的 session 也可延续
+        """
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT * FROM sessions
+                   WHERE sender_id = ? AND channel = ?
+                         AND status IN ('active', 'completed')
+                   ORDER BY
+                       CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                       updated_at DESC
+                   LIMIT 1""",
+                (sender_id, channel),
+            ).fetchone()
+        return self._row_to_session(row) if row else None
+
     def get_session(self, session_id: str) -> Session | None:
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row

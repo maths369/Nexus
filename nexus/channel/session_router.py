@@ -22,7 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 精确命令词（对标 OpenClaw command detection：只匹配完整消息或 /command 前缀）
+# 精确命令词
+# 匹配规则: 完整消息 == keyword，或消息以 /{action} 开头，或消息以 /{中文keyword} 开头
 _COMMAND_KEYWORDS: dict[str, str] = {
     "停": "pause",
     "暂停": "pause",
@@ -134,7 +135,8 @@ class SessionRouter:
         if search_decision is not None:
             return search_decision
         for keyword, action in _COMMAND_KEYWORDS.items():
-            if text == keyword or text.startswith(f"/{action}"):
+            # 匹配: 纯文本 "新对话"、英文斜杠 "/new"、中文斜杠 "/新对话"
+            if text == keyword or text.startswith(f"/{action}") or text == f"/{keyword}":
                 return RoutingDecision(
                     intent=MessageIntent.COMMAND,
                     confidence=1.0,
@@ -218,21 +220,42 @@ class SessionRouter:
         )
 
     async def _match_active_session(self, message: InboundMessage) -> RoutingDecision | None:
-        """对标 OpenClaw：同 sender 的消息默认延续活跃/新鲜 session。"""
-        active = self._store.get_active_session(sender_id=message.sender_id)
-        candidate = active
+        """同 sender 的消息默认延续活跃/新鲜 session。
+
+        查找优先级（借鉴 Claude Code 的 "不主动断 session" 理念）:
+        1. 同 sender + 同 channel 的 active/completed session（通道感知）
+        2. 同 sender 的 active session（跨通道兜底）
+        3. 同 sender 的 most_recent session（最终兜底）
+
+        只有 freshness 超时才放弃延续。
+        """
+        # 优先: 同通道的 active/completed session
+        channel_key = message.metadata.get("channel_key") or message.channel.value
+        candidate = self._store.get_active_session_by_channel(
+            sender_id=message.sender_id,
+            channel=channel_key,
+        )
+        # 兜底: 同 sender 的 active session（跨通道）
+        if candidate is None:
+            candidate = self._store.get_active_session(sender_id=message.sender_id)
+        # 最终兜底: most_recent session
         if candidate is None:
             candidate = self._store.get_most_recent_session(sender_id=message.sender_id)
         if candidate is None:
             return None
+
         if not self._context.is_within_freshness(candidate.session_id, message.timestamp):
+            logger.info(
+                "Session %s expired (freshness check failed), will start new task",
+                candidate.session_id,
+            )
             return None
 
         return RoutingDecision(
             intent=MessageIntent.FOLLOW_UP,
             session_id=candidate.session_id,
-            confidence=0.85,
-            reason="session continuity (active/fresh session)",
+            confidence=0.90,
+            reason=f"session continuity (channel={channel_key}, session={candidate.session_id[:8]})",
         )
 
     async def _match_historical_session(self, message: InboundMessage) -> RoutingDecision | None:
