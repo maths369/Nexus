@@ -279,7 +279,7 @@ export interface VaultTreeResult {
 // Vault CRUD — proxied through Sidecar to avoid CORS issues
 // Sidecar forwards to Hub: localhost:8765/vault/* → Hub/vault/*
 
-export async function vaultTree(path = "", depth = 3): Promise<VaultTreeResult> {
+export async function vaultTree(path = "", depth = 6): Promise<VaultTreeResult> {
   const url = new URL(`${SIDECAR_URL}/vault/tree`);
   if (path) url.searchParams.set("path", path);
   url.searchParams.set("depth", String(depth));
@@ -296,6 +296,12 @@ export async function vaultRead(path: string): Promise<string> {
   if (!res.ok) throw new Error(`vault/read failed: ${res.status}`);
   const data = await res.json();
   return data.content;
+}
+
+export function vaultFileUrl(path: string): string {
+  const url = new URL(`${SIDECAR_URL}/vault/file`);
+  url.searchParams.set("path", path);
+  return url.toString();
 }
 
 export async function vaultWrite(path: string, content: string): Promise<void> {

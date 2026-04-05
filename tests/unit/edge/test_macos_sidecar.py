@@ -96,6 +96,37 @@ def _runtime_with_transport(root: Path, transport: object) -> MacOSSidecarRuntim
         browser_enabled=False,
     )
 
+
+def _runtime_with_token(root: Path, token: str) -> MacOSSidecarRuntime:
+    settings = load_nexus_settings(root)
+    mesh = {
+        "broker_host": "127.0.0.1",
+        "broker_port": 1883,
+        "transport": "tcp",
+        "websocket_path": "/mqtt",
+        "username": None,
+        "password": None,
+        "keepalive_seconds": 60,
+        "qos": 1,
+        "tls_enabled": False,
+        "tls_ca_path": None,
+        "tls_cert_path": None,
+        "tls_key_path": None,
+        "tls_insecure": False,
+        "node_card_path": str(root / "config" / "node_cards" / "macbook-pro.example.yaml"),
+        "hub_api_bearer_token": token,
+    }
+    node_card = NodeCard.from_yaml_file(mesh["node_card_path"])
+    return MacOSSidecarRuntime(
+        settings=settings,
+        http_host="127.0.0.1",
+        http_port=8765,
+        mesh_config=mesh,
+        transport=InMemoryTransport(node_card.node_id, hub_name="macos-sidecar-test"),
+        node_card=node_card,
+        browser_enabled=False,
+    )
+
 @pytest.mark.skipif(platform.system() != "Darwin", reason="macOS sidecar runtime tests require Darwin")
 def test_sidecar_health_and_status() -> None:
     root = REPO_ROOT
@@ -156,6 +187,13 @@ def test_sidecar_runs_local_only_when_mesh_unavailable() -> None:
 def test_parse_battery_percent() -> None:
     assert _parse_battery_percent("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1234567)\t84%;") == 84.0
     assert _parse_battery_percent("no battery here") is None
+
+
+def test_sidecar_hub_api_headers_include_bearer_token() -> None:
+    runtime = _runtime_with_token(REPO_ROOT, "secret-token")
+    headers = runtime._hub_api_headers(content_type="application/json")
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Authorization"] == "Bearer secret-token"
 
 
 @pytest.mark.asyncio

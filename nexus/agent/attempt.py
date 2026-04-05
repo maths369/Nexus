@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from nexus.knowledge.memory import EpisodicMemory
     from nexus.knowledge.memory_manager import MemoryManager
     from nexus.evolution.skill_manager import SkillManager
+    from .tools_policy import ToolPolicyPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class AttemptBuilder:
         extra_tools: list[ToolDefinition] | None = None,
         disabled_tool_names: set[str] | None = None,
         tool_profile: ToolProfile | None = None,
+        tool_pipeline: ToolPolicyPipeline | None = None,
     ) -> AttemptConfig:
         """
         构建一次 attempt 的完整配置。
@@ -107,6 +109,7 @@ class AttemptBuilder:
             extra_tools=extra_tools,
             disabled_tool_names=disabled_tool_names,
             tool_profile=tool_profile,
+            tool_pipeline=tool_pipeline,
         )
         system_prompt += self._render_tool_catalog(tools)
 
@@ -118,6 +121,8 @@ class AttemptBuilder:
         installable_skill_hints = self._inject_installable_skill_hints(run.task)
         if installable_skill_hints:
             system_prompt += installable_skill_hints
+
+        await self._sync_knowledge_context()
 
         # Step 3: 记忆注入
         memory_context = await self._inject_memory(run.task)
@@ -382,11 +387,31 @@ class AttemptBuilder:
     # 记忆注入
     # ------------------------------------------------------------------
 
+    async def _sync_knowledge_context(self) -> None:
+        if self._memory_manager is None:
+            return
+        try:
+            await self._memory_manager.sync_retrieval_sources_if_due()
+        except Exception as e:
+            logger.warning(f"Knowledge sync failed before attempt build: {e}")
+
     async def _inject_memory(self, task: str) -> str:
         """从 Episodic Memory 中检索相关记忆"""
         try:
             if self._memory_manager is not None:
-                memories = await self._memory_manager.search(task, top_k=5)
+                if hasattr(self._memory_manager, "build_prompt_context"):
+                    prompt = await self._memory_manager.build_prompt_context(task, top_k=6)
+                    if prompt:
+                        return prompt
+
+                try:
+                    memories = await self._memory_manager.search(
+                        task,
+                        top_k=5,
+                        include_identity=False,
+                    )
+                except TypeError:
+                    memories = await self._memory_manager.search(task, top_k=5)
                 if not memories:
                     return ""
                 return "\n".join(
@@ -416,11 +441,28 @@ class AttemptBuilder:
             return ""
 
         try:
-            results = await self._retrieval.search(task, top_k=5)
+            results = await self._retrieval.search(task, top_k=15)
             if not results:
                 return ""
+            filtered = [
+                item
+                for item in results
+                if not item.source.startswith(("memory://", "identity://", "journal://"))
+            ]
+            if not filtered:
+                return ""
+            budget = 2_400
+            rendered: list[str] = []
+            used = 0
+            for result in filtered[:5]:
+                snippet = f"[{result.source}]\n{result.content}"
+                projected = used + len(snippet)
+                if projected > budget and rendered:
+                    break
+                rendered.append(snippet)
+                used = projected
             return "\n---\n".join(
-                f"[{r.source}]\n{r.content}" for r in results
+                rendered
             )
         except Exception as e:
             logger.warning(f"Retrieval injection failed: {e}")
@@ -437,6 +479,7 @@ class AttemptBuilder:
         extra_tools: list[ToolDefinition] | None = None,
         disabled_tool_names: set[str] | None = None,
         tool_profile: ToolProfile | None = None,
+        tool_pipeline: ToolPolicyPipeline | None = None,
     ) -> list[ToolDefinition]:
         """
         根据任务类型选择可用工具。
@@ -457,8 +500,10 @@ class AttemptBuilder:
                 seen.add(tool.name)
                 tools.append(tool)
 
-        # Profile 过滤（如果指定）
-        if tool_profile is not None:
+        # 新策略管线优先；未提供时保留旧 profile 过滤行为
+        if tool_pipeline is not None:
+            tools = tool_pipeline.filter_tools(tools)
+        elif tool_profile is not None:
             tools = tool_profile.filter(tools)
 
         return tools

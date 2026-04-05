@@ -1,11 +1,23 @@
 """Tests for MemoryManager — long-term memory orchestration."""
 
-import pytest
+import json
 from pathlib import Path
 
+import pytest
+
+from nexus.agent.types import RunEvent
+from nexus.channel.session_store import SessionStore
 from nexus.knowledge.memory import EpisodicMemory
+from nexus.knowledge.memory_manager import (
+    IDENTITY_SOURCE_PREFIX,
+    JOURNAL_SOURCE_PREFIX,
+    MEMORY_SOURCE_PREFIX,
+    MemoryManager,
+)
 from nexus.knowledge.retrieval import RetrievalIndex
-from nexus.knowledge.memory_manager import MemoryManager, MEMORY_SOURCE_PREFIX, IDENTITY_SOURCE_PREFIX
+from nexus.knowledge.structural import StructuralIndex
+from nexus.knowledge.content import VaultContentStore
+from nexus.services.document import DocumentService
 
 
 @pytest.fixture
@@ -34,6 +46,63 @@ def manager(memory: EpisodicMemory, retrieval: RetrievalIndex, vault_path: Path)
         vault_path=vault_path,
         half_life_days=30.0,
     )
+
+
+@pytest.fixture
+def session_store(tmp_path: Path) -> SessionStore:
+    return SessionStore(tmp_path / "sessions.db")
+
+
+@pytest.fixture
+def document_service(vault_path: Path, tmp_path: Path, retrieval: RetrievalIndex) -> DocumentService:
+    return DocumentService(
+        VaultContentStore(vault_path),
+        StructuralIndex(tmp_path / "knowledge.db"),
+        retrieval,
+    )
+
+
+class _MedicalPromotionProvider:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def chat_completion(self, **kwargs):
+        self.calls.append(kwargs)
+        payload = {
+            "medical_relevant": True,
+            "l2_memories": [
+                {
+                    "summary": "BF 类患者漏电流限值需要单独核对",
+                    "detail": "本次飞书会话明确要求把 BF 类患者漏电流限值作为法规判断重点。",
+                    "kind": "decision",
+                    "tags": ["BF", "漏电流", "IEC60601-1"],
+                    "importance": 5,
+                }
+            ],
+            "l3_entries": [
+                {
+                    "folder": "adr",
+                    "title": "BF 类患者漏电流判定路径",
+                    "summary": "先查 IEC 60601-1，再映射内部测试项。",
+                    "body_markdown": "## 背景\n\n需要统一 BF 类患者漏电流的判定路径。\n\n## 决策\n\n- 先核对 IEC 60601-1 原始条款。\n- 再映射到内部测试项与记录模板。\n",
+                    "promotion_state": "working",
+                }
+            ],
+            "l4_entries": [
+                {
+                    "section": "regulation",
+                    "title": "BF 类患者漏电流限值",
+                    "summary": "整理 BF 类患者漏电流的适用标准与判定口径。",
+                    "body_markdown": "## 适用标准\n\n- IEC 60601-1\n\n## 判定口径\n\n- 以 BF 类患者漏电流限值为正式判定基线。\n",
+                    "promotion_state": "published",
+                }
+            ],
+            "weekly_summary": {
+                "title": "飞书问答沉淀",
+                "body_markdown": "- 本周持续出现 BF 类患者漏电流相关问题。\n- 已形成标准核对与内部映射的决策路径。\n",
+            },
+        }
+        return {"message": {"content": f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```"}}
 
 
 @pytest.mark.asyncio
@@ -201,6 +270,98 @@ async def test_reindex_all_memories(manager: MemoryManager, retrieval: Retrieval
 
 
 @pytest.mark.asyncio
+async def test_sync_retrieval_sources_indexes_journals_and_vault_pages(
+    manager: MemoryManager,
+    retrieval: RetrievalIndex,
+    vault_path: Path,
+):
+    project_dir = vault_path / "projects"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "roadmap.md").write_text(
+        "# 自我进化路线图\n\nMemory 检索优先，随后补 skill 演化闭环。\n",
+        encoding="utf-8",
+    )
+    await manager.append_daily_journal("今天完成了 Memory 同步链路。", date="2026-03-20")
+
+    result = await manager.sync_retrieval_sources(delta_only=False, include_vault=True)
+
+    assert result["journals"]["files_processed"] == 1
+    assert result["vault"]["files_processed"] == 1
+
+    journal_hits = await retrieval.search("Memory 同步链路", top_k=5)
+    assert any(item.source == f"{JOURNAL_SOURCE_PREFIX}2026-03-20" for item in journal_hits)
+
+    vault_hits = await retrieval.search("自我进化路线图", top_k=5)
+    assert any(item.source == "projects/roadmap.md" for item in vault_hits)
+
+
+@pytest.mark.asyncio
+async def test_build_prompt_context_formats_high_value_memories(manager: MemoryManager):
+    await manager.save(
+        summary="用户偏好结果先行",
+        detail="输出时先给结论，再补推理。",
+        kind="preference",
+        importance=5,
+    )
+    await manager.save(
+        summary="Excel 转 CSV 工作流成功",
+        detail="优先用 excel_list_sheets 和 excel_to_csv。",
+        kind="workflow_success",
+        tags=["excel", "csv"],
+        importance=4,
+    )
+
+    context = await manager.build_prompt_context("如何处理 Excel 转 CSV", top_k=5)
+
+    assert "[偏好" in context
+    assert "[成功经验" in context
+    assert "excel_to_csv" in context
+
+
+@pytest.mark.asyncio
+async def test_capture_workflow_outcome_supports_repeated_success_suggestion(manager: MemoryManager):
+    task = "把 Excel 工作簿转换成 CSV 并保存到 vault"
+    events = [
+        RunEvent(
+            event_id="evt-tool-call",
+            run_id="run-1",
+            event_type="tool_call",
+            data={"call_id": "call-1", "tool": "excel_to_csv"},
+        ),
+        RunEvent(
+            event_id="evt-tool-result",
+            run_id="run-1",
+            event_type="tool_result",
+            data={"call_id": "call-1", "success": True, "output": "已生成 reports/result.md"},
+        ),
+    ]
+
+    for idx in range(3):
+        payload = await manager.capture_workflow_outcome(
+            task=task,
+            result="CSV 已生成，保存在 reports/result.md",
+            events=events,
+            success=True,
+            session_id="session-1",
+            run_id=f"run-{idx + 1}",
+        )
+        assert payload["saved"] == 1
+        assert payload["successful_tools"] == ["excel_to_csv"]
+
+    recent = manager._memory.list_recent(limit=5, kind="workflow_success")
+    assert len(recent) == 3
+    assert all(entry.metadata.get("task_signature") for entry in recent)
+    assert all(entry.metadata.get("run_id") for entry in recent)
+
+    suggestion = manager.suggest_evolution_opportunity(task=task)
+    assert suggestion is not None
+    assert suggestion["kind"] == "skill_candidate"
+    assert suggestion["occurrence_count"] == 3
+    assert "excel_to_csv" in suggestion["recommended_tools"]
+    assert suggestion["suggested_skill_id"]
+
+
+@pytest.mark.asyncio
 async def test_rule_based_flush(manager: MemoryManager):
     messages = [
         {"role": "user", "content": "这是一个很重要的技术决策，我们决定使用 Qwen3-Max 作为主力模型"},
@@ -208,6 +369,83 @@ async def test_rule_based_flush(manager: MemoryManager):
     ]
     result = await manager._rule_based_flush(messages)
     assert result["saved"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_promote_session_to_medical_knowledge_writes_l2_l3_l4_and_weekly_summary(
+    memory: EpisodicMemory,
+    retrieval: RetrievalIndex,
+    vault_path: Path,
+    session_store: SessionStore,
+    document_service: DocumentService,
+):
+    provider = _MedicalPromotionProvider()
+    manager = MemoryManager(
+        memory=memory,
+        retrieval=retrieval,
+        vault_path=vault_path,
+        provider=provider,
+        session_store=session_store,
+        document_service=document_service,
+    )
+    session = session_store.create_session("user-1", "feishu:chat-1", summary="讨论 BF 漏电流")
+    session_store.add_event(session.session_id, "user", "请把 BF 类患者漏电流限值和判定路径整理出来。")
+    session_store.add_event(session.session_id, "assistant", "已整理，并形成法规核对与内部映射的决策路径。")
+
+    result = await manager.promote_session_to_medical_knowledge(session_id=session.session_id)
+
+    assert result["promoted"] is True
+    assert result["l2_saved"] == 1
+    assert result["l3_written"] == 1
+    assert result["l4_written"] == 1
+    assert result["weekly_updated"] is True
+    entries = memory.list_recent(limit=5)
+    assert entries[0].summary == "BF 类患者漏电流限值需要单独核对"
+    assert (vault_path / "knowledge" / "medical-device-engineering" / "06_工作记录" / "技术决策记录" / "BF-类患者漏电流判定路径.md").exists()
+    assert (vault_path / "knowledge" / "medical-device-engineering" / "01_法规与标准" / "BF-类患者漏电流限值.md").exists()
+    weekly_files = list((vault_path / "knowledge" / "medical-device-engineering" / "06_工作记录" / "对话周报").glob("*.md"))
+    assert weekly_files
+    promoted_session = session_store.get_session(session.session_id)
+    assert promoted_session is not None
+    assert promoted_session.metadata["medical_kb_promotion"]["last_event_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_promote_session_to_medical_knowledge_preserves_conflicts(
+    memory: EpisodicMemory,
+    retrieval: RetrievalIndex,
+    vault_path: Path,
+    session_store: SessionStore,
+    document_service: DocumentService,
+):
+    provider = _MedicalPromotionProvider()
+    manager = MemoryManager(
+        memory=memory,
+        retrieval=retrieval,
+        vault_path=vault_path,
+        provider=provider,
+        session_store=session_store,
+        document_service=document_service,
+    )
+    existing_path = "knowledge/medical-device-engineering/01_法规与标准/BF-类患者漏电流限值.md"
+    await document_service.materialize_page(
+        relative_path=existing_path,
+        content="# BF 类患者漏电流限值\n\n旧版本内容。\n",
+        title="BF 类患者漏电流限值",
+        backup_existing=False,
+    )
+
+    session = session_store.create_session("user-1", "feishu:chat-1", summary="再次讨论 BF 漏电流")
+    session_store.add_event(session.session_id, "user", "再确认一次 BF 类患者漏电流限值，形成正式知识。")
+    session_store.add_event(session.session_id, "assistant", "已给出更新版说明。")
+
+    result = await manager.promote_session_to_medical_knowledge(session_id=session.session_id)
+
+    assert result["conflicts"] >= 1
+    incoming_variants = list((vault_path / "knowledge" / "medical-device-engineering" / "01_法规与标准").glob("BF-类患者漏电流限值-incoming-*.md"))
+    conflict_records = list((vault_path / "knowledge" / "medical-device-engineering" / "06_工作记录" / "同步冲突").glob("*.md"))
+    assert incoming_variants
+    assert conflict_records
 
 
 @pytest.mark.asyncio
@@ -231,3 +469,11 @@ async def test_parse_memory_extraction_empty():
 
     result = MemoryManager._parse_memory_extraction("没有值得保存的内容")
     assert result == []
+
+
+def test_parse_medical_promotion_payload():
+    payload = MemoryManager._parse_medical_promotion_payload(
+        '```json\n{"medical_relevant": true, "l2_memories": [], "l3_entries": [], "l4_entries": [], "weekly_summary": {}}\n```'
+    )
+    assert payload["medical_relevant"] is True
+    assert payload["l2_memories"] == []

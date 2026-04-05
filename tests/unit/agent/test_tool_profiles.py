@@ -36,7 +36,11 @@ def all_tools() -> list[ToolDefinition]:
     """模拟完整工具集"""
     return [
         _make_tool("read_local_file", ToolRiskLevel.LOW),
+        _make_tool("code_read_file", ToolRiskLevel.LOW),
         _make_tool("write_local_file", ToolRiskLevel.MEDIUM),
+        _make_tool("file_write", ToolRiskLevel.MEDIUM),
+        _make_tool("file_edit", ToolRiskLevel.MEDIUM),
+        _make_tool("file_search", ToolRiskLevel.LOW),
         _make_tool("system_run", ToolRiskLevel.MEDIUM),
         _make_tool("background_run", ToolRiskLevel.HIGH),
         _make_tool("delete_page", ToolRiskLevel.HIGH),
@@ -66,6 +70,7 @@ class TestProfileFactory:
         assert p.name == "coding"
         assert "system_run" in p.include
         assert "skill_create" in p.include
+        assert "dispatch_subagent" in p.include
 
     def test_messaging_profile(self):
         p = ToolProfile.messaging()
@@ -81,11 +86,13 @@ class TestProfileFactory:
         p = ToolProfile.custom(
             include={"a", "b"},
             exclude={"b"},
+            also_allow={"c"},
             max_risk_level=ToolRiskLevel.MEDIUM,
         )
         assert p.name == "custom"
         assert p.include == frozenset({"a", "b"})
         assert "b" in p.exclude
+        assert p.also_allow == frozenset({"c"})
 
     def test_from_name(self):
         for name in ("minimal", "coding", "messaging", "full"):
@@ -128,19 +135,37 @@ class TestProfileFilter:
         for t in filtered:
             assert t.risk_level in (ToolRiskLevel.LOW, ToolRiskLevel.MEDIUM)
 
+    def test_also_allow_restores_tool_outside_include(self, all_tools):
+        p = ToolProfile.custom(
+            include={"read_local_file"},
+            also_allow={"dispatch_subagent"},
+        )
+        filtered = p.filter(all_tools)
+        names = {t.name for t in filtered}
+        assert names == {"read_local_file", "dispatch_subagent"}
+
     def test_minimal_blocks_write_tools(self, all_tools):
         p = ToolProfile.minimal()
         filtered = p.filter(all_tools)
         names = {t.name for t in filtered}
+        assert "code_read_file" in names
         assert "write_local_file" not in names
+        assert "file_write" not in names
+        assert "file_edit" not in names
+        assert "file_search" not in names
         assert "system_run" not in names
 
     def test_coding_includes_execution(self, all_tools):
         p = ToolProfile.coding()
         filtered = p.filter(all_tools)
         names = {t.name for t in filtered}
+        assert "code_read_file" in names
+        assert "file_write" in names
+        assert "file_edit" in names
+        assert "file_search" in names
         assert "system_run" in names
         assert "skill_create" in names
+        assert "dispatch_subagent" in names
 
 
 class TestProfileMerge:
@@ -157,6 +182,12 @@ class TestProfileMerge:
         p2 = ToolProfile.custom(exclude={"y"})
         merged = p1.merge(p2)
         assert merged.exclude == frozenset({"x", "y"})
+
+    def test_merge_unions_also_allow(self):
+        p1 = ToolProfile.custom(also_allow={"x"})
+        p2 = ToolProfile.custom(also_allow={"y"})
+        merged = p1.merge(p2)
+        assert merged.also_allow == frozenset({"x", "y"})
 
     def test_merge_with_full(self):
         """full + custom → custom 的 include"""
@@ -176,11 +207,11 @@ class TestProfileSerialization:
     """序列化测试"""
 
     def test_to_dict(self):
-        p = ToolProfile.minimal()
+        p = ToolProfile.custom(include={"read_local_file"}, also_allow={"dispatch_subagent"})
         d = p.to_dict()
-        assert d["name"] == "minimal"
+        assert d["name"] == "custom"
         assert isinstance(d["include"], list)
-        assert d["max_risk_level"] == "low"
+        assert d["also_allow"] == ["dispatch_subagent"]
 
     def test_to_dict_full(self):
         p = ToolProfile.full()

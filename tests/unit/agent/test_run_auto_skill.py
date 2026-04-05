@@ -70,6 +70,27 @@ class _FakeCapabilityManager:
         return _FakeChangeResult(True, "Capability enabled")
 
 
+class _FakeMemoryManager:
+    def __init__(self, *, suggestion: dict[str, Any] | None = None):
+        self.capture_calls: list[dict[str, Any]] = []
+        self.suggestion_calls: list[dict[str, Any]] = []
+        self._suggestion = suggestion
+
+    async def capture_workflow_outcome(self, **kwargs) -> dict[str, Any]:
+        self.capture_calls.append(dict(kwargs))
+        return {
+            "saved": 1,
+            "entry_id": "mem-1",
+            "task_signature": "csv excel 转换",
+            "successful_tools": ["excel_to_csv"],
+            "failed_tools": [],
+        }
+
+    def suggest_evolution_opportunity(self, **kwargs) -> dict[str, Any] | None:
+        self.suggestion_calls.append(dict(kwargs))
+        return self._suggestion
+
+
 def _create_installable_bundle(registry_dir: Path, skill_id: str = "office-conversion") -> None:
     skill_dir = registry_dir / skill_id
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -118,6 +139,7 @@ def _build_manager(
     *,
     capability_manager: _FakeCapabilityManager | None = None,
     available_tools: list[ToolDefinition] | None = None,
+    memory_manager: _FakeMemoryManager | None = None,
 ) -> tuple[RunManager, SkillManager]:
     skills_dir = tmp_path / "skills"
     registry_dir = tmp_path / "skill_registry"
@@ -144,6 +166,7 @@ def _build_manager(
         fallback_models=["qwen-test"],
         capability_manager=capability_manager,
         skill_manager=skill_manager,
+        memory_manager=memory_manager,
     )
     return run_manager, skill_manager
 
@@ -256,6 +279,47 @@ def test_run_manager_auto_enables_matching_capability_and_preloads_skill_hint(tm
     assert capability_manager.enable_calls == ["excel_processing"]
     assert "excel_processing" in run.metadata.get("auto_enabled_capabilities", [])
     assert "excel-processing" in run.metadata.get("auto_preloaded_skills", [])
+
+
+def test_run_manager_records_workflow_memory_and_suggestion(tmp_path):
+    gateway = _FakeGateway(["done"])
+    memory_manager = _FakeMemoryManager(
+        suggestion={
+            "kind": "skill_candidate",
+            "reason": "repeated_successful_workflow",
+            "task_signature": "excel csv 转换",
+            "occurrence_count": 3,
+            "suggested_skill_id": "excel-csv-workflow",
+            "recommended_tools": ["excel_to_csv"],
+            "examples": ["成功完成: 把 Excel 转成 CSV"],
+        }
+    )
+    run_manager, _skill_manager = _build_manager(
+        tmp_path,
+        gateway,
+        memory_manager=memory_manager,
+    )
+
+    run = asyncio.run(
+        run_manager.execute(
+            session_id="s-5",
+            task="把 Excel 转成 CSV",
+            context_messages=[{"role": "user", "content": "把 Excel 转成 CSV"}],
+            model="qwen-test",
+        )
+    )
+
+    events = asyncio.run(run_manager._store.get_events(run.run_id))  # noqa: SLF001
+    event_types = [event.event_type for event in events]
+
+    assert run.result == "done"
+    assert len(memory_manager.capture_calls) == 1
+    assert memory_manager.capture_calls[0]["success"] is True
+    assert run.metadata["workflow_memory_recorded"] is True
+    assert run.metadata["workflow_memory"]["entry_id"] == "mem-1"
+    assert run.metadata["memory_evolution_suggestion"]["suggested_skill_id"] == "excel-csv-workflow"
+    assert "workflow_memory_saved" in event_types
+    assert "memory_evolution_suggested" in event_types
 
 
 def test_run_manager_retries_after_missing_capability_response(tmp_path):

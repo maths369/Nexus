@@ -101,6 +101,8 @@ def test_skill_content_found(tmp_path):
 
     content = manager.get_skill_content("pdf-tool")
     assert '<skill name="pdf-tool">' in content
+    assert f"<location>{skills_dir / 'pdf-tool' / 'SKILL.md'}</location>" in content
+    assert f"<root>{skills_dir / 'pdf-tool'}</root>" in content
     assert "步骤" in content
     assert "打开文件" in content
     assert "</skill>" in content
@@ -126,6 +128,8 @@ def test_skill_content_json_fallback(tmp_path):
 
     content = manager.get_skill_content("json-only")
     assert '<skill name="json-only">' in content
+    assert f"<location>{skill_path / 'skill.json'}</location>" in content
+    assert f"<root>{skill_path}</root>" in content
     assert "json-skill" in content
 
 

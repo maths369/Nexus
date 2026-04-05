@@ -51,7 +51,11 @@ def _make_client(monkeypatch, tmp_path):
     app_module = importlib.import_module("nexus.api.app")
     monkeypatch.setattr(app_module, "load_nexus_settings", lambda: settings)
     monkeypatch.setattr(app_module, "build_runtime", lambda settings=None: runtime)
-    return TestClient(app_module.app)
+    client = TestClient(app_module.app)
+    auth_config = app_module._current_auth_config()
+    if getattr(auth_config, "bearer_token", ""):
+        client.headers.update({"Authorization": f"Bearer {auth_config.bearer_token}"})
+    return client
 
 
 def test_document_endpoints_support_create_get_update_and_append(monkeypatch, tmp_path):
@@ -132,3 +136,33 @@ def test_document_delete_endpoint_removes_page(monkeypatch, tmp_path):
 
         missing = client.get("/documents/page", params={"path": relative_path})
         assert missing.status_code == 404
+
+
+def test_document_get_adopts_existing_vault_file_when_structural_index_is_stale(monkeypatch, tmp_path):
+    with _make_client(monkeypatch, tmp_path) as client:
+        target = tmp_path / "vault" / "journals" / "2026-01" / "2026-01-05.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# 2026-01-05\n\n这是一条直接落到 vault 的历史日志。\n", encoding="utf-8")
+
+        fetched = client.get("/documents/page", params={"path": "journals/2026-01/2026-01-05.md"})
+        assert fetched.status_code == 200
+        payload = fetched.json()["page"]
+        assert payload["relative_path"] == "journals/2026-01/2026-01-05.md"
+        assert payload["title"] == "2026-01-05"
+        assert "历史日志" in payload["content"]
+
+
+def test_raw_file_endpoints_stream_binary_bytes(monkeypatch, tmp_path):
+    with _make_client(monkeypatch, tmp_path) as client:
+        target = tmp_path / "vault" / "_system" / "artifacts" / "images" / "2026" / "03" / "29" / "capture.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x89PNG\r\n\x1a\nstub")
+
+        fetched = client.get("/vault/file", params={"path": "_system/artifacts/images/2026/03/29/capture.png"})
+        assert fetched.status_code == 200
+        assert fetched.headers["content-type"].startswith("image/png")
+        assert fetched.content.startswith(b"\x89PNG")
+
+        alias = client.get("/documents/file", params={"path": "_system/artifacts/images/2026/03/29/capture.png"})
+        assert alias.status_code == 200
+        assert alias.content == fetched.content

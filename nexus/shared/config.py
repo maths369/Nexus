@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import sys
 from dataclasses import dataclass
@@ -258,6 +259,84 @@ class NexusSettings:
         if os.getenv("NEXUS_AUDIO_DEVICE"):
             raw["sensevoice_device"] = os.getenv("NEXUS_AUDIO_DEVICE")
         return raw
+
+    def auth_config(self) -> dict[str, Any]:
+        raw = dict(_deep_get(self.raw, "auth", {}) or {})
+        exempt_paths = [
+            str(item).strip()
+            for item in (raw.get("exempt_paths") or ["/health", "/feishu/webhook", "/weixin/"])
+            if str(item).strip()
+        ]
+        return {
+            "enabled": _coerce_bool(os.getenv("NEXUS_AUTH_ENABLED"), _coerce_bool(raw.get("enabled"), False)),
+            "bearer_token": str(os.getenv("NEXUS_BEARER_TOKEN") or raw.get("bearer_token") or "").strip(),
+            "cookie_name": str(raw.get("cookie_name") or "__nexus_token").strip() or "__nexus_token",
+            "exempt_paths": exempt_paths,
+        }
+
+    @property
+    def external_base_url(self) -> str:
+        return str(
+            os.getenv("NEXUS_EXTERNAL_BASE_URL")
+            or _deep_get(self.raw, "external_base_url", "")
+            or ""
+        ).rstrip("/")
+
+    def agent_session_config(self) -> dict[str, Any]:
+        raw = dict(_deep_get(self.raw, "agent.session", {}) or {})
+        return {
+            "idle_timeout_minutes": int(raw.get("idle_timeout_minutes", 30) or 30),
+            "max_concurrent_sessions": int(raw.get("max_concurrent_sessions", 20) or 20),
+            "sweep_interval_seconds": float(raw.get("sweep_interval_seconds", 60.0) or 60.0),
+        }
+
+    def model_policy(self, model_name: str) -> dict[str, Any] | None:
+        policies = dict(_deep_get(self.raw, "model_policies", {}) or {})
+        query = str(model_name or "").strip()
+        if not query:
+            return None
+        if query in policies:
+            return dict(policies[query] or {})
+        for pattern, policy in policies.items():
+            if fnmatch.fnmatch(query, str(pattern)):
+                return dict(policy or {})
+        return None
+
+    def channel_policy(self, channel: str, group_id: str | None = None) -> dict[str, Any] | None:
+        policies = dict(_deep_get(self.raw, "channel_policies", {}) or {})
+        channel_name = str(channel or "").strip()
+        if not channel_name:
+            return None
+        base = dict(policies.get(channel_name) or {})
+        if not base:
+            return None
+        groups = dict(base.get("groups") or {})
+        selected_group: dict[str, Any] = {}
+        if group_id:
+            selected_group = dict(groups.get(str(group_id)) or {})
+        if not selected_group:
+            selected_group = dict(groups.get("default") or {})
+        if selected_group:
+            merged = dict(base)
+            merged.pop("groups", None)
+            merged.update(selected_group)
+            return merged
+        base.pop("groups", None)
+        return base
+
+    def subagent_policy(self) -> dict[str, Any]:
+        return dict(_deep_get(self.raw, "subagent_policy", {"deny": []}) or {"deny": []})
+
+    def heartbeat_config(self) -> dict[str, Any]:
+        raw = dict(_deep_get(self.raw, "agent.heartbeat", {}) or {})
+        return {
+            "enabled": _coerce_bool(raw.get("enabled"), False),
+            "interval_minutes": int(raw.get("interval_minutes", 30) or 30),
+            "active_hours": str(raw.get("active_hours") or "08:00-22:00"),
+            "quiet_days": [str(item) for item in (raw.get("quiet_days") or []) if str(item).strip()],
+            "ack_max_chars": int(raw.get("ack_max_chars", 300) or 300),
+            "model": str(raw.get("model") or "").strip() or None,
+        }
 
     def feishu_config(self) -> dict[str, Any]:
         raw = dict(_deep_get(self.raw, "feishu", {}) or {})

@@ -10,6 +10,7 @@ struct SidecarSettings: Codable, Equatable {
     var brokerPort: Int
     var hubAPIHost: String
     var hubAPIPort: Int
+    var hubBearerToken: String
     var meshTransport: String
     var autoStartSidecar: Bool
     var commandMode: CommandMode
@@ -26,6 +27,7 @@ struct SidecarSettings: Codable, Equatable {
         case brokerPort
         case hubAPIHost
         case hubAPIPort
+        case hubBearerToken
         case meshTransport
         case autoStartSidecar
         case commandMode
@@ -41,6 +43,7 @@ struct SidecarSettings: Codable, Equatable {
         brokerPort: Int,
         hubAPIHost: String,
         hubAPIPort: Int,
+        hubBearerToken: String = "",
         meshTransport: String,
         autoStartSidecar: Bool,
         commandMode: CommandMode = .auto
@@ -54,6 +57,7 @@ struct SidecarSettings: Codable, Equatable {
         self.brokerPort = brokerPort
         self.hubAPIHost = hubAPIHost
         self.hubAPIPort = hubAPIPort
+        self.hubBearerToken = hubBearerToken
         self.meshTransport = meshTransport
         self.autoStartSidecar = autoStartSidecar
         self.commandMode = commandMode
@@ -70,6 +74,7 @@ struct SidecarSettings: Codable, Equatable {
         brokerPort = try container.decode(Int.self, forKey: .brokerPort)
         hubAPIHost = try container.decodeIfPresent(String.self, forKey: .hubAPIHost) ?? ""
         hubAPIPort = try container.decodeIfPresent(Int.self, forKey: .hubAPIPort) ?? 0
+        hubBearerToken = try container.decodeIfPresent(String.self, forKey: .hubBearerToken) ?? ""
         meshTransport = try container.decode(String.self, forKey: .meshTransport)
         autoStartSidecar = try container.decode(Bool.self, forKey: .autoStartSidecar)
         commandMode = try container.decodeIfPresent(CommandMode.self, forKey: .commandMode) ?? .auto
@@ -106,6 +111,7 @@ struct SidecarSettings: Codable, Equatable {
             brokerPort: 1883,
             hubAPIHost: defaultHubAPIHost(),
             hubAPIPort: defaultHubAPIPort(),
+            hubBearerToken: defaultHubBearerToken(),
             meshTransport: "tcp",
             autoStartSidecar: true
         )
@@ -182,6 +188,14 @@ struct SidecarSettings: Codable, Equatable {
         return 18100
     }
 
+    static func defaultHubBearerToken() -> String {
+        let env = ProcessInfo.processInfo.environment["NEXUS_MAC_HUB_BEARER_TOKEN"] ?? ""
+        if !env.isEmpty {
+            return env
+        }
+        return ProcessInfo.processInfo.environment["NEXUS_BEARER_TOKEN"] ?? ""
+    }
+
     func merged(with fallback: SidecarSettings) -> SidecarSettings {
         SidecarSettings(
             nexusRoot: nexusRoot.nonEmpty ?? fallback.nexusRoot,
@@ -193,6 +207,7 @@ struct SidecarSettings: Codable, Equatable {
             brokerPort: brokerPort > 0 ? brokerPort : fallback.brokerPort,
             hubAPIHost: hubAPIHost.nonEmpty ?? brokerHost.nonEmpty ?? fallback.hubAPIHost,
             hubAPIPort: hubAPIPort > 0 ? hubAPIPort : fallback.hubAPIPort,
+            hubBearerToken: hubBearerToken.nonEmpty ?? fallback.hubBearerToken,
             meshTransport: meshTransport.nonEmpty ?? fallback.meshTransport,
             autoStartSidecar: autoStartSidecar,
             commandMode: commandMode
@@ -205,6 +220,10 @@ struct SidecarSettings: Codable, Equatable {
 
     var resolvedHubAPIPort: Int {
         hubAPIPort > 0 ? hubAPIPort : Self.defaultHubAPIPort()
+    }
+
+    var resolvedHubBearerToken: String {
+        hubBearerToken.nonEmpty ?? Self.defaultHubBearerToken()
     }
 
     func makeLaunchCommand() -> SidecarLaunchCommand {
@@ -356,6 +375,10 @@ final class SidecarSupervisor {
         // Writable data directory (edge journal, etc.)
         let dataRoot = SidecarSettings.defaultDataRoot()
         extraEnv["NEXUS_DATA_ROOT"] = dataRoot
+        let hubBearerToken = settings.resolvedHubBearerToken
+        if !hubBearerToken.isEmpty {
+            extraEnv["NEXUS_HUB_BEARER_TOKEN"] = hubBearerToken
+        }
 
         try start(
             command: command,

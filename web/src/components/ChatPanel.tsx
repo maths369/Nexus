@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 export type MessageType = "ack" | "status" | "blocked" | "result" | "clarify" | "error" | "system";
 
@@ -52,7 +53,7 @@ export default function ChatPanel({
                 ) : null}
               </header>
               <div className="message-body">
-                <ReactMarkdown>{message.content}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
               </div>
             </article>
           ))}

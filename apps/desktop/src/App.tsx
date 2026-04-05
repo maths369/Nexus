@@ -7,6 +7,14 @@ import { useAppStore } from "./stores/appStore";
 import type { Document, ChatMessage, TaskStep, WorkingFolder } from "./types";
 import * as hub from "./services/hub";
 
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"]);
+const VAULT_TREE_DEPTH = 6;
+
+function isImagePath(path: string): boolean {
+  const normalized = path.toLowerCase();
+  return Array.from(IMAGE_EXTENSIONS).some((ext) => normalized.endsWith(ext));
+}
+
 export default function App() {
   const store = useAppStore();
   const abortRef = useRef<AbortController | null>(null);
@@ -20,7 +28,7 @@ export default function App() {
   // ------------------------------------------------------------------
   const loadFiles = useCallback(async () => {
     try {
-      const result = await hub.vaultTree("", 3);
+      const result = await hub.vaultTree("", VAULT_TREE_DEPTH);
       store.setFiles(result.tree as any);
       setVaultSources([{
         path: result.root,
@@ -60,15 +68,38 @@ export default function App() {
       }
 
       try {
+        if (isImagePath(doc.path)) {
+          const previewUrl = hub.vaultFileUrl(doc.path);
+          const imageDoc: Document = {
+            ...doc,
+            content: "",
+            modified: false,
+            kind: "image",
+            previewUrl,
+          };
+          if (existing) {
+            store.patchDocument(doc.id, imageDoc);
+          } else {
+            store.openDocument(imageDoc);
+          }
+          return;
+        }
         const content = await hub.vaultRead(doc.path);
         if (existing) {
-          store.patchDocument(doc.id, { path: doc.path, title: doc.title, content, modified: false });
+          store.patchDocument(doc.id, {
+            path: doc.path,
+            title: doc.title,
+            content,
+            modified: false,
+            kind: "text",
+            previewUrl: undefined,
+          });
         } else {
-          store.openDocument({ ...doc, content, modified: false });
+          store.openDocument({ ...doc, content, modified: false, kind: "text", previewUrl: undefined });
         }
       } catch {
         if (!existing) {
-          store.openDocument(doc);
+          store.openDocument({ ...doc, kind: "text", previewUrl: undefined });
         }
       }
     },

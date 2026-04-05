@@ -21,6 +21,7 @@ from nexus.services.audio import AudioService
 from nexus.services.document import DocumentEditorService, DocumentService
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac", ".amr", ".webm", ".opus"}
 _TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".yaml", ".yml"}
 
 
@@ -135,7 +136,11 @@ class ArtifactService:
         mime_type: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ArtifactRecord:
-        kind = self._normalize_artifact_type(artifact_type)
+        kind = self._normalize_artifact_type(
+            artifact_type,
+            filename=filename,
+            mime_type=mime_type,
+        )
         normalized_name = self._normalize_filename(filename, kind=kind)
         resolved_mime = mime_type or mimetypes.guess_type(normalized_name)[0] or self._default_mime(kind)
         ext = Path(normalized_name).suffix or self._extension_for_mime(resolved_mime, kind=kind)
@@ -476,11 +481,26 @@ class ArtifactService:
         )
 
     @staticmethod
-    def _normalize_artifact_type(value: str) -> str:
+    def _normalize_artifact_type(
+        value: str,
+        *,
+        filename: str | None = None,
+        mime_type: str | None = None,
+    ) -> str:
         lowered = str(value or "file").strip().lower()
         if lowered in {"audio", "voice"}:
             return "audio"
         if lowered in {"image", "screenshot"}:
+            return "image"
+        mime = str(mime_type or "").strip().lower()
+        if mime.startswith("audio/"):
+            return "audio"
+        if mime.startswith("image/"):
+            return "image"
+        suffix = Path(str(filename or "")).suffix.lower()
+        if suffix in _AUDIO_EXTENSIONS:
+            return "audio"
+        if suffix in _IMAGE_EXTENSIONS:
             return "image"
         if lowered in {"file", "media", "document"}:
             return "file"

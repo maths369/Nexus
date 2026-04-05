@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -40,10 +41,10 @@ _FORBIDDEN_WRITE_PATTERNS = [
 
 # 禁止的高危命令模式
 _FORBIDDEN_COMMAND_PATTERNS = [
-    re.compile(r"\brm\s+-rf\s+/\s"),       # rm -rf /
+    re.compile(r"\brm\s+-rf\s+/(?:\s|$)"),  # rm -rf /
     re.compile(r"\bmkfs\b"),                 # mkfs (format disk)
     re.compile(r"\bdd\s+.*of=/dev/"),        # dd write to device
-    re.compile(r">\s*/dev/sd[a-z]"),         # redirect to block device
+    re.compile(r">\s*/dev/sd[a-z](?:\s|$)"), # redirect to block device
     re.compile(r"\bshutdown\b"),             # shutdown
     re.compile(r"\breboot\b"),               # reboot
 ]
@@ -284,6 +285,168 @@ class SystemRunner:
             stdout = stdout[:max_output] + f"\n\n... [截断, 共 {len(stdout_bytes)} 字节]"
         if len(stderr) > max_output:
             stderr = stderr[:max_output] + f"\n\n... [截断, 共 {len(stderr_bytes)} 字节]"
+
+        return {
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": timed_out,
+        }
+
+    async def run_argv(
+        self,
+        argv: list[str],
+        *,
+        workdir: str | None = None,
+        timeout: int | None = None,
+        actor: str = "agent",
+    ) -> dict[str, Any]:
+        if not argv:
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "空命令不允许执行",
+                "timed_out": False,
+            }
+
+        display_command = " ".join(shlex.quote(str(part)) for part in argv)
+        rejection = _check_command_safety(display_command)
+        if rejection:
+            self._audit.record(
+                action="system_run_blocked",
+                target=display_command[:200],
+                actor=actor,
+                details={"reason": rejection, "argv": [str(part) for part in argv]},
+                success=False,
+                error=rejection,
+            )
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"[BLOCKED] {rejection}",
+                "timed_out": False,
+            }
+
+        try:
+            cwd = self._resolve_workdir(workdir)
+        except PermissionError as exc:
+            self._audit.record(
+                action="system_run_blocked",
+                target=display_command[:200],
+                actor=actor,
+                details={"reason": str(exc), "workdir": workdir, "argv": [str(part) for part in argv]},
+                success=False,
+                error=str(exc),
+            )
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": str(exc),
+                "timed_out": False,
+            }
+
+        effective_timeout = timeout or self._default_timeout
+        self._audit.record(
+            action="system_run",
+            target=display_command[:500],
+            actor=actor,
+            details={
+                "workdir": str(cwd),
+                "timeout": effective_timeout,
+                "argv": [str(part) for part in argv],
+            },
+        )
+
+        logger.info(
+            "system_run argv: %s (cwd=%s, timeout=%ds, sandbox=%s)",
+            display_command[:100], cwd, effective_timeout,
+            self._sandbox.sandbox_type.value if self._sandbox else "none",
+        )
+
+        if self._sandbox and self._sandbox.sandbox_type != SandboxType.HOST:
+            try:
+                result = await self._sandbox.execute(
+                    display_command,
+                    workdir=str(cwd),
+                    timeout=effective_timeout,
+                )
+                stdout = result.stdout
+                stderr = result.stderr
+                exit_code = result.exit_code
+                timed_out = result.timed_out
+            except Exception as exc:
+                self._audit.record(
+                    action="system_run_error",
+                    target=display_command[:200],
+                    actor=actor,
+                    success=False,
+                    error=str(exc),
+                )
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"沙箱执行失败: {exc}",
+                    "timed_out": False,
+                }
+        else:
+            timed_out = False
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *[str(part) for part in argv],
+                    cwd=str(cwd),
+                    env=_sanitized_env(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=effective_timeout if effective_timeout > 0 else None,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    timed_out = True
+                    stdout_bytes = b""
+                    stderr_bytes = f"命令超时 ({effective_timeout}s)".encode()
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+                exit_code = proc.returncode or 0
+            except Exception as exc:
+                self._audit.record(
+                    action="system_run_error",
+                    target=display_command[:200],
+                    actor=actor,
+                    success=False,
+                    error=str(exc),
+                )
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"执行失败: {exc}",
+                    "timed_out": False,
+                }
+
+        self._audit.record(
+            action="system_run_completed",
+            target=display_command[:200],
+            actor=actor,
+            details={
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "stdout_len": len(stdout),
+                "stderr_len": len(stderr),
+                "argv": [str(part) for part in argv],
+            },
+            success=exit_code == 0 and not timed_out,
+            error=stderr[:500] if exit_code != 0 else None,
+        )
+
+        max_output = 50_000
+        if len(stdout) > max_output:
+            stdout = stdout[:max_output] + f"\n\n... [截断, 共 {len(stdout)} 字符]"
+        if len(stderr) > max_output:
+            stderr = stderr[:max_output] + f"\n\n... [截断, 共 {len(stderr)} 字符]"
 
         return {
             "exit_code": exit_code,

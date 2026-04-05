@@ -7,6 +7,7 @@ Nexus CLI 入口
     python -m nexus reindex        # 重建 Vault 知识索引
     python -m nexus reindex --delta # 增量索引
     python -m nexus vault-import   # 导入 legacy Vault 内容并重建索引
+    python -m nexus vault-bootstrap-medical-kb  # 归档旧 Vault 并重建医疗器械知识树
     python -m nexus health         # 检查运行状态
     python -m nexus audio-worker   # 启动独立音频转录服务
     python -m nexus agent-smoke    # 验证 Core Agent 六项能力 wiring
@@ -257,6 +258,34 @@ def cmd_vault_import(args: argparse.Namespace) -> None:
     ))
 
 
+def cmd_vault_bootstrap_medical_kb(args: argparse.Namespace) -> None:
+    from nexus.api.runtime import build_runtime
+    from nexus.services.vault import VaultManagerService
+
+    settings = load_nexus_settings(find_project_root())
+    manager = VaultManagerService(settings)
+    result = manager.bootstrap_medical_knowledge_vault()
+
+    runtime = build_runtime(settings=load_nexus_settings(find_project_root()))
+    structural_stats = runtime.structural_index.rebuild_from_vault(runtime.paths.vault)
+    asyncio.run(_close_runtime(runtime))
+
+    print(json.dumps(
+        {
+            "old_root": str(result.old_root),
+            "new_root": str(result.new_root),
+            "archive_path": str(result.archive_path),
+            "manifest_path": str(result.manifest_path),
+            "carried_forward_paths": result.carried_forward_paths,
+            "scaffolded_paths": result.scaffolded_paths,
+            "structural_rebuild": structural_stats,
+            "note": result.note,
+        },
+        indent=2,
+        ensure_ascii=False,
+    ))
+
+
 def cmd_memory_status(args: argparse.Namespace) -> None:
     from nexus.api.runtime import build_runtime
 
@@ -295,6 +324,7 @@ def _build_orchestrator():
         capability_manager=runtime.capability_manager,
         task_router=getattr(runtime, "mesh_task_router", None),
         mesh_registry=getattr(runtime, "mesh_registry", None),
+        memory_manager=getattr(runtime, "memory_manager", None),
     )
     return runtime, orchestrator
 
@@ -538,6 +568,12 @@ def main() -> None:
     vault_import_p.add_argument("--target", help="目标 Vault 根目录；默认使用当前受管 Vault")
     vault_import_p.add_argument("--label", default="macos-ai-assistant", help="导入来源标签，用于生成导入目录和摘要")
 
+    # vault-bootstrap-medical-kb
+    sub.add_parser(
+        "vault-bootstrap-medical-kb",
+        help="归档当前 Vault，并按医疗器械工程知识库结构重建 live Vault",
+    )
+
     # memory-status
     sub.add_parser("memory-status", help="查看当前记忆与上下文压缩能力")
 
@@ -566,6 +602,8 @@ def main() -> None:
         cmd_vault_migrate(args)
     elif args.command == "vault-import":
         cmd_vault_import(args)
+    elif args.command == "vault-bootstrap-medical-kb":
+        cmd_vault_bootstrap_medical_kb(args)
     elif args.command == "memory-status":
         cmd_memory_status(args)
     elif args.command == "chat":

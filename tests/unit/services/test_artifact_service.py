@@ -138,6 +138,56 @@ def test_artifact_service_materializes_audio_via_audio_service(tmp_path):
     assert "<audio-block" in page_text
 
 
+def test_artifact_service_infers_audio_from_file_mime_type(tmp_path):
+    content, _, retrieval, documents, editor = _build_services(tmp_path)
+
+    def fake_transcriber(path: Path, language: str | None) -> TranscriptionResult:
+        return TranscriptionResult(
+            text="这是通过文件附件导入的录音。",
+            language=language or "zh",
+            segments=[
+                TranscriptionSegment(
+                    start=0.0,
+                    end=3.0,
+                    text="这是通过文件附件导入的录音。",
+                )
+            ],
+            duration=3.0,
+        )
+
+    audio = AudioService(
+        content,
+        retrieval,
+        documents,
+        editor_service=editor,
+        config=AudioConfig(
+            temp_directory=tmp_path / "tmp",
+            final_directory=tmp_path / "audio",
+            transcript_directory=tmp_path / "transcripts",
+        ),
+        transcriber=fake_transcriber,
+    )
+    service = ArtifactService(content, documents, document_editor=editor, audio_service=audio)
+
+    result = asyncio.run(
+        service.ingest_bytes(
+            artifact_type="file",
+            source="feishu",
+            data=b"fake-wav",
+            filename="R20260329-213705.WAV",
+            mime_type="audio/wav",
+        )
+    )
+
+    assert result.status == "materialized"
+    assert result.transcript_relative_path is not None
+    assert result.page_relative_path is not None
+    assert result.artifact.artifact_type == "audio"
+    assert result.artifact.relative_path.startswith("_system/audio/")
+    page_text = documents.read_page(result.page_relative_path)
+    assert "<audio-block" in page_text
+
+
 def test_artifact_service_creates_batch_manifest(tmp_path):
     content, _, _, documents, editor = _build_services(tmp_path)
     service = ArtifactService(content, documents, document_editor=editor)

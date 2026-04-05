@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from pathlib import Path
+import sys
+import types
+
+import numpy as np
+import soundfile as sf
 
 from nexus.knowledge import RetrievalIndex, StructuralIndex, VaultContentStore
 from nexus.services.audio import AudioConfig, AudioService, TranscriptionResult, TranscriptionSegment
@@ -143,6 +149,173 @@ def test_audio_service_can_transcribe_and_materialize_with_injected_transcriber(
     assert "<audio-block" in page_text
     assert "<summary-block>" in page_text
     assert retrieval_hits
+
+
+def test_audio_service_supports_faster_whisper_backend(monkeypatch, tmp_path):
+    content = VaultContentStore(tmp_path / "vault")
+    structural = StructuralIndex(tmp_path / "knowledge.db")
+    retrieval = RetrievalIndex(tmp_path / "retrieval.db")
+    documents = DocumentService(content, structural, retrieval)
+    editor = DocumentEditorService(documents, structural)
+
+    class FakeSegment:
+        def __init__(self, start: float, end: float, text: str):
+            self.start = start
+            self.end = end
+            self.text = text
+
+    class FakeInfo:
+        language = "zh"
+
+    class FakeWhisperModel:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.args = args
+            self.kwargs = kwargs
+
+        def transcribe(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return iter([FakeSegment(0.0, 1.5, "先做前处理"), FakeSegment(1.5, 3.2, "再做转录")]), FakeInfo()
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeWhisperModel))
+
+    audio = AudioService(
+        content,
+        retrieval,
+        documents,
+        editor_service=editor,
+        config=AudioConfig(
+            backend="faster_whisper",
+            language="auto",
+            sensevoice_device="cpu",
+            faster_whisper_model="large-v3",
+            preprocessing_enabled=False,
+            temp_directory=tmp_path / "tmp",
+            final_directory=tmp_path / "audio",
+            transcript_directory=tmp_path / "transcripts",
+        ),
+    )
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"fake")
+
+    result = audio.transcribe_file(audio_file)
+
+    assert result.language == "zh"
+    assert result.text == "先做前处理再做转录"
+    assert len(result.segments) == 2
+
+
+def test_audio_service_uses_external_vad_regions_for_faster_whisper(monkeypatch, tmp_path):
+    content = VaultContentStore(tmp_path / "vault")
+    structural = StructuralIndex(tmp_path / "knowledge.db")
+    retrieval = RetrievalIndex(tmp_path / "retrieval.db")
+    documents = DocumentService(content, structural, retrieval)
+    editor = DocumentEditorService(documents, structural)
+    audio_module = importlib.import_module("nexus.services.audio.service")
+    calls: list[tuple[str, bool]] = []
+
+    class FakeSegment:
+        def __init__(self, text: str):
+            self.start = 0.0
+            self.end = 0.5
+            self.text = text
+
+    class FakeInfo:
+        language = "zh"
+
+    class FakeWhisperModel:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pass
+
+        def transcribe(self, audio_path, **kwargs):  # noqa: ANN001
+            calls.append((str(audio_path), bool(kwargs.get("vad_filter"))))
+            return iter([FakeSegment(f"片段{len(calls)}")]), FakeInfo()
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeWhisperModel))
+
+    audio = AudioService(
+        content,
+        retrieval,
+        documents,
+        editor_service=editor,
+        config=AudioConfig(
+            backend="faster_whisper",
+            language="auto",
+            sensevoice_device="cpu",
+            temp_directory=tmp_path / "tmp",
+            final_directory=tmp_path / "audio",
+            transcript_directory=tmp_path / "transcripts",
+        ),
+    )
+    audio_file = tmp_path / "sample.wav"
+    waveform = np.zeros(16000, dtype=np.float32)
+    sf.write(str(audio_file), waveform, 16000)
+    prepared = audio_module.PreparedAudioInput(
+        audio_path=audio_file,
+        speech_regions=[
+            audio_module.SpeechRegion(start=0.0, end=0.5),
+            audio_module.SpeechRegion(start=0.5, end=1.0),
+        ],
+        sample_rate=16000,
+    )
+    monkeypatch.setattr(audio, "_prepare_audio_input", lambda path, backend: prepared)
+
+    result = audio.transcribe_file(audio_file)
+
+    assert len(calls) == 2
+    assert calls[0][1] is False
+    assert calls[1][1] is False
+    assert result.text == "片段1片段2"
+    assert len(result.segments) == 2
+    assert result.segments[0].start == 0.0
+    assert result.segments[1].start == 0.5
+
+
+def test_audio_service_prepares_audio_with_deepfilternet_backend(monkeypatch, tmp_path):
+    content = VaultContentStore(tmp_path / "vault")
+    structural = StructuralIndex(tmp_path / "knowledge.db")
+    retrieval = RetrievalIndex(tmp_path / "retrieval.db")
+    documents = DocumentService(content, structural, retrieval)
+    editor = DocumentEditorService(documents, structural)
+    audio_module = importlib.import_module("nexus.services.audio.service")
+
+    audio = AudioService(
+        content,
+        retrieval,
+        documents,
+        editor_service=editor,
+        config=AudioConfig(
+            backend="faster_whisper",
+            preprocessing_enabled=True,
+            preprocessing_backend="deepfilternet",
+            vad_enabled=True,
+            temp_directory=tmp_path / "tmp",
+            final_directory=tmp_path / "audio",
+            transcript_directory=tmp_path / "transcripts",
+        ),
+    )
+    audio_file = tmp_path / "sample.wav"
+    audio_file.write_bytes(b"fake")
+
+    def fake_ffmpeg_prepare(*, output_path, **kwargs):  # noqa: ANN003
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).touch()
+
+    def fake_enhance(input_path, output_path):  # noqa: ANN001
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).touch()
+
+    monkeypatch.setattr(audio, "_run_ffmpeg_prepare", fake_ffmpeg_prepare)
+    monkeypatch.setattr(audio, "_enhance_with_deepfilternet", fake_enhance)
+    monkeypatch.setattr(
+        audio,
+        "_detect_speech_regions",
+        lambda path: [audio_module.SpeechRegion(start=0.1, end=0.9)],
+    )
+
+    prepared = audio._prepare_audio_input(audio_file, backend="faster_whisper")  # noqa: SLF001
+
+    assert prepared.audio_path.name.startswith("df-asr-")
+    assert len(prepared.cleanup_paths) == 3
+    assert prepared.speech_regions[0].start == 0.1
 
 
 def test_document_service_can_list_find_and_delete_pages(tmp_path):

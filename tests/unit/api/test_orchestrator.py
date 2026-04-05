@@ -54,6 +54,26 @@ class _FakeRunManager:
         self.fallback_models = list(models)
 
 
+class _SlowRunManager(_FakeRunManager):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, **kwargs):
+        self.last_kwargs = kwargs
+        self.started.set()
+        await self.release.wait()
+        return Run(
+            run_id="run-slow",
+            session_id=kwargs["session_id"],
+            status=RunStatus.SUCCEEDED,
+            task=kwargs["task"],
+            result="slow-done",
+            model="qwen-max",
+        )
+
+
 class _FailingRunManager(_FakeRunManager):
     async def execute(self, **kwargs):
         self.last_kwargs = kwargs
@@ -65,6 +85,15 @@ class _FailingRunManager(_FakeRunManager):
             error='boom',
             model='qwen-max',
         )
+
+
+class _FakeMemoryManager:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def promote_session_to_medical_knowledge(self, *, session_id: str):
+        self.calls.append(session_id)
+        return {"promoted": True, "l2_saved": 1, "l3_written": 0, "l4_written": 0, "conflicts": 0}
 
 
 class _FakeRemoteProxy:
@@ -213,6 +242,24 @@ def test_orchestrator_unknown_includes_router_candidates(tmp_path):
     assert replies
     assert 'OpenClaw 架构分析' in replies[0].content
     assert '今日会议纪要' in replies[0].content
+
+
+def test_orchestrator_coding_profile_keeps_subagent_dispatch(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_FakeRunManager(),
+        formatter=MessageFormatter(),
+    )
+
+    profile = orchestrator._select_tool_profile("请调用 dispatch_subagent 检查这个文件")  # noqa: SLF001
+
+    assert profile is not None
+    assert profile.name == "coding"
+    assert profile.include is not None
+    assert "dispatch_subagent" in profile.include
 
 
 def test_orchestrator_switches_provider_and_persists_config(tmp_path):
@@ -453,6 +500,98 @@ def test_orchestrator_failed_run_mentions_attempted_provider_chain(tmp_path):
     assert "当前后端 `gemini-3-flash-preview` 已达到额度限制。" in replies[-1].content
 
 
+def test_orchestrator_queues_concurrent_run_for_same_session(tmp_path):
+    """繁忙时第二条消息应排队并通知用户，而非直接拒绝。"""
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session("user-1", "feishu", summary="长任务")
+    run_manager = _SlowRunManager()
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=run_manager,
+        formatter=MessageFormatter(),
+    )
+    replies: list = []
+
+    async def reply(message):
+        replies.append(message)
+
+    async def scenario():
+        first = asyncio.create_task(
+            orchestrator._start_run(session.session_id, "先执行这个", reply)
+        )
+        await run_manager.started.wait()
+
+        # 第二条消息: 应排队而非拒绝
+        second = asyncio.create_task(
+            orchestrator._start_run(session.session_id, "后执行这个", reply)
+        )
+        # 给 enqueue 和通知一点时间
+        await asyncio.sleep(0.05)
+
+        run_manager.release.set()
+        await first
+        await second
+
+    asyncio.run(scenario())
+
+    # 应收到排队通知（而非"任务正在执行中"的拒绝）
+    queued_replies = [r for r in replies if "已排队" in r.content]
+    assert len(queued_replies) >= 1
+    assert "/new" in queued_replies[0].content
+
+
+def test_orchestrator_returns_full_when_queue_is_saturated(tmp_path):
+    """队列满时应告知用户无法接受更多消息。"""
+    from nexus.agent.session_manager import SessionManager
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session("user-1", "feishu", summary="满队列")
+    run_manager = _SlowRunManager()
+    session_manager = SessionManager(
+        store,
+        _FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
+        max_queue_size=1,
+    )
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=run_manager,
+        formatter=MessageFormatter(),
+        session_manager=session_manager,
+    )
+    replies: list = []
+
+    async def reply(message):
+        replies.append(message)
+
+    async def scenario():
+        first = asyncio.create_task(
+            orchestrator._start_run(session.session_id, "第一个", reply)
+        )
+        await run_manager.started.wait()
+
+        # 填满队列 (maxsize=1)
+        second = asyncio.create_task(
+            orchestrator._start_run(session.session_id, "第二个", reply)
+        )
+        await asyncio.sleep(0.05)
+
+        # 第三个: 队列满
+        await orchestrator._start_run(session.session_id, "第三个", reply)
+
+        run_manager.release.set()
+        await first
+        await second
+
+    asyncio.run(scenario())
+
+    full_replies = [r for r in replies if "队列已满" in r.content]
+    assert len(full_replies) >= 1
+
+
 class _FakeSkillManager:
     def __init__(self):
         self.installed_from_catalog: list[str] = []
@@ -590,8 +729,8 @@ def test_orchestrator_new_task_abandons_previous_active_sessions(tmp_path):
 
     sessions = store.get_recent_sessions("user-1", limit=5)
     status_by_summary = {session.summary: session.status.value for session in sessions}
-    assert status_by_summary["旧 PDF 任务"] == "abandoned"
-    assert any(status == "completed" for status in status_by_summary.values())
+    # _handle_new_task 将旧 session 标记为 completed（持续会话模型）
+    assert status_by_summary["旧 PDF 任务"] == "completed"
 
 
 def test_orchestrator_marks_failed_run_session_paused(tmp_path):
@@ -845,3 +984,26 @@ def test_orchestrator_force_dispatch_only_dispatches_missing_step_on_same_node(t
 
     assert len(remote_proxy.calls) == 1
     assert remote_proxy.calls[0]["task_description"] == step_b.description
+
+
+def test_orchestrator_promotes_completed_feishu_session_memory(tmp_path):
+    store = SessionStore(tmp_path / "sessions.db")
+    memory_manager = _FakeMemoryManager()
+    orchestrator = Orchestrator(
+        session_router=_FakeRouter(RoutingDecision(intent=MessageIntent.NEW_TASK)),
+        session_store=store,
+        context_window=ContextWindowManager(store),
+        run_manager=_FakeRunManager(),
+        formatter=MessageFormatter(),
+        memory_manager=memory_manager,
+    )
+    replies = []
+
+    async def reply(message):
+        replies.append(message)
+
+    asyncio.run(orchestrator.handle_message(_message("请整理这次 BF 漏电流讨论"), reply))
+
+    sessions = store.get_recent_sessions("user-1", limit=1)
+    assert sessions
+    assert memory_manager.calls == [sessions[0].session_id]

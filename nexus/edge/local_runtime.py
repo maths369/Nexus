@@ -265,6 +265,7 @@ class TaskJournal:
         hub_host: str,
         hub_port: int,
         node_id: str,
+        bearer_token: str | None = None,
         max_batch: int = 10,
     ) -> int:
         """Sync unsynced entries to the Hub's /edge/journal/sync endpoint.
@@ -281,10 +282,19 @@ class TaskJournal:
             "node_id": node_id,
             "entries": [e.to_dict() for e in batch],
         }
+        headers = {}
+        token = str(bearer_token or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers=headers or None,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         accepted_ids = data.get("entry_ids", [])

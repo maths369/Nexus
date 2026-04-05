@@ -41,7 +41,7 @@ class ContextWindowManager:
     def __init__(
         self,
         session_store: SessionStore,
-        freshness_minutes: int = 10,
+        freshness_minutes: int = 60,
         max_events: int = 50,
         max_tokens_estimate: int = 8000,
         *,

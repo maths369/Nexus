@@ -15,6 +15,7 @@ import logging
 import time
 import uuid
 import json
+import inspect
 from typing import Any, TYPE_CHECKING
 
 from .types import (
@@ -127,7 +128,11 @@ async def execute_tool_loop(
 
         # Layer 1+2 压缩: 在每轮 LLM 调用前执行
         if compressor:
-            messages = await compressor.compress_before_call(messages)
+            messages = await compressor.compress_before_call(
+                messages,
+                run_id=run_id,
+                session_id=session_id,
+            )
 
         # 上下文溢出检查（压缩后再检查）
         token_estimate = estimate_messages_tokens(messages)
@@ -205,7 +210,12 @@ async def execute_tool_loop(
             # --- 特殊处理: compact 工具（Layer 3 手动压缩）---
             if tc.tool_name == "compact" and compressor:
                 focus = tc.arguments.get("focus", "")
-                messages = await compressor.manual_compact(messages, focus=focus)
+                messages = await compressor.manual_compact(
+                    messages,
+                    focus=focus,
+                    run_id=run_id,
+                    session_id=session_id,
+                )
                 compact_triggered = True
                 events.append(RunEvent(
                     event_id=str(uuid.uuid4()),
@@ -283,7 +293,10 @@ async def execute_tool_loop(
                         error=f"Unknown tool: {tc.tool_name}",
                     )
                 else:
-                    policy_result = await tools_policy.check(tc, tool_def)
+                    if hasattr(tools_policy, "check_runtime"):
+                        policy_result = await tools_policy.check_runtime(tc, tool_def)
+                    else:
+                        policy_result = await tools_policy.check(tc, tool_def)
                     if not policy_result.allowed:
                         # 如果需要审批且有审批引擎，走审批流程
                         if policy_result.requires_approval and approval_engine:
@@ -312,7 +325,17 @@ async def execute_tool_loop(
                                         "approval_id": approval.approval_id,
                                     },
                                 ))
-                                result = await _execute_tool(tc, tool_def)
+                                result = await _execute_tool(
+                                    tc,
+                                    tool_def,
+                                    tool_context={
+                                        "run_id": run_id,
+                                        "session_id": session_id,
+                                        "channel": channel,
+                                        "iteration": iteration,
+                                        "tool_name": tc.tool_name,
+                                    },
+                                )
                             else:
                                 # 审批拒绝
                                 result = ToolResult(
@@ -352,7 +375,17 @@ async def execute_tool_loop(
                             ))
                     else:
                         # 执行工具
-                        result = await _execute_tool(tc, tool_def)
+                        result = await _execute_tool(
+                            tc,
+                            tool_def,
+                            tool_context={
+                                "run_id": run_id,
+                                "session_id": session_id,
+                                "channel": channel,
+                                "iteration": iteration,
+                                "tool_name": tc.tool_name,
+                            },
+                        )
 
                 # 记录 outcome 到检测器
                 record_tool_call_outcome(
@@ -494,11 +527,24 @@ def _truncate_output(output: str, tool_name: str) -> str:
     return truncated + f"\n\n... [截断, 原始 {len(output)} 字符, 保留前 {TOOL_RESULT_MAX_CHARS} 字符]"
 
 
-async def _execute_tool(call: ToolCall, tool_def: ToolDefinition) -> ToolResult:
+async def _execute_tool(
+    call: ToolCall,
+    tool_def: ToolDefinition,
+    *,
+    tool_context: dict[str, Any] | None = None,
+) -> ToolResult:
     """执行单个工具调用"""
     start = time.monotonic()
     try:
-        output = await tool_def.handler(**call.arguments)
+        kwargs = dict(call.arguments)
+        if tool_context:
+            try:
+                signature = inspect.signature(tool_def.handler)
+                if "_tool_context" in signature.parameters:
+                    kwargs["_tool_context"] = tool_context
+            except (TypeError, ValueError):
+                pass
+        output = await tool_def.handler(**kwargs)
         duration = (time.monotonic() - start) * 1000
         text = _truncate_output(str(output), call.tool_name)
         return ToolResult(

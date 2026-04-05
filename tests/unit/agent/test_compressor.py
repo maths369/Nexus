@@ -8,6 +8,7 @@ import asyncio
 from pathlib import Path
 
 from nexus.agent.compressor import ContextCompressor
+from nexus.agent.transcript_store import TranscriptStore
 
 
 def _make_messages(n_tool_calls: int = 5) -> list[dict]:
@@ -170,8 +171,24 @@ def test_save_transcript(tmp_path):
     assert path.exists()
 
     lines = path.read_text(encoding="utf-8").strip().split("\n")
-    assert len(lines) == 2
-    assert json.loads(lines[0])["role"] == "user"
+    assert len(lines) == 3
+    assert json.loads(lines[0])["kind"] == "snapshot"
+    assert json.loads(lines[1])["message"]["role"] == "user"
+
+
+def test_save_transcript_uses_transcript_store(tmp_path):
+    store = TranscriptStore(tmp_path / "transcripts")
+    compressor = ContextCompressor(transcript_store=store)
+
+    path_str = compressor._save_transcript(
+        [{"role": "user", "content": "hello"}],
+        session_id="sess-1",
+        run_id="run-1",
+    )
+
+    assert path_str is not None
+    latest = store.load_latest_snapshot("sess-1")
+    assert latest == [{"role": "user", "content": "hello"}]
 
 
 def test_save_transcript_no_dir():
@@ -253,6 +270,17 @@ def test_rule_based_summary():
     assert "用户请求" in summary
 
 
+def test_append_missing_identifiers():
+    messages = [
+        {"role": "user", "content": "请检查 `/tmp/demo.py` 里的 `build_index`，task-run-12 失败了"},
+        {"role": "assistant", "content": "我会检查"},
+    ]
+    summary = ContextCompressor._append_missing_identifiers(messages, "已经完成分析。")
+    assert "/tmp/demo.py" in summary
+    assert "build_index" in summary
+    assert "task-run-12" in summary
+
+
 def test_build_tool_name_map():
     """从 assistant 消息中提取 tool_call_id → tool_name 映射"""
     messages = [
@@ -265,3 +293,52 @@ def test_build_tool_name_map():
     mapping = ContextCompressor._build_tool_name_map(messages)
     assert mapping["c1"] == "read_file"
     assert mapping["c2"] == "bash"
+
+
+# ---------------------------------------------------------------------------
+# 百分比阈值 + 断路器
+# ---------------------------------------------------------------------------
+
+def test_context_window_based_threshold():
+    """context_window_tokens 参数应根据百分比计算阈值"""
+    compressor = ContextCompressor(context_window_tokens=128_000)
+    # 128K * 0.80 - 13K = 89_400
+    assert compressor._token_threshold == 128_000 * 0.80 - 13_000
+
+    # 小窗口模型
+    compressor_small = ContextCompressor(context_window_tokens=32_000)
+    assert compressor_small._token_threshold == 32_000 * 0.80 - 13_000
+
+
+def test_context_window_zero_uses_default():
+    """context_window_tokens=0 时使用固定默认值"""
+    compressor = ContextCompressor(context_window_tokens=0, token_threshold=80_000)
+    assert compressor._token_threshold == 80_000
+
+
+def test_circuit_breaker_stops_compact_after_failures():
+    """连续压缩失败达到上限后跳过压缩"""
+    compressor = ContextCompressor(token_threshold=10, keep_recent=1)
+    messages = _make_messages(3)
+
+    # 模拟连续失败
+    compressor._consecutive_compact_failures = 3
+
+    result = asyncio.run(compressor.compress_before_call(list(messages)))
+
+    # 断路器生效: auto_compact 不应触发
+    assert compressor.stats["auto_compact_count"] == 0
+    # 消息不应被压缩（只有 micro_compact）
+    assert len(result) == len(messages)
+
+
+def test_circuit_breaker_resets_on_success():
+    """压缩成功后断路器重置"""
+    compressor = ContextCompressor(token_threshold=10, keep_recent=1)
+    compressor._consecutive_compact_failures = 2
+
+    messages = _make_messages(3)
+    asyncio.run(compressor.compress_before_call(list(messages)))
+
+    # 成功后重置
+    assert compressor._consecutive_compact_failures == 0

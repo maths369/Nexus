@@ -5,6 +5,7 @@ import sys
 import yaml
 
 from nexus.api import build_runtime
+from nexus.agent.tool_profiles import ToolProfile
 from nexus.agent.types import ToolRiskLevel
 from nexus.provider import ProviderConfig
 from nexus.shared import find_project_root, load_nexus_settings
@@ -26,11 +27,50 @@ def test_build_runtime_creates_core_stores_and_services(tmp_path):
     assert runtime.document_editor is not None
     assert runtime.audio_service is not None
     assert runtime.provider.get_provider().name == "qwen"
+    assert runtime.session_manager is not None
+    assert runtime.heartbeat_engine is not None
+    assert runtime.transcript_writer is not None
+    assert runtime.transcript_store is not None
+    assert runtime.subagent_registry is not None
+    assert (runtime.paths.vault / "_system" / "heartbeat.md").exists()
+    assert runtime.run_manager._transcript_writer is runtime.transcript_writer  # noqa: SLF001
+
+
+def test_build_runtime_wires_voiceprint_store_to_diarization_engine(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "app.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "audio": {
+                    "diarization": {
+                        "enabled": True,
+                        "similarity_threshold": 0.72,
+                    }
+                }
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_nexus_settings(tmp_path)
+    runtime = build_runtime(
+        settings=settings,
+        primary_provider=ProviderConfig(name="qwen", model="qwen-max"),
+    )
+
+    assert runtime.audio_service._diarization is not None  # noqa: SLF001
+    assert runtime.audio_service._voiceprint_store is not None  # noqa: SLF001
+    assert runtime.audio_service._voiceprint_store._embedding_extractor is runtime.audio_service._diarization  # noqa: SLF001
+    assert (runtime.paths.vault / "_system" / "voiceprints").is_dir()
 
 
 def test_build_runtime_wires_core_agent_capabilities():
+    settings = load_nexus_settings(find_project_root())
     runtime = build_runtime(
-        settings=load_nexus_settings(find_project_root()),
+        settings=settings,
         primary_provider=ProviderConfig(name="qwen", model="qwen-max"),
     )
 
@@ -39,6 +79,9 @@ def test_build_runtime_wires_core_agent_capabilities():
     assert "load_skill" in tool_names
     assert "skill_list_installable" in tool_names
     assert "skill_install" in tool_names
+    assert "skill_search_remote" in tool_names
+    assert "skill_import_local" in tool_names
+    assert "skill_import_remote" in tool_names
     assert "todo_write" in tool_names
     assert "dispatch_subagent" in tool_names
     assert "task_create" in tool_names
@@ -47,8 +90,18 @@ def test_build_runtime_wires_core_agent_capabilities():
     assert "task_get" in tool_names
     assert "background_run" in tool_names
     assert "check_background" in tool_names
+    assert "system_run" in tool_names
+    assert "read_local_file" in tool_names
+    assert "code_read_file" in tool_names
+    assert "write_local_file" in tool_names
+    assert "file_write" in tool_names
+    assert "file_edit" in tool_names
+    assert "file_search" in tool_names
     assert "audio_transcribe_path" in tool_names
     assert "audio_materialize_transcript" in tool_names
+    assert "voiceprint_register" in tool_names
+    assert "voiceprint_list" in tool_names
+    assert "voiceprint_delete" in tool_names
     assert "list_vault_pages" in tool_names
     assert "find_vault_pages" in tool_names
     assert "document_append_block" in tool_names
@@ -58,12 +111,18 @@ def test_build_runtime_wires_core_agent_capabilities():
     assert "document_insert_page_link" in tool_names
     assert "document_create_database" in tool_names
     assert "delete_page" in tool_names
-    assert "browser_navigate" in tool_names
-    assert "browser_extract_text" in tool_names
-    assert "browser_screenshot" in tool_names
-    assert "browser_fill_form" in tool_names
-    assert "search_web" in tool_names
-    assert "search_web_structured" in tool_names
+    browser_tools = {
+        "browser_navigate",
+        "browser_extract_text",
+        "browser_screenshot",
+        "browser_fill_form",
+    }
+    if settings.browser_enabled:
+        assert browser_tools <= tool_names
+        assert {"search_web", "search_web_structured"} <= tool_names
+    else:
+        assert browser_tools.isdisjoint(tool_names)
+        assert {"search_web", "search_web_structured"}.isdisjoint(tool_names)
     assert "skill_create" in tool_names
     assert "skill_update" in tool_names
     assert "skill_list_installed" in tool_names
@@ -99,6 +158,9 @@ def test_project_runtime_allowlist_exposes_evolution_tools():
     assert {
         "skill_list_installable",
         "skill_install",
+        "skill_search_remote",
+        "skill_import_local",
+        "skill_import_remote",
         "skill_create",
         "skill_update",
         "skill_list_installed",
@@ -124,10 +186,34 @@ def test_project_runtime_allowlist_exposes_evolution_tools():
         "memory_read_journal",
         "memory_list_journals",
         "memory_reindex",
+        "memory_sync",
+        "memory_suggest_evolution",
     } <= tool_names
 
     assert runtime.attempt_builder._memory_manager is runtime.memory_manager  # noqa: SLF001
     assert runtime.compressor._memory_flush_callback is not None  # noqa: SLF001
+    assert runtime.run_manager._memory_manager is runtime.memory_manager  # noqa: SLF001
+
+
+def test_project_runtime_coding_profile_keeps_actual_code_tools():
+    settings = load_nexus_settings(find_project_root())
+    runtime = build_runtime(
+        settings=settings,
+        primary_provider=ProviderConfig(name="qwen", model="qwen-max"),
+    )
+
+    coding_names = {tool.name for tool in ToolProfile.coding().filter(runtime.available_tools)}
+    assert {
+        "list_local_files",
+        "code_read_file",
+        "file_write",
+        "file_edit",
+        "file_search",
+        "system_run",
+        "background_run",
+        "check_background",
+        "dispatch_subagent",
+    } <= coding_names
 
 
 def test_project_runtime_uses_sanitized_evolution_python():

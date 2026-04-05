@@ -102,16 +102,19 @@ final class HubAPIClient {
     private let httpBaseURL: URL
     private let websocketURL: URL
     private let session: URLSession
+    private let bearerToken: String
 
-    init(host: String, port: Int, session: URLSession = .shared) {
+    init(host: String, port: Int, bearerToken: String = "", session: URLSession = .shared) {
         self.httpBaseURL = URL(string: "http://\(host):\(port)")!
         self.websocketURL = URL(string: "ws://\(host):\(port)/ws")!
         self.session = session
+        self.bearerToken = bearerToken
     }
 
     func health() async throws -> HubHealthResponse {
         var request = URLRequest(url: httpBaseURL.appending(path: "health"))
         request.httpMethod = "GET"
+        applyAuth(to: &request)
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw URLError(.badServerResponse)
@@ -125,7 +128,9 @@ final class HubAPIClient {
         sequence: Int = Int(Date().timeIntervalSince1970),
         onEvent: @escaping @MainActor (HubConversationEntry) -> Void
     ) async throws {
-        let task = session.webSocketTask(with: websocketURL)
+        var request = URLRequest(url: websocketURL)
+        applyAuth(to: &request)
+        let task = session.webSocketTask(with: request)
         task.resume()
         defer {
             task.cancel(with: .goingAway, reason: nil)
@@ -179,5 +184,11 @@ final class HubAPIClient {
         }
 
         return try JSONDecoder().decode(HubMessageEnvelope.self, from: data)
+    }
+
+    private func applyAuth(to request: inout URLRequest) {
+        let token = bearerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     }
 }

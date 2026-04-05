@@ -27,6 +27,34 @@ interface Props {
 }
 
 export default function Editor({ doc, onContentChange, onSave }: Props) {
+  if (doc.kind === "image" && doc.previewUrl) {
+    return <ImageDocumentViewer doc={doc} />;
+  }
+  return <MarkdownDocumentEditor doc={doc} onContentChange={onContentChange} onSave={onSave} />;
+}
+
+function ImageDocumentViewer({ doc }: { doc: Document }) {
+  return (
+    <div className="editor-container">
+      <div className="editor-titlebar">
+        <input
+          className="editor-title-input"
+          value={doc.title}
+          readOnly
+          placeholder="Untitled"
+        />
+      </div>
+      <div className="image-viewer-shell">
+        <div className="image-viewer-meta">{doc.path}</div>
+        <div className="image-viewer-stage">
+          <img className="image-viewer-image" src={doc.previewUrl} alt={doc.title} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MarkdownDocumentEditor({ doc, onContentChange, onSave }: Props) {
   const onSaveRef = useRef(onSave);
   const onContentChangeRef = useRef(onContentChange);
   const editorRef = useRef<ReturnType<typeof useEditor> | null>(null);

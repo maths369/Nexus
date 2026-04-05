@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from nexus.knowledge import PageNode, RetrievalIndex, StructuralIndex, VaultContentStore
@@ -83,6 +84,61 @@ class DocumentService:
             relative_path=page.relative_path,
             title=page.title,
             page_type=page.page_type,
+        )
+
+    async def materialize_page(
+        self,
+        *,
+        relative_path: str,
+        content: str,
+        title: str | None = None,
+        page_type: str = "note",
+        parent_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        overwrite: bool = True,
+        backup_existing: bool = True,
+    ) -> DocumentPageResult:
+        existing = self._structural.get_page_by_path(relative_path)
+        exists_on_disk = self._content.exists(relative_path)
+        if exists_on_disk and not overwrite:
+            raise FileExistsError(relative_path)
+        if exists_on_disk and backup_existing:
+            self._content.backup(relative_path)
+
+        self._content.write(relative_path, content, create_if_missing=True)
+        absolute_path = self._content.resolve_path(relative_path)
+        stat = absolute_path.stat()
+        timestamp = datetime.fromtimestamp(stat.st_mtime)
+
+        if existing is None:
+            node = PageNode(
+                page_id=self._structural._page_id_for_path(relative_path),  # noqa: SLF001
+                relative_path=relative_path,
+                title=title or self._derive_title(content, fallback=Path(relative_path).stem),
+                page_type=page_type,
+                parent_id=parent_id,
+                metadata=metadata or {},
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+        else:
+            node = PageNode(
+                page_id=existing.page_id,
+                relative_path=relative_path,
+                title=title or self._derive_title(content, fallback=existing.title),
+                page_type=page_type or existing.page_type,
+                parent_id=existing.parent_id if parent_id is None else parent_id,
+                metadata=metadata or existing.metadata,
+                created_at=existing.created_at,
+                last_opened_at=existing.last_opened_at,
+            )
+        self._structural.upsert_page(node)
+        await self._reindex_page(node, content)
+        return DocumentPageResult(
+            page_id=node.page_id,
+            relative_path=node.relative_path,
+            title=node.title,
+            page_type=node.page_type,
         )
 
     async def update_page(
@@ -168,6 +224,21 @@ class DocumentService:
             page_type=existing.page_type,
         )
 
+    async def get_page(self, relative_path: str) -> PageNode:
+        page = self._structural.get_page_by_path(relative_path)
+        if page is not None:
+            self._structural.mark_recent_open(page.page_id)
+            return page
+
+        if not self._content.exists(relative_path):
+            raise FileNotFoundError(relative_path)
+
+        content = self._content.read(relative_path)
+        adopted = self._adopt_page(relative_path, content)
+        await self._reindex_page(adopted, content)
+        self._structural.mark_recent_open(adopted.page_id)
+        return adopted
+
     def read_page(self, relative_path: str) -> str:
         page = self._structural.get_page_by_path(relative_path)
         if page is not None:
@@ -227,6 +298,26 @@ class DocumentService:
         )
         self._refresh_links(node.page_id, content)
         self._refresh_anchors(node.page_id, content)
+
+    def _adopt_page(self, relative_path: str, content: str) -> PageNode:
+        absolute_path = self._content.resolve_path(relative_path)
+        stat = absolute_path.stat()
+        timestamp = datetime.fromtimestamp(stat.st_mtime)
+        node = PageNode(
+            page_id=self._structural._page_id_for_path(relative_path),  # noqa: SLF001
+            relative_path=relative_path,
+            title=self._derive_title(content, fallback=Path(relative_path).stem),
+            page_type=self._structural._infer_page_type(relative_path, fallback="note"),  # noqa: SLF001
+            metadata={
+                "source": "vault",
+                "adopted": True,
+                "file_modified": timestamp.isoformat(),
+            },
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        self._structural.upsert_page(node)
+        return node
 
     def _refresh_links(self, source_page_id: str, content: str) -> None:
         self._structural.clear_links(source_page_id)

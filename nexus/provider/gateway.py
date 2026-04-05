@@ -24,6 +24,45 @@ class ProviderGatewayError(RuntimeError):
     """Raised when provider requests fail or clients are misconfigured."""
 
 
+# 常见模型的上下文窗口大小（tokens）
+# 用于计算动态压缩阈值，未列出的模型使用 DEFAULT_CONTEXT_WINDOW
+DEFAULT_CONTEXT_WINDOW = 128_000
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "qwen-max": 128_000,
+    "qwen-plus": 128_000,
+    "qwen-turbo": 128_000,
+    "qwen3-max": 128_000,
+    "qwen3-plus": 128_000,
+    "kimi-k2.5": 128_000,
+    "kimi-k2": 128_000,
+    "moonshot-v1-128k": 128_000,
+    "moonshot-v1-32k": 32_000,
+    "moonshot-v1-8k": 8_000,
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-4-turbo": 128_000,
+    "gpt-3.5-turbo": 16_000,
+    "claude-3-5-sonnet": 200_000,
+    "claude-3-opus": 200_000,
+    "claude-3-haiku": 200_000,
+    "gemini-2.5-flash": 1_000_000,
+    "gemini-2.5-pro": 1_000_000,
+    "deepseek-chat": 64_000,
+    "deepseek-reasoner": 64_000,
+}
+
+
+def get_context_window(model: str) -> int:
+    """查询模型的上下文窗口大小（tokens）。"""
+    if model in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[model]
+    # 模糊匹配: "qwen-max-latest" → "qwen-max"
+    for key, value in MODEL_CONTEXT_WINDOWS.items():
+        if model.startswith(key):
+            return value
+    return DEFAULT_CONTEXT_WINDOW
+
+
 @dataclass
 class ProviderConfig:
     """Single provider configuration."""
