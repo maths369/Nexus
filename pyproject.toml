@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nexus"
-version = "0.1.0"
+version = "0.5.0"
 description = "星策 — Personal AI Agent Runtime"
 readme = "ARCHITECTURE_BLUEPRINT.md"
 requires-python = ">=3.10"
